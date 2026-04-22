@@ -1,0 +1,32 @@
+provider: local
+path: ~/images
+priority: 0
+chunk_size: 128MB
+compression_override: webp
+headers:
+  Authorization: Bearer Token
+  Cookie: session=abc
+resources:
+  - url: https://example.com/resource.png
+    name: image
+    priority: 10
+    dest:
+      path: ~/images/special
+    config:
+      force_compress: true
+      compression_override: webp
+      quality: 95
+  - url: ftp://files.example.com/resource.mp4
+    dest:
+      provider: gdrive
+      path: my-drive/Música
+    name: video
+    config:
+      compression_override: av1
+  - url: https://example3.com/resource.mov
+    dest:
+      provider: s3
+      path: movies
+    name: movie
+    config:
+      compression_override: none

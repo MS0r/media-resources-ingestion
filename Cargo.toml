@@ -1,15 +1,17 @@
 [package]
-name = "file_down_comp"
+name = "media-resources-ingestion"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
 axum = "0.8.9"
 bb8 = "0.9.1"
-clap = "4.6.1"
+clap = { version = "4.5.55", features = ["derive"] }
+dotenvy = "0.15.7"
 mongodb = { version = "3.6.0", default-features = false, features = ["bson-3", "compat-3-3-0", "rustls-tls"] }
 redis = { version = "1.2.0", default-features = false, features = ["tokio-comp", "bb8"] }
 reqwest = { version = "0.13.2", default-features = false, features = ["stream"] }
+serde_yaml = "0.9"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 tokio = { version = "1.52.1", features = ["full"] }
