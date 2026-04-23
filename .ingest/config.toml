@@ -1,0 +1,22 @@
+[cli]
+log_format = "pretty"       # pretty | json
+no_color = false
+
+[scheduler]
+file_workers = 5            # SCHEDULER_FILE_WORKERS
+chunk_workers = 20          # SCHEDULER_CHUNK_WORKERS
+max_pending = 10_000        # SCHEDULER_MAX_PENDING
+max_per_host = 2            # DOWNLOAD_MAX_PER_HOST
+
+[compression]
+threshold_mb = 512          # COMPRESSION_THRESHOLD_MB
+quality = 95                # COMPRESSION_QUALITY_DEFAULT
+
+[storage]
+default_provider = "local"
+default_path = "~/downloads"
+
+[retry]
+attempt_1_secs = 5
+attempt_2_secs = 30
+attempt_3_secs = 120

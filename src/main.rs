@@ -16,14 +16,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!("Starting media-resources-ingestion CLI...");
 
-    let config_path = cli::get_config_path()?;
-    tracing::info!("Loading config from: {:?}", config_path);
+    let config = cli::get_config()?;
+    tracing::info!("Loading config from: {:?}", config);
 
-    let request = cli::load_config(config_path.to_str().unwrap())?;
+    println!("{}",config.path);
+    tracing::info!("Config loaded: {} resources to process", config.resources.len());
 
-    tracing::info!("Config loaded: {} resources to process", request.resources.len());
-
-    println!("Config loaded successfully. {} resources found.", request.resources.len());
+    println!("Config loaded successfully. {} resources found.", config.resources.len());
 
     Ok(())
 }

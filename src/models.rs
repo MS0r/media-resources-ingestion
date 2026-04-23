@@ -115,13 +115,3 @@ pub struct IngestionRequest {
 fn default_provider() -> Provider {
     Provider::Local
 }
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Claims {
-    pub accept: bool,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct HealthCheckResponse {
-    pub status: String,
-}
