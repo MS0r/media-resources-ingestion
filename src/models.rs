@@ -1,4 +1,6 @@
 use serde::{Deserialize, Serialize};
+use crate::cli::LogFormat;
+use url::Url;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Headers {
@@ -75,7 +77,7 @@ pub struct Destination {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Resource {
-    pub url: String,
+    pub url: Url,
     #[serde(default)]
     pub name: Option<String>,
     #[serde(default)]
@@ -114,4 +116,46 @@ pub struct IngestionRequest {
 
 fn default_provider() -> Provider {
     Provider::Local
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TomlConfig {
+    cli : CliConfig,
+    scheduler : SchedulerConfig,
+    compression : CompressionConfig,
+    storage : StorageConfig,
+    retry : RetryConfig
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CliConfig {
+    pub log_format: LogFormat,
+    pub no_color: bool
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SchedulerConfig {
+    pub file_workers: usize,
+    pub chunk_workers : usize,
+    pub max_pending_jobs: usize,
+    pub max_per_host : usize
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CompressionConfig {
+    pub threshold_mb : usize,
+    pub quality : u8
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct StorageConfig {
+    pub default_provider: String,
+    pub default_path: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RetryConfig {
+    pub attempt_1_secs: u16,
+    pub attempt_2_secs: u16,
+    pub attempt_3_secs: u16,
 }

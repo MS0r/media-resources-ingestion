@@ -1,4 +1,4 @@
-use redis::{aio::MultiplexedConnection, AsyncCommands, Client};
+use redis::{aio::MultiplexedConnection, Client};
 
 #[derive(Clone)]
 pub struct RedisService {

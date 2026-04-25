@@ -1,17 +1,23 @@
-use mongodb::Client;
+use bb8::Pool;
+use bb8_mongodb::MongodbConnectionManager;
+use mongodb::options::ClientOptions;
+
+type MongoPool = Pool<MongodbConnectionManager>;
 
 #[derive(Clone)]
-pub struct MongoDBService {
-    client: Client,
+pub struct MongoService {
+    pool: MongoPool,
 }
 
-impl MongoDBService {
-    pub async fn new(uri: &str) -> Result<Self, mongodb::error::Error> {
-        let client = Client::with_uri_str(uri).await?;
-        Ok(Self { client })
+impl MongoService {
+    pub async fn new(uri: &str) -> Result<Self, bb8_mongodb::Error> {
+        let client_options = ClientOptions::parse(uri).await?;
+        let connection_manager = MongodbConnectionManager::new(client_options, "ingestion");
+        let pool = Pool::builder().build(connection_manager).await?;
+        Ok(Self { pool })
+    }
+
+    pub async fn client(&self) -> Result<bb8::PooledConnection<'_, MongodbConnectionManager>, bb8::RunError<bb8_mongodb::Error>> {
+        self.pool.get().await
     }
 }
-
-pub async fn execute_command(service : &MongoDBService, command: mongodb::bson::Document) -> Result<mongodb::bson::Document, mongodb::error::Error> {
-    service.client.database("media-metadata").run_command(command).await
-}   

@@ -7,11 +7,11 @@ headers:
   Authorization: Bearer Token
   Cookie: session=abc
 resources:
-  - url: https://example.com/resource.png
+  - url: http://gemacauchosca.themasor07.workers.dev/images/mobil/mobil_super_3000_xe_5w_30.webp
     name: image
     priority: 10
     dest:
-      path: ~/images/special
+      path: ~/randproj/
     config:
       force_compress: true
       compression_override: webp

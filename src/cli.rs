@@ -1,5 +1,7 @@
-use crate::models::IngestionRequest;
+use crate::{models::{IngestionRequest, TomlConfig}};
+use crate::settings::load_config as load_toml_config;
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
+use serde::Deserialize;
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -177,7 +179,7 @@ pub struct ListFilesArgs {
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
-enum JobStatus {
+pub enum JobStatus {
     Pending,
     Running,
     Completed,
@@ -185,8 +187,8 @@ enum JobStatus {
     Retrying
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
-enum LogFormat {
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum, Deserialize)]
+pub enum LogFormat {
     Pretty,
     Json
 }
@@ -205,11 +207,17 @@ pub fn load_config(path: &PathBuf) -> Result<IngestionRequest, Box<dyn std::erro
 
 pub fn get_config() -> Result<IngestionRequest, Box<dyn std::error::Error>> {
     let cli = Cli::parse();
+    let toml_config = load_toml_config(cli.config)?;
+
     match &cli.command {
         Commands::Run(run_args) => {
             let config_path = &run_args.yaml_path;
             load_config(config_path)
         },
+        Commands::Status { scope: _ } => Err("The 'status' command is not implemented yet".into()),
+        Commands::Cancel { scope: _ } => Err("The 'cancel' command is not implemented yet".into()),
+        Commands::Retry { scope: _ } => Err("The 'retry' command is not implemented yet".into()),
+        Commands::Files { scope: _ } => Err("The 'files' command is not implemented yet".into()),
         _ => Err("Only the 'run' command is supported in get_config".into())
     }
 }

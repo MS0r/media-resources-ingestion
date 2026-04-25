@@ -1,21 +1,17 @@
 use crate::services::redis::RedisService;
-use crate::services::mongo::MongoDBService;
-
-use std::sync::Arc;
+use crate::services::mongo::MongoService;
 
 #[derive(Clone)]
 pub struct AppState {
-    pub mongodb_service: MongoDBService,
+    pub mongo_service: MongoService,
     pub redis_service: RedisService,
-    pub api_key : Arc<String>
 }
 
 impl AppState {
-    pub fn new(mongodb_service: MongoDBService, redis_service: RedisService, api_key : String) -> Self {
+    pub fn new(mongo_service: MongoService, redis_service: RedisService) -> Self {
         Self {
-            mongodb_service,
+            mongo_service,
             redis_service,
-            api_key : Arc::new(api_key)
         }
     }
 }
