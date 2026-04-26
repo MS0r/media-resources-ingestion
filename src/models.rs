@@ -1,11 +1,71 @@
 use serde::{Deserialize, Serialize};
 use crate::cli::LogFormat;
+use mongodb::bson::DateTime as MongoDateTime;
 use url::Url;
+
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Headers {
     pub authorization: Option<String>,
     pub cookie: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Metadata {
+    pub file_hash: String, // SHA256 or similar
+    original_url: Url,
+    storage_provider: Provider,
+    storage_path: String,
+    original_file_size: u64,
+    compressed_file_size: Option<u64>,
+    compression_ratio: Option<f32>,
+    mime_type: String,
+    chunk_manifest: Option<Manifest>, // List of chunk identifiers if applicable
+    upload_date: MongoDateTime,
+    duplicate_reference_count: u32,
+    update_date: Option<MongoDateTime>,
+}
+
+impl Metadata {
+    pub fn new(file_hash: String, original_url: Url, storage_provider: Provider, storage_path: String, original_file_size: u64, compressed_file_size: Option<u64>, mime_type: String) -> Self {
+        Self {
+            file_hash,
+            original_url,
+            storage_provider,
+            storage_path,
+            original_file_size,
+            compressed_file_size,
+            compression_ratio: compressed_file_size.map(|c| c as f32 / original_file_size as f32),
+            mime_type,
+            chunk_manifest: None,
+            upload_date: MongoDateTime::now(),
+            duplicate_reference_count: 0,
+            update_date: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Manifest {
+    file_hash: String,
+    original_file_size: u64,
+    compressed_file_size: Option<u64>,
+    compression_method: Option<String>,
+    chunking_strategy: Option<String>,
+    chunk_size_bytes: Option<u64>,
+    sequence: Option<u32>,
+    chunks: Option<Vec<Chunk>>,
+    reconstruction_instructions: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Chunk {
+    hash: String,
+    size_original: u64,
+    size_compressed: Option<u64>,
+    storage_path: String,
+    offset_start: u64,
+    offset_end: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
