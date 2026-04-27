@@ -1,9 +1,9 @@
 use serde::{Deserialize, Serialize};
-use crate::cli::LogFormat;
+use crate::{storage::Provider};
 use mongodb::bson::DateTime as MongoDateTime;
 use url::Url;
 
-
+/// Core data models for the media resources ingestion system
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Headers {
     pub authorization: Option<String>,
@@ -137,6 +137,8 @@ pub struct Destination {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Resource {
+    #[serde(default = "default_uuid")]
+    pub id: String,
     pub url: Url,
     #[serde(default)]
     pub name: Option<String>,
@@ -148,18 +150,9 @@ pub struct Resource {
     pub config: Option<ResourceLevelConfig>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
-#[serde(rename_all = "lowercase")]
-pub enum Provider {
-    #[default]
-    Local,
-    Gdrive,
-    Dropbox,
-    S3,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IngestionRequest {
+pub struct IngestionConfig {
     #[serde(default = "default_provider")]
     pub provider: Provider,
     pub path: String,
@@ -178,44 +171,6 @@ fn default_provider() -> Provider {
     Provider::Local
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct TomlConfig {
-    cli : CliConfig,
-    scheduler : SchedulerConfig,
-    compression : CompressionConfig,
-    storage : StorageConfig,
-    retry : RetryConfig
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct CliConfig {
-    pub log_format: LogFormat,
-    pub no_color: bool
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct SchedulerConfig {
-    pub file_workers: usize,
-    pub chunk_workers : usize,
-    pub max_pending_jobs: usize,
-    pub max_per_host : usize
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct CompressionConfig {
-    pub threshold_mb : usize,
-    pub quality : u8
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct StorageConfig {
-    pub default_provider: String,
-    pub default_path: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct RetryConfig {
-    pub attempt_1_secs: u16,
-    pub attempt_2_secs: u16,
-    pub attempt_3_secs: u16,
+fn default_uuid() -> String {
+    uuid::Uuid::new_v4().to_string()
 }

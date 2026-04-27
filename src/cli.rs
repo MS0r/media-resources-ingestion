@@ -1,4 +1,4 @@
-use crate::{models::{IngestionRequest, TomlConfig}};
+use crate::{models::{IngestionConfig}, settings::TomlConfig};
 use crate::settings::load_config as load_toml_config;
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use serde::Deserialize;
@@ -109,6 +109,15 @@ pub struct StatusJobsArgs {
     output: OutputFormat,
 }
 
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
+pub enum JobStatus {
+    Pending,
+    Running,
+    Completed,
+    Failed,
+    Retrying
+}
+
 #[derive(Subcommand)]
 pub enum CancelScope {
     ///Cancel all pending jobs in batch
@@ -178,15 +187,6 @@ pub struct ListFilesArgs {
     output: OutputFormat,
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
-pub enum JobStatus {
-    Pending,
-    Running,
-    Completed,
-    Failed,
-    Retrying
-}
-
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum, Deserialize)]
 pub enum LogFormat {
     Pretty,
@@ -199,20 +199,37 @@ enum OutputFormat {
     Json
 }
 
-pub fn load_config(path: &PathBuf) -> Result<IngestionRequest, Box<dyn std::error::Error>> {
+pub fn load_config(path: &PathBuf) -> Result<IngestionConfig, Box<dyn std::error::Error>> {
     let content = std::fs::read_to_string(path)?;
-    let request: IngestionRequest = serde_yaml::from_str(&content)?;
+    let request: IngestionConfig = serde_yaml::from_str(&content)?;
     Ok(request)
 }
 
-pub fn get_config() -> Result<IngestionRequest, Box<dyn std::error::Error>> {
+pub struct Config {
+    pub toml_config : TomlConfig,
+    pub yaml_config : IngestionConfig,
+    pub yaml_path : PathBuf,
+    pub redis_uri: String,
+    pub mongo_uri: String
+}
+pub fn get_config() -> Result<Config, Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     let toml_config = load_toml_config(cli.config)?;
+    let redis_uri = std::env::var("REDIS_URI").unwrap_or_else(|_| "redis://localhost:6379".to_string());
+    let mongo_uri = std::env::var("MONGODB_URI").unwrap_or_else(|_| "mongodb://localhost:27017/ingestion".to_string());
 
     match &cli.command {
         Commands::Run(run_args) => {
             let config_path = &run_args.yaml_path;
-            load_config(config_path)
+            let yaml_config = load_config(config_path)
+                .map_err(|e| format!("Failed to load YAML config from {}: {}", config_path.display(), e))?;
+            Ok(Config {
+                toml_config,
+                yaml_config,
+                yaml_path: config_path.clone(),
+                redis_uri,
+                mongo_uri
+            })
         },
         Commands::Status { scope: _ } => Err("The 'status' command is not implemented yet".into()),
         Commands::Cancel { scope: _ } => Err("The 'cancel' command is not implemented yet".into()),

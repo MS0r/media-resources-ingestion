@@ -1,11 +1,10 @@
-use crate::{models::{Metadata, Provider::Local}, services::mongo::{self, UpsertResult}, state::AppState};
-use axum::http::HeaderMap;
+use crate::{context::ContextFactory, handlers::jobs::{ChunkJobHandler, FileJobHandler, JobError, JobKind, JobOutcome}, models::Metadata, services::{mongo::UpsertResult, redis::RedisService}};
 use futures_util::StreamExt;
-use reqwest::header;
-use tokio::fs::File;
+use reqwest::header::{self, HeaderMap};
+use tokio::{fs::File, sync::Semaphore};
 use sha2::{Sha256, Digest};
 use tokio::io::AsyncWriteExt;
-use std::{path::PathBuf};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 use url::Url;
 
 use crate::models::Resource;
@@ -76,7 +75,7 @@ pub async fn download_file(resource : &Resource, state: &AppState) -> Result<Str
         .dest
         .as_ref()
         .and_then(|d| d.provider.as_ref())
-        .unwrap_or(&Local);
+        .unwrap_or("Local".to_string());
 
     let path = expand_path(dest, &filename);
     tracing::info!("Downloading from URL: {}", url);
@@ -119,5 +118,47 @@ pub async fn download_file(resource : &Resource, state: &AppState) -> Result<Str
             tracing::info!("Duplicate file detected. Existing hash: {}", existing.file_hash);
             Ok(existing.file_hash)
         }
+    }
+}
+
+pub async fn scheduler_loop(
+    file_handler: Arc<FileJobHandler>,
+    chunk_handler: Arc<ChunkJobHandler>,
+    ctx_factory: Arc<ContextFactory>,
+    max_file_workers: usize,
+    max_chunk_workers: usize,
+) {
+    let redis = ctx_factory.redis_service();
+    let file_semaphore = Arc::new(Semaphore::new(max_file_workers));
+    let chunk_semaphore = Arc::new(Semaphore::new(max_chunk_workers));
+
+    loop {
+        // ZPOPMAX jobs:pending — highest priority first
+        if let Some((job_id, kind)) = redis.dequeue_job().await {
+            match kind {
+                JobKind::File => {
+                    let permit = file_semaphore.clone().acquire_owned().await.unwrap();
+                    let ctx = ctx_factory.build(job_id);
+                    let handler = file_handler.clone();
+                    tokio::spawn(async move {
+                        let _permit = permit; // dropped when task ends
+                        match handler.execute(&ctx).await {
+                            Ok(JobOutcome::SpawnedChunks(chunks)) => {
+                                // enqueue each ChunkJob into jobs:pending
+                            }
+                            Ok(JobOutcome::Completed) => { /* update Redis + MongoDB */ }
+                            Err(JobError::Retryable(e)) => { /* backoff + re-enqueue */ }
+                            Err(JobError::Fatal(e)) => { /* mark Failed, no retry */ }
+                        }
+                    });
+                }
+                JobKind::Chunk => {
+                    let permit = chunk_semaphore.clone().acquire_owned().await.unwrap();
+                    // same pattern
+                }
+            }
+        }
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }

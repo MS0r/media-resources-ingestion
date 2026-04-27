@@ -1,4 +1,4 @@
-use crate::models::Metadata;
+use crate::models::{Metadata, Resource};
 use bb8::Pool;
 use bb8_mongodb::MongodbConnectionManager;
 use mongodb::{
@@ -24,7 +24,8 @@ impl MongoService {
         let client_options = ClientOptions::parse(uri).await?;
 
         let client = Client::with_options(client_options.clone())?;
-        let coll = client.database("ingestion").collection::<Metadata>("files_metadata");
+        let metadata_coll = client.database("ingestion").collection::<Metadata>("files_metadata");
+        let resources_coll = client.database("ingestion").collection::<Resource>("resources");
 
         let file_hash_index = IndexModel::builder()
             .keys(doc! { "file_hash": 1 })
@@ -37,9 +38,21 @@ impl MongoService {
             .keys(doc! { "storage_provider": 1 })
             .build();
 
-        coll.create_index(file_hash_index).await?;
-        coll.create_index(storage_index).await?;
-        coll.create_index(provider_index).await?;
+        let resource_id_index = IndexModel::builder()
+            .keys(doc! { "id": 1 })
+            .options(IndexOptions::builder().unique(true).build())
+            .build();
+        
+        let resource_batch_id = IndexModel::builder()
+            .keys(doc! { "batch_id": 1 })
+            .build();
+
+        metadata_coll.create_index(file_hash_index).await?;
+        metadata_coll.create_index(storage_index).await?;
+        metadata_coll.create_index(provider_index).await?;
+
+        resources_coll.create_index(resource_id_index).await?;
+        resources_coll.create_index(resource_batch_id).await?;
 
         let connection_manager = MongodbConnectionManager::new(client_options, "ingestion");
         let pool = Pool::builder()
@@ -51,18 +64,18 @@ impl MongoService {
         Ok(Self { pool})
     }
 
-    pub async fn client(&self) -> Result<bb8::PooledConnection<'_, MongodbConnectionManager>, bb8::RunError<bb8_mongodb::Error>> {
+    async fn client(&self) -> Result<bb8::PooledConnection<'_, MongodbConnectionManager>, bb8::RunError<bb8_mongodb::Error>> {
         self.pool.get().await
     }
 
-    pub async fn save_resource_metadata(self: &MongoService, metadata: &Metadata) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn save_file_metadata(self: &MongoService, metadata: &Metadata) -> Result<(), Box<dyn std::error::Error>> {
         let client = self.client().await?;
         let collection : Collection<Metadata> = client.collection("files_metadata");
         collection.insert_one(metadata).await?;
         Ok(())
     }
     
-    pub async fn upsert_resource_metadata(
+    pub async fn upsert_file_metadata(
         &self,
         metadata: &Metadata,
     ) -> Result<UpsertResult, Box<dyn std::error::Error>> {
@@ -81,5 +94,20 @@ impl MongoService {
             None => Ok(UpsertResult::Inserted),
             Some(existing) => Ok(UpsertResult::Duplicate(existing)),
         }
+    }
+
+    pub async fn save_resource(&self, resource: &Resource) -> Result<(), Box<dyn std::error::Error>> {
+        let client = self.client().await?;
+        let collection : Collection<Resource> = client.collection("resources");
+        collection.insert_one(resource).await?;
+        Ok(())
+    }
+
+    pub async fn get_resource_by_id(&self, id: &str) -> Result<Option<Resource>, Box<dyn std::error::Error>> {
+        let client = self.client().await?;
+        let collection : Collection<Resource> = client.collection("resources");
+        let filter = doc! { "id": id };
+        let resource = collection.find_one(filter).await?;
+        Ok(resource)
     }
 }
