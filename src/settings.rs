@@ -1,4 +1,4 @@
-use crate::cli::LogFormat;
+use crate::{cli::LogFormat, error::BoxedError};
 use std::path::PathBuf;
 use serde::{Deserialize};
 
@@ -27,7 +27,7 @@ pub struct SchedulerConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct CompressionConfig {
-    pub threshold_mb : usize,
+    pub threshold_mb : u64,
     pub quality : u8
 }
 
@@ -44,7 +44,7 @@ pub struct RetryConfig {
     pub attempt_3_secs: u16,
 }
 
-pub fn load_config(path : PathBuf) -> Result<TomlConfig, Box<dyn std::error::Error>> {
+pub fn load_config(path : PathBuf) -> Result<TomlConfig, BoxedError> {
     let toml_fs = std::fs::read_to_string(path)?;
     let config: TomlConfig = toml::from_str(&toml_fs)?;
     Ok(config)

@@ -16,17 +16,17 @@ resources:
       force_compress: true
       compression_override: webp
       quality: 95
-  - url: ftp://files.example.com/resource.mp4
-    dest:
-      provider: gdrive
-      path: my-drive/Música
-    name: video
-    config:
-      compression_override: av1
-  - url: https://example3.com/resource.mov
-    dest:
-      provider: s3
-      path: movies
-    name: movie
-    config:
-      compression_override: none
+  # - url: ftp://files.example.com/resource.mp4
+  #   dest:
+  #     provider: gdrive
+  #     path: my-drive/Música
+  #   name: video
+  #   config:
+  #     compression_override: av1
+  # - url: https://example3.com/resource.mov
+  #   dest:
+  #     provider: s3
+  #     path: movies
+  #   name: movie
+  #   config:
+  #     compression_override: none

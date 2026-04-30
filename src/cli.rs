@@ -1,5 +1,8 @@
-use crate::{models::{IngestionConfig}, settings::TomlConfig};
-use crate::settings::load_config as load_toml_config;
+use crate::{
+    models::{IngestionConfig},
+    settings::{TomlConfig, load_config as load_toml_config},
+    error::BoxedError,
+};
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use serde::Deserialize;
 use std::path::PathBuf;
@@ -199,7 +202,7 @@ enum OutputFormat {
     Json
 }
 
-pub fn load_config(path: &PathBuf) -> Result<IngestionConfig, Box<dyn std::error::Error>> {
+pub fn load_config(path: &PathBuf) -> Result<IngestionConfig, BoxedError> {
     let content = std::fs::read_to_string(path)?;
     let request: IngestionConfig = serde_yaml::from_str(&content)?;
     Ok(request)
@@ -212,7 +215,8 @@ pub struct Config {
     pub redis_uri: String,
     pub mongo_uri: String
 }
-pub fn get_config() -> Result<Config, Box<dyn std::error::Error>> {
+
+pub fn get_config() -> Result<Config, BoxedError> {
     let cli = Cli::parse();
     let toml_config = load_toml_config(cli.config)?;
     let redis_uri = std::env::var("REDIS_URI").unwrap_or_else(|_| "redis://localhost:6379".to_string());

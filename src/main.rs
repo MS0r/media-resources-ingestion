@@ -6,11 +6,13 @@ mod models;
 mod services;
 mod settings;
 mod storage;
+mod error;
 
+use crate::error::BoxedError;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), BoxedError> {
     dotenvy::dotenv().ok();
 
     tracing_subscriber::registry()
