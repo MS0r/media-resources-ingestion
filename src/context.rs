@@ -1,5 +1,14 @@
+use tokio::fs::File;
+
+use crate::{
+    cli::Config,
+    error::BoxedError,
+    handlers::jobs::{ChunkJob, FileJob, JobContext, JobKind},
+    models::Resource,
+    services::{mongo::MongoService, redis::RedisService},
+    settings::TomlConfig,
+};
 use std::{fmt::Error, sync::Arc};
-use crate::{cli::Config, handlers::jobs::JobContext, models::Resource, services::{mongo::MongoService, redis::RedisService}, settings::TomlConfig};
 
 pub struct ContextFactory {
     mongo: Arc<MongoService>,
@@ -24,21 +33,17 @@ impl ContextFactory {
         self.mongo.clone()
     }
 
-    // Called once per job execution by the scheduler
-    pub async fn build(&self, job_id : String) -> Result<JobContext, Box<dyn std::error::Error>> {
-        if let Some(res) = self.mongo.get_resource_by_id(&job_id).await? {
-            tracing::info!(url = %res.url, "Resource found for job");
-            Ok(JobContext {
-                job_id: job_id,
-                db: self.mongo.clone(),
-                redis: self.redis.clone(),
-                resource: Arc::new(resource),
-                config: self.config.clone(),
-            })
+    pub async fn build_file_context(&self, job_id: &str) -> Result<JobContext, BoxedError> {
+        if let Some(file_job) = self.mongo.get_file_job(job_id).await? {
+            tracing::info!(job_id = %job_id, url = %file_job.resource.url, "Building file job context from Mongo");
+            return Ok(JobContext::from_file_job(
+                file_job,
+                self.mongo.clone(),
+                self.redis.clone(),
+                self.config.clone(),
+            ));
         } else {
-            tracing::error!(job_id = %job_id, "No resource found for job");
-            Err(())
+            Err(format!("File job {job_id} not found in Mongo").into())
         }
-
     }
 }
