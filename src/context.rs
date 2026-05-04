@@ -1,14 +1,10 @@
-use tokio::fs::File;
-
 use crate::{
-    cli::Config,
     error::BoxedError,
-    handlers::jobs::{ChunkJob, FileJob, JobContext, JobKind},
-    models::Resource,
+    handlers::jobs::JobContext,
     services::{mongo::MongoService, redis::RedisService},
     settings::TomlConfig,
 };
-use std::{fmt::Error, sync::Arc};
+use std::{sync::Arc};
 
 pub struct ContextFactory {
     mongo: Arc<MongoService>,

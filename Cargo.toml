@@ -3,6 +3,14 @@ name = "media-resources-ingestion"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "media-resources-ingestion"
+path = "src/main.rs"
+
+[lib]
+name = "media_resources_ingestion"
+path = "src/lib.rs"
+
 [dependencies]
 bb8 = "0.9.1"
 clap = { version = "4.5.55", features = ["derive"] }

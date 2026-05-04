@@ -191,6 +191,7 @@ pub struct ListFilesArgs {
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum LogFormat {
     Pretty,
     Json
@@ -208,37 +209,23 @@ pub fn load_config(path: &PathBuf) -> Result<IngestionConfig, BoxedError> {
     Ok(request)
 }
 
-pub struct Config {
+pub struct CliConfig {
     pub toml_config : TomlConfig,
-    pub yaml_config : IngestionConfig,
-    pub yaml_path : PathBuf,
     pub redis_uri: String,
-    pub mongo_uri: String
+    pub mongo_uri: String,
+    pub cli : Cli,
 }
 
-pub fn get_config() -> Result<Config, BoxedError> {
+pub fn get_config() -> Result<CliConfig, BoxedError> {
     let cli = Cli::parse();
-    let toml_config = load_toml_config(cli.config)?;
+    let toml_config = load_toml_config(&cli.config)?;
     let redis_uri = std::env::var("REDIS_URI").unwrap_or_else(|_| "redis://localhost:6379".to_string());
     let mongo_uri = std::env::var("MONGODB_URI").unwrap_or_else(|_| "mongodb://localhost:27017/ingestion".to_string());
 
-    match &cli.command {
-        Commands::Run(run_args) => {
-            let config_path = &run_args.yaml_path;
-            let yaml_config = load_config(config_path)
-                .map_err(|e| format!("Failed to load YAML config from {}: {}", config_path.display(), e))?;
-            Ok(Config {
-                toml_config,
-                yaml_config,
-                yaml_path: config_path.clone(),
-                redis_uri,
-                mongo_uri
-            })
-        },
-        Commands::Status { scope: _ } => Err("The 'status' command is not implemented yet".into()),
-        Commands::Cancel { scope: _ } => Err("The 'cancel' command is not implemented yet".into()),
-        Commands::Retry { scope: _ } => Err("The 'retry' command is not implemented yet".into()),
-        Commands::Files { scope: _ } => Err("The 'files' command is not implemented yet".into()),
-        _ => Err("Only the 'run' command is supported in get_config".into())
-    }
+    Ok(CliConfig {
+        toml_config,
+        redis_uri,
+        mongo_uri,
+        cli
+    })
 }

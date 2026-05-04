@@ -1,10 +1,13 @@
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
-use crate::{storage::Provider};
+use crate::{settings::TomlConfig, storage::Provider};
 use mongodb::bson::DateTime as MongoDateTime;
 use url::Url;
 
 /// Core data models for the media resources ingestion system
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
 pub struct Headers {
     pub authorization: Option<String>,
     pub cookie: Option<String>,
@@ -120,7 +123,6 @@ impl Default for CompressionOverride {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ResourceLevelConfig {
-    pub force_compress: Option<bool>,
     #[serde(default)]
     pub compression_override: Option<CompressionOverride>,
     pub quality: Option<u8>,
@@ -132,6 +134,7 @@ pub struct ResourceLevelConfig {
 pub struct Destination {
     #[serde(default)]
     pub provider: Option<Provider>,
+    #[serde(default)]
     pub path: Option<String>,
 }
 
@@ -144,7 +147,6 @@ pub struct Resource {
     pub name: Option<String>,
     #[serde(default)]
     pub priority: Option<i32>,
-    #[serde(default)]
     pub dest: Option<Destination>,
     #[serde(default)]
     pub config: Option<ResourceLevelConfig>,
@@ -153,12 +155,10 @@ pub struct Resource {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IngestionConfig {
-    #[serde(default = "default_provider")]
-    pub provider: Provider,
-    pub path: String,
+    #[serde(flatten)]
+    pub default_dest: Option<Destination>,
     #[serde(default)]
     pub priority: Option<i32>,
-    #[serde(default)]
     pub chunk_size: Option<String>,
     #[serde(default)]
     pub compression_override: Option<CompressionOverride>,
@@ -167,10 +167,14 @@ pub struct IngestionConfig {
     pub resources: Vec<Resource>,
 }
 
-fn default_provider() -> Provider {
-    Provider::Local
-}
-
 fn default_uuid() -> String {
     uuid::Uuid::new_v4().to_string()
+}
+
+pub struct MainConfig {
+    pub toml_config: TomlConfig,
+    pub yaml_config: IngestionConfig,
+    pub yaml_path: PathBuf,
+    pub redis_uri: String,
+    pub mongo_uri: String,
 }

@@ -4,7 +4,7 @@ use bb8_mongodb::MongodbConnectionManager;
 use mongodb::{
     Client, Collection, IndexModel, bson::{DateTime, doc}, options::{ClientOptions, IndexOptions}
 };
-use std::{fs::File, time::Duration};
+use std::time::Duration;
 
 type MongoPool = Pool<MongodbConnectionManager>;
 

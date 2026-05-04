@@ -15,10 +15,7 @@ use reqwest::Response;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{io, path::PathBuf, sync::Arc};
-use tokio::{
-    fs::File,
-    io::{AsyncReadExt, AsyncWriteExt},
-};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::io::StreamReader;
 use url::Url;
 

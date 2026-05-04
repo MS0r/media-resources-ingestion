@@ -15,6 +15,28 @@ pub enum Provider {
     S3,
 }
 
+impl std::fmt::Display for Provider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Provider::Local => write!(f, "local"),
+            Provider::Gdrive => write!(f, "gdrive"),
+            Provider::Dropbox => write!(f, "dropbox"),
+            Provider::S3 => write!(f, "s3"),
+        }
+    }
+}
+
+impl From<String> for Provider {
+    fn from(s: String) -> Self {
+        match s.to_lowercase().as_str() {
+            "gdrive" => Provider::Gdrive,
+            "dropbox" => Provider::Dropbox,
+            "s3" => Provider::S3,
+            _ => Provider::Local,
+        }
+    }
+}
+
 pub struct LocalProvider;
 pub struct GDriveProvider;
 pub struct DropboxProvider;

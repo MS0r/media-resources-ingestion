@@ -1,5 +1,5 @@
 [cli]
-log_format = "Pretty"       # pretty | json
+log_format = "pretty"       # pretty | json
 no_color = false
 
 [scheduler]
@@ -15,6 +15,7 @@ quality = 95                # COMPRESSION_QUALITY_DEFAULT
 [storage]
 default_provider = "local"
 default_path = "~/downloads"
+chunk_size = "128MB"          # STORAGE_CHUNK_SIZE
 
 [retry]
 attempt_1_secs = 5

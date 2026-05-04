@@ -1,19 +1,20 @@
 use crate::{
-    cli::Config,
+    cli::{CancelScope, FilesScope, RetryScope, StatusScope},
     context::ContextFactory,
     error::BoxedError,
     handlers::{
         jobs::{Batch, ChunkJobHandler, FileJob, FileJobHandler, JobStatus},
         scheduler::scheduler_loop,
     },
-    // services::mongo::MongoService,
-    services::{mongo::MongoService, redis::RedisService},
+    models::MainConfig,
+    services::{mongo::MongoService, redis::RedisService}, 
+    settings::merge_configs_yaml,
 };
 use chrono::Utc;
 use std::sync::Arc;
 use uuid::Uuid;
 
-pub async fn run(config: Config) -> Result<(), BoxedError> {
+pub async fn run(config: MainConfig) -> Result<(), BoxedError> {
     tracing::info!(
         resources = config.yaml_config.resources.len(),
         "Config loaded"
@@ -65,8 +66,8 @@ pub async fn run(config: Config) -> Result<(), BoxedError> {
     let chunk_handler = Arc::new(ChunkJobHandler);
 
     // -- Context factory ---------------------------------------------------
-    let max_f_workers = config.toml_config.scheduler.file_workers;
-    let max_c_workers = config.toml_config.scheduler.chunk_workers;
+    let max_file_workers = config.toml_config.scheduler.file_workers;
+    let max_chunk_workers = config.toml_config.scheduler.chunk_workers;
 
     let ctx_factory = Arc::new(ContextFactory::new(
         mongo_service,
@@ -78,10 +79,52 @@ pub async fn run(config: Config) -> Result<(), BoxedError> {
         file_handler,
         chunk_handler,
         ctx_factory,
-        max_f_workers,
-        max_c_workers,
+        max_file_workers,
+        max_chunk_workers,
     )
     .await;
 
+    Ok(())
+}
+
+pub async fn status(scope: StatusScope) -> Result<(), BoxedError> {
+    match scope {
+        StatusScope::Batch { batch_id } => {
+            tracing::info!("Checking status of batch {}", batch_id)
+        }
+        StatusScope::Job { job_id } => tracing::info!("Checking status of file {}", job_id),
+        StatusScope::Jobs(args) => tracing::info!("Checking status of all jobs"),
+    }
+    Ok(())
+}
+
+pub async fn cancel(scope: CancelScope) -> Result<(), BoxedError> {
+    match scope {
+        CancelScope::Batch { batch_id } => tracing::info!("Cancelling batch {}", batch_id),
+        CancelScope::Job { job_id } => tracing::info!("Cancelling file {}", job_id),
+    }
+    Ok(())
+}
+
+pub async fn retry(scope: RetryScope) -> Result<(), BoxedError> {
+    match scope {
+        RetryScope::Job { job_id } => tracing::info!("Retrying file {}", job_id),
+    }
+    Ok(())
+}
+
+pub async fn files(scope: FilesScope) -> Result<(), BoxedError> {
+    match scope {
+        FilesScope::Delete { hash, yes } => tracing::info!("Listing all stored files"),
+        FilesScope::Download { hash, dest } => {
+            if let Some(des) = dest {
+                tracing::info!("Downloading file with hash {} to {}", hash, des.display())
+            } else {
+                tracing::info!("Downloading file with hash {} to stdout", hash)
+            }
+        }
+        FilesScope::Get { hash } => tracing::info!("Listing all stored files"),
+        FilesScope::List(args) => tracing::info!("Listing all stored files"),
+    }
     Ok(())
 }

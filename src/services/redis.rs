@@ -4,7 +4,6 @@ use crate::{
     handlers::jobs::{Batch, ChunkJob, FileJob, JobKind},
 };
 use redis::{AsyncCommands, Client, aio::MultiplexedConnection};
-use serde_json;
 
 #[derive(Clone)]
 pub struct RedisService {
