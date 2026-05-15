@@ -1,12 +1,16 @@
 use media_resources_ingestion::settings::TomlConfig;
 use media_resources_ingestion::models::IngestionConfig;
-use media_resources_ingestion::cli::LogFormat;
 use media_resources_ingestion::settings::merge_configs_yaml;
 
 const TOML_FULL: &str = r#"
 [cli]
 log_format = "Pretty"
 no_color = false
+
+[cli.custom_flags]
+dry_run = false
+follow = true
+output = "table"
 
 [scheduler]
 file_workers = 5
@@ -34,6 +38,11 @@ const TOML_MINIMAL: &str = r#"
 log_format = "Json"
 no_color = true
 
+[cli.custom_flags]
+dry_run = false
+follow = true
+output = "table"
+
 [scheduler]
 file_workers = 1
 chunk_workers = 1
@@ -59,6 +68,11 @@ const TOML_LARGE: &str = r#"
 [cli]
 log_format = "Pretty"
 no_color = false
+
+[cli.custom_flags]
+dry_run = false
+follow = true
+output = "table"
 
 [scheduler]
 file_workers = 100
@@ -98,7 +112,6 @@ resources:
       provider: local
       path: ~/downloads
     config:
-      force_compress: true
       compression_override: webp
       quality: 95
 "#;
@@ -139,7 +152,6 @@ const YAML_RESOURCE_CONFIG: &str = r#"
 resources:
   - url: https://example.com/image.png
     config:
-      force_compress: false
       quality: 80
 "#;
 
@@ -150,7 +162,7 @@ mod toml_tests {
     fn test_toml_config_full_deserialization() {
         let config: TomlConfig = toml::from_str(TOML_FULL).expect("Failed to parse TOML");
 
-        assert_eq!(config.cli.log_format, LogFormat::Pretty);
+        assert_eq!(config.cli.log_format, "Pretty");
         assert_eq!(config.cli.no_color, false);
         assert_eq!(config.scheduler.file_workers, 5);
         assert_eq!(config.scheduler.chunk_workers, 20);
@@ -170,7 +182,7 @@ mod toml_tests {
     fn test_toml_config_minimal_values() {
         let config: TomlConfig = toml::from_str(TOML_MINIMAL).expect("Failed to parse TOML");
 
-        assert_eq!(config.cli.log_format, LogFormat::Json);
+        assert_eq!(config.cli.log_format, "Json");
         assert_eq!(config.cli.no_color, true);
         assert_eq!(config.scheduler.file_workers, 1);
         assert_eq!(config.compression.quality, 0);
@@ -286,7 +298,7 @@ mod yaml_tests {
 }
 
 mod merge_tests {
-    use media_resources_ingestion::error::BoxedError;
+    use media_resources_ingestion::error::ToolError;
 
     use super::*;
 
@@ -294,6 +306,11 @@ mod merge_tests {
 [cli]
 log_format = "Pretty"
 no_color = false
+
+[cli.custom_flags]
+dry_run = false
+follow = true
+output = "table"
 
 [scheduler]
 file_workers = 5
@@ -335,7 +352,7 @@ resources:
 "#;
 
     #[test]
-    fn test_merge_provider_from_toml() -> Result<(), BoxedError> {
+    fn test_merge_provider_from_toml() -> Result<(), ToolError> {
         let toml: TomlConfig = toml::from_str(TOML_DEFAULTS).expect("Failed to parse TOML");
         let yaml: IngestionConfig = serde_yaml::from_str(YAML_MINIMAL_NO_PROVIDER).expect("Failed to parse YAML");
 
@@ -346,7 +363,7 @@ resources:
     }
 
     #[test]
-    fn test_merge_path_from_toml() -> Result<(), BoxedError>  {
+    fn test_merge_path_from_toml() -> Result<(), ToolError>  {
         let toml: TomlConfig = toml::from_str(TOML_DEFAULTS).expect("Failed to parse TOML");
         let yaml: IngestionConfig = serde_yaml::from_str(YAML_MINIMAL_NO_PROVIDER).expect("Failed to parse YAML");
 
@@ -357,7 +374,7 @@ resources:
     }
 
     #[test]
-    fn test_merge_chunk_size_from_toml() -> Result<(), BoxedError>  {
+    fn test_merge_chunk_size_from_toml() -> Result<(), ToolError>  {
         let toml: TomlConfig = toml::from_str(TOML_DEFAULTS).expect("Failed to parse TOML");
         let yaml: IngestionConfig = serde_yaml::from_str(YAML_MINIMAL_NO_PROVIDER).expect("Failed to parse YAML");
 
@@ -368,7 +385,7 @@ resources:
     }
 
     #[test]
-    fn test_merge_yaml_overrides_toml() -> Result<(), BoxedError>  {
+    fn test_merge_yaml_overrides_toml() -> Result<(), ToolError>  {
         let toml: TomlConfig = toml::from_str(TOML_DEFAULTS).expect("Failed to parse TOML");
         let yaml: IngestionConfig = serde_yaml::from_str(YAML_WITH_PROVIDER).expect("Failed to parse YAML");
 
@@ -380,7 +397,7 @@ resources:
     }
 
     #[test]
-    fn test_merge_yaml_chunk_size_overrides_toml() -> Result<(), BoxedError>  {
+    fn test_merge_yaml_chunk_size_overrides_toml() -> Result<(), ToolError>  {
         let toml: TomlConfig = toml::from_str(TOML_DEFAULTS).expect("Failed to parse TOML");
         let yaml: IngestionConfig = serde_yaml::from_str(YAML_WITH_CHUNK_SIZE).expect("Failed to parse YAML");
 

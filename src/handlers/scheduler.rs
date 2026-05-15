@@ -1,46 +1,10 @@
 use crate::{
     context::ContextFactory,
-    handlers::jobs::{ChunkJobHandler, FileJobHandler, JobError, JobHandler, JobKind, JobOutcome},
+    error::JobErrorOutcome,
+    handlers::jobs::{ChunkJobHandler, FileJobHandler, JobHandler, JobKind, JobOutcome},
 };
-use reqwest::header::{self, HeaderMap};
 use std::{sync::Arc, time::Duration};
 use tokio::sync::Semaphore;
-
-fn get_mime_from_filename(filename: &str) -> Option<String> {
-    mime_guess::from_path(filename)
-        .first_raw()
-        .map(|s| s.to_string())
-}
-
-fn get_mime_type(headers: &HeaderMap) -> Option<String> {
-    if let Some(ct) = headers.get(header::CONTENT_TYPE)
-        && let Ok(ct_str) = ct.to_str()
-    {
-        // remove charset if present
-        let mime = ct_str.split(';').next()?.trim();
-        if !mime.is_empty() {
-            return Some(mime.to_string());
-        }
-    }
-
-    if let Some(cd) = headers.get(header::CONTENT_DISPOSITION) {
-        if let Ok(cd_str) = cd.to_str()
-            && let Some(filename_part) = cd_str
-                .split(';')
-                .find(|part| part.trim().starts_with("filename="))
-        {
-            let filename = filename_part
-                .trim()
-                .trim_start_matches("filename=")
-                .trim_matches('"');
-
-            if let Some(mime) = mime_guess::from_path(filename).first_raw() {
-                return Some(mime.to_string());
-            }
-        }
-    }
-    Some("No Mime type found".to_string())
-}
 
 pub async fn scheduler_loop(
     file_handler: Arc<FileJobHandler>,
@@ -54,12 +18,10 @@ pub async fn scheduler_loop(
     let chunk_semaphore = Arc::new(Semaphore::new(max_chunk_workers));
 
     loop {
-        // ZPOPMAX jobs:pending — highest priority first
         if let Ok(Some((kind, job_id))) = redis.dequeue_job().await {
             match kind {
                 JobKind::File => {
                     let permit = file_semaphore.clone().acquire_owned().await.unwrap();
-
                     let ctx = match ctx_factory.build_file_context(&job_id).await {
                         Ok(ctx) => ctx,
                         Err(e) => {
@@ -69,27 +31,63 @@ pub async fn scheduler_loop(
                     };
 
                     let handler = file_handler.clone();
+                    let redis_clone = redis.clone();
                     tokio::spawn(async move {
                         let _permit = permit;
-
                         match handler.execute(&ctx).await {
-                            Ok(JobOutcome::SpawnedChunks(chunks)) => {}
-                            Ok(JobOutcome::Completed) => {}
-                            Err(JobError::Retryable(e)) => {
-                                if let Err(err) = ctx.redis.retry_job(&job_id, kind).await {
-                                    tracing::error!(?err, "failed to requeue retryable job");
+                            Ok(JobOutcome::SpawnedChunks(chunks)) => {
+                                for chunk in chunks {
+                                    let _ = redis_clone.enqueue_chunk_job(&chunk).await;
                                 }
                             }
-
-                            Err(JobError::Fatal(e)) => {
+                            Ok(JobOutcome::Completed) => {
+                                tracing::info!(job_id = %job_id, "File job completed");
+                            }
+                            Err(JobErrorOutcome::Retryable(e)) => {
+                                tracing::error!(?job_id, "retrying job due to error: ({e})");
+                                if let Err(err) = ctx.redis.retry_job(&job_id, JobKind::File).await {
+                                    tracing::error!(?err, "failed to reenqueue retryable job");
+                                }
+                            }
+                            Err(JobErrorOutcome::Fatal(e)) => {
                                 tracing::error!(?e, "fatal job error");
+                                ctx.redis.fail_job(&job_id, e.as_str()).await.ok();
+                                ctx.db.fail_job(&job_id, e.as_str()).await.ok();
                             }
                         }
                     });
                 }
                 JobKind::Chunk => {
                     let permit = chunk_semaphore.clone().acquire_owned().await.unwrap();
-                    // same pattern
+                    let ctx = match ctx_factory.build_chunk_context(&job_id).await {
+                        Ok(ctx) => ctx,
+                        Err(e) => {
+                            tracing::error!(job_id = %job_id, error = %e, "Failed to build chunk job context");
+                            continue;
+                        }
+                    };
+
+                    let handler = chunk_handler.clone();
+                    tokio::spawn(async move {
+                        let _permit = permit;
+                        match handler.execute(&ctx).await {
+                            Ok(JobOutcome::Completed) => {
+                                tracing::info!(job_id = %job_id, "Chunk job completed");
+                            }
+                            Ok(JobOutcome::SpawnedChunks(_)) => {
+                                tracing::warn!(job_id = %job_id, "Unexpected SpawnedChunks from chunk job");
+                            }
+                            Err(JobErrorOutcome::Retryable(e)) => {
+                                tracing::error!(?job_id, "retrying chunk job due to error: ({e})");
+                                if let Err(err) = ctx.redis.retry_job(&job_id, JobKind::Chunk).await {
+                                    tracing::error!(?err, "failed to reenqueue retryable chunk job");
+                                }
+                            }
+                            Err(JobErrorOutcome::Fatal(e)) => {
+                                tracing::error!(?e, "fatal chunk job error");
+                            }
+                        }
+                    });
                 }
             }
         }

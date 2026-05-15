@@ -97,7 +97,6 @@ resources:
       provider: local
       path: ~/downloads
     config:
-      force_compress: true
       compression_override: webp
       quality: 95
 ```
@@ -117,7 +116,6 @@ resources:
 | `resources[].priority` | No | Overrides batch-level priority for this resource |
 | `resources[].dest.provider` | No | Storage provider for this resource |
 | `resources[].dest.path` | No | Destination path for this resource |
-| `resources[].config.force_compress` | No | Force compression regardless of file size |
 | `resources[].config.compression_override` | No | Compression format for this resource |
 | `resources[].config.quality` | No | Lossy quality 0–100 (default `95`) |
 

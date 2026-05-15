@@ -1,4 +1,4 @@
-use crate::{cli::{Cli, Global, LogFormat, RunArgs}, error::BoxedError, models::IngestionConfig};
+use crate::{error::ToolError, models::IngestionConfig};
 use std::path::PathBuf;
 use serde::{Deserialize};
 
@@ -13,8 +13,16 @@ pub struct TomlConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct CliConfig {
-    pub log_format: LogFormat,
-    pub no_color: bool
+    pub log_format: String,
+    pub no_color: bool,
+    pub custom_flags: CustomFlags,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CustomFlags {
+    pub dry_run: bool,
+    pub follow: bool,
+    pub output: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -35,7 +43,7 @@ pub struct CompressionConfig {
 pub struct StorageConfig {
     pub default_provider: String,
     pub default_path: String,
-    pub chunk_size: String   
+    pub chunk_size: String
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -45,13 +53,13 @@ pub struct RetryConfig {
     pub attempt_3_secs: u16,
 }
 
-pub fn load_config(path : &PathBuf) -> Result<TomlConfig, BoxedError> {
+pub fn load_config(path : &PathBuf) -> Result<TomlConfig, ToolError> {
     let toml_fs = std::fs::read_to_string(path)?;
     let config: TomlConfig = toml::from_str(&toml_fs)?;
     Ok(config)
 }
 
-pub fn merge_configs_yaml(yaml: &IngestionConfig, toml: TomlConfig) -> Result<TomlConfig, BoxedError> {
+pub fn merge_configs_yaml(yaml: &IngestionConfig, toml: TomlConfig) -> Result<TomlConfig, ToolError> {
     let mut merged = toml.clone();
 
     if let Some(ref dest) = yaml.default_dest {
@@ -66,11 +74,6 @@ pub fn merge_configs_yaml(yaml: &IngestionConfig, toml: TomlConfig) -> Result<To
     if let Some(ref chunk_size) = yaml.chunk_size {
         merged.storage.chunk_size = chunk_size.clone();
     }
-    Ok(merged)
-}
-
-pub fn merge_configs_cli(global: Global, args: RunArgs, toml: TomlConfig) -> Result<TomlConfig, BoxedError> {
-    let mut merged = toml.clone();
     
     Ok(merged)
 }

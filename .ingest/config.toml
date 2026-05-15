@@ -2,6 +2,11 @@
 log_format = "pretty"       # pretty | json
 no_color = false
 
+[cli.custom_flags]
+dry_run = false
+follow = true
+output = "table"              # table | json
+
 [scheduler]
 file_workers = 5            # SCHEDULER_FILE_WORKERS
 chunk_workers = 20          # SCHEDULER_CHUNK_WORKERS

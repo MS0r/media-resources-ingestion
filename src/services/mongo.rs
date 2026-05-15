@@ -1,8 +1,10 @@
-use crate::{error::BoxedError, handlers::jobs::{Batch, ChunkJob, FileJob}, models::{Metadata, Resource}};
+use crate::{cli::JobStatus as JobStatusCli, error::ToolError, handlers::jobs::{Batch, ChunkJob, FileJob, JobStatus}, models::Metadata};
 use bb8::Pool;
 use bb8_mongodb::MongodbConnectionManager;
+use chrono::Utc;
+use futures_util::stream::StreamExt;
 use mongodb::{
-    Client, Collection, IndexModel, bson::{DateTime, doc}, options::{ClientOptions, IndexOptions}
+    Client, Collection, IndexModel, bson::{DateTime, doc, serialize_to_bson}, options::{ClientOptions, IndexOptions}
 };
 use std::time::Duration;
 
@@ -25,7 +27,7 @@ impl MongoService {
 
         let client = Client::with_options(client_options.clone())?;
         let metadata_coll = client.database("ingestion").collection::<Metadata>("files_metadata");
-        let batches_coll = client.database("ingestion").collection::<Batch>("batches");
+        let _batches_coll = client.database("ingestion").collection::<Batch>("batches");
         let files_jobs_coll = client.database("ingestion").collection::<FileJob>("files_jobs");
         let chunks_jobs_coll = client.database("ingestion").collection::<ChunkJob>("chunks_jobs");
 
@@ -40,9 +42,14 @@ impl MongoService {
             .keys(doc! { "storage_provider": 1 })
             .build();
 
+        let original_url_index = IndexModel::builder()
+            .keys(doc! { "original_url": 1 })
+            .build();
+        
         metadata_coll.create_index(file_hash_index).await?;
         metadata_coll.create_index(storage_index).await?;
         metadata_coll.create_index(provider_index).await?;
+        metadata_coll.create_index(original_url_index).await?;
         
         let batch_id = IndexModel::builder()
             .keys(doc! { "batch_id": 1 })
@@ -70,13 +77,14 @@ impl MongoService {
         self.pool.get().await
     }
 
-    pub async fn complete_job(self: &MongoService, metadata: Metadata,job_id: &str) -> Result<(), BoxedError> {
+    pub async fn complete_job(self: &MongoService, metadata: Metadata,job_id: &str) -> Result<(), ToolError> {
         let client = self.client().await?;
         let collection : Collection<Metadata> = client.collection("files_metadata");
         collection.insert_one(&metadata).await?;
 
+        let complete_job = serialize_to_bson(&JobStatus::Completed { finished_at: Utc::now()})?;
         let jobs_collection : Collection<FileJob> = client.collection("files_jobs");
-        jobs_collection.update_one(doc! { "_id": job_id }, doc! { "$set": { "status": "completed", "file_hash": metadata.file_hash } }).await?;
+        jobs_collection.update_one(doc! { "_id": job_id }, doc! { "$set": { "status": complete_job, "file_hash": metadata.file_hash } }).await?;
 
         Ok(())
     }
@@ -84,7 +92,7 @@ impl MongoService {
     pub async fn upsert_file_metadata(
         &self,
         file_hash: &str,
-    ) -> Result<UpsertResult, BoxedError> {
+    ) -> Result<UpsertResult, ToolError> {
         let client = self.client().await?;
         let collection: Collection<Metadata> = client.collection("files_metadata");
 
@@ -102,14 +110,14 @@ impl MongoService {
         }
     }
 
-    pub async fn save_batch(&self, batch: Batch) -> Result<(), BoxedError> {
+    pub async fn save_batch(&self, batch: Batch) -> Result<(), ToolError> {
         let client = self.client().await?;
         let collection : Collection<Batch> = client.collection("batches");
         collection.insert_one(batch).await?;
         Ok(())
     }
 
-    pub async fn save_file_job(&self, file_job: FileJob) -> Result<(), BoxedError> {
+    pub async fn save_file_job(&self, file_job: FileJob) -> Result<(), ToolError> {
         let client = self.client().await?;
         let collection : Collection<FileJob> = client.collection("files_jobs");
         match collection.insert_one(&file_job).await {
@@ -121,31 +129,134 @@ impl MongoService {
         }
     }
 
-    pub async fn save_chunk_job(&self, chunk_job: ChunkJob) -> Result<(), BoxedError> {
+    pub async fn save_chunk_job(&self, chunk_job: ChunkJob) -> Result<(), ToolError> {
         let client = self.client().await?;
         let collection : Collection<ChunkJob> = client.collection("chunks_jobs");
         collection.insert_one(chunk_job).await?;
         Ok(())
     }
 
-    pub async fn get_batch(&self, batch_id: &str) -> Result<Option<Batch>, BoxedError> {
+    pub async fn get_batch(&self, batch_id: &str) -> Result<Option<Batch>, ToolError> {
         let client = self.client().await?;
         let collection : Collection<Batch> = client.collection("batches");
         let batch = collection.find_one(doc! { "_id": batch_id }).await?;
         Ok(batch)
     }
 
-    pub async fn get_file_job(&self, job_id: &str) -> Result<Option<FileJob>, BoxedError> {
+    pub async fn get_file_job(&self, job_id: &str) -> Result<Option<FileJob>, ToolError> {
         let client = self.client().await?;
         let collection : Collection<FileJob> = client.collection("files_jobs");
         let job = collection.find_one(doc! { "_id": job_id }).await?;
         Ok(job)
     }
 
-    pub async fn get_chunk_job(&self, job_id: &str) -> Result<Option<ChunkJob>, BoxedError> {
+    pub async fn get_chunk_job(&self, job_id: &str) -> Result<Option<ChunkJob>, ToolError> {
         let client = self.client().await?;
         let collection : Collection<ChunkJob> = client.collection("chunks_jobs");
         let job = collection.find_one(doc! { "_id": job_id }).await?;
         Ok(job)
+    }
+
+    pub async fn list_jobs(
+        &self,
+        filter_status: Option<JobStatusCli>,
+        limit: usize,
+    ) -> Result<Vec<FileJob>, ToolError> {
+        let client = self.client().await?;
+        let collection: Collection<FileJob> = client.collection("files_jobs");
+
+        let mut filter = doc! {};
+        if let Some(status) = filter_status {
+            let status_str = match status {
+                JobStatusCli::Pending => "status.pending",
+                JobStatusCli::Running => "status.running",
+                JobStatusCli::Completed => "status.completed",
+                JobStatusCli::Failed => "status.failed",
+                JobStatusCli::Retrying => "status.retrying",
+                JobStatusCli::Cancelled => "status.cancelled",
+            };
+            filter.insert(status_str, doc! {"$exists" : true} );
+        }
+
+        let mut cursor = collection.find(filter).limit(limit as i64).await?;
+        let mut jobs = Vec::new();
+        while let Some(result) = cursor.next().await {
+            jobs.push(result?);
+        }
+        Ok(jobs)
+    }
+
+    pub async fn list_files(
+        &self,
+        mime_filter: Option<&str>,
+        provider_filter: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<Metadata>, ToolError> {
+        let client = self.client().await?;
+        let collection: Collection<Metadata> = client.collection("files_metadata");
+
+        let mut filter = doc! {};
+        if let Some(mime) = mime_filter {
+            filter.insert("mime_type", mime);
+        }
+        if let Some(provider) = provider_filter {
+            filter.insert("storage_provider", provider);
+        }
+
+        let mut cursor = collection.find(filter).limit(limit as i64).await?;
+        let mut files = Vec::new();
+        while let Some(result) = cursor.next().await {
+            files.push(result?);
+        }
+        Ok(files)
+    }
+
+    pub async fn get_file_metadata(&self, file_hash: &str) -> Result<Option<Metadata>, ToolError> {
+        let client = self.client().await?;
+        let collection: Collection<Metadata> = client.collection("files_metadata");
+        let file = collection.find_one(doc! { "file_hash": file_hash }).await?;
+        Ok(file)
+    }
+
+    pub async fn cancel_batch_jobs(&self, batch_id: &str) -> Result<usize, ToolError> {
+        let client = self.client().await?;
+        let collection: Collection<FileJob> = client.collection("files_jobs");
+
+        let pending_job = serialize_to_bson(&JobStatus::Pending)?;
+        let result = collection.delete_many(doc! { "batch_id": batch_id, "status": pending_job }).await?;
+        Ok(result.deleted_count as usize)
+    }
+
+    pub async fn cancel_job(&self, job_id: &str) -> Result<bool, ToolError> {
+        let client = self.client().await?;
+        let collection: Collection<FileJob> = client.collection("files_jobs");
+
+        let result = collection.delete_one(doc! { "_id": job_id, "status": "pending" }).await?;
+        Ok(result.deleted_count > 0)
+    }
+
+    pub async fn retry_failed_job(&self, job_id: &str) -> Result<bool, ToolError> {
+        let client = self.client().await?;
+        let collection: Collection<FileJob> = client.collection("files_jobs");
+
+        let pending_job = serialize_to_bson(&JobStatus::Pending)?;
+        
+        let result = collection.update_one(
+            doc! { "_id": job_id, "status.failed" : doc! {"$exists" : true} },
+            doc! { "$set": { "status": pending_job, "retry_count": 0 } }
+        ).await?;
+        Ok(result.modified_count > 0)
+    }
+
+    pub async fn fail_job(&self, job_id: &str, reason: &str) -> Result<(), ToolError> {
+        let client = self.client().await?;
+        let collection: Collection<FileJob> = client.collection("files_jobs");
+
+        let failed_job = serialize_to_bson(&JobStatus::Failed { reason: reason.to_string(), failed_at: Utc::now() })?;
+        collection.update_one(
+            doc! { "_id": job_id },
+            doc! { "$set": { "status": failed_job } }
+        ).await?;
+        Ok(())
     }
 }

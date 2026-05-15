@@ -1,14 +1,14 @@
 use crate::{
     models::{IngestionConfig},
     settings::{TomlConfig, load_config as load_toml_config},
-    error::BoxedError,
+    error::ToolError,
 };
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "media-resources-ingestion")]
+#[command(name = "ingest")]
 #[command(version, about = "Media resources ingestion CLI tool", long_about = None)]
 pub struct Cli {
     /// Path to TOML config file
@@ -20,24 +20,23 @@ pub struct Cli {
     pub command: Commands,
 }
 
-#[derive(Args)]
+#[derive(Args, Clone)]
 pub struct Global {
     /// Log format
     #[arg(long, value_enum, default_value_t = LogFormat::Pretty)]
-    log_format: LogFormat,
+    pub log_format: LogFormat,
     /// Increase log verbosity (-v info, -vv debug, -vvv trace)
     #[arg(short, long, action = ArgAction::Count)]
-    verbose: u8,
+    pub verbose: u8,
     /// Suppress all output except errors
     #[arg(short, long)]
-    quiet: bool,
+    pub quiet: bool,
     /// Disable ANSI colour output
     #[arg(long)]
-    no_color: bool,
+    pub no_color: bool,
 }
 
-#[derive(Subcommand)]
-
+#[derive(Subcommand, Clone)]
 pub enum Commands {
     ///Submit a YAML config and process all resources
     Run(RunArgs),
@@ -63,30 +62,30 @@ pub enum Commands {
     },
 }
 
-#[derive(Args)]
+#[derive(Args, Clone)]
 pub struct RunArgs {
     pub yaml_path: PathBuf,
     /// Validate YAML and preflight URLs without downloading
     #[arg(long)]
-    dry_run: bool,
+    pub dry_run: bool,
     /// Override top-level priority for this batch
     #[arg(long)]
-    priority: Option<i32>,
+    pub priority: Option<i32>,
     /// Override SCHEDULER_FILE_WORKERS for this run
     #[arg(long)]
-    workers: Option<usize>,
+    pub workers: Option<usize>,
     /// Stream live progress to the terminal
-    #[arg(long, default_value_t = true, overrides_with = "no_follow")]
-    follow: bool,
+    #[arg(long, overrides_with = "no_follow")]
+    pub follow: bool,
     /// Return immediately after enqueuing; print batch ID
     #[arg(long, overrides_with = "follow")]
-    no_follow: bool,
+    pub no_follow: bool,
     /// Output format for final summary
     #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
-    output: OutputFormat,
+    pub output: OutputFormat,
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Clone)]
 pub enum StatusScope {
     ///All jobs in a batch
     Batch {
@@ -100,28 +99,30 @@ pub enum StatusScope {
     Jobs(StatusJobsArgs)
 }
 
-#[derive(Args)]
+#[derive(Args, Clone)]
 pub struct StatusJobsArgs {
     #[arg(long, value_name = "status", value_enum, help = "Filter jobs by status")]
-    filter: Option<JobStatus>,
+    pub filter: Option<JobStatus>,
 
     #[arg(long, help = "Max results", default_value_t = 50)]
-    limit: usize,
+    pub limit: usize,
 
-    #[arg(long, value_name = "fmt", value_enum, help = "Output format for final summary", default_value_t = OutputFormat::Table)]
-    output: OutputFormat,
+    #[arg(long, value_name = "fmt", value_enum, help = "Output format", default_value_t = OutputFormat::Table)]
+    pub output: OutputFormat,
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum JobStatus {
     Pending,
     Running,
     Completed,
     Failed,
-    Retrying
+    Retrying,
+    Cancelled
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Clone)]
 pub enum CancelScope {
     ///Cancel all pending jobs in batch
     Batch {
@@ -133,7 +134,7 @@ pub enum CancelScope {
     },
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Clone)]
 pub enum RetryScope {
     ///Retry a single failed job
     Job {
@@ -141,7 +142,7 @@ pub enum RetryScope {
     },
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Clone)]
 pub enum FilesScope {
     ///List stored files
     List(ListFilesArgs),
@@ -169,25 +170,25 @@ pub enum FilesScope {
 
 }
 
-#[derive(Args)]
+#[derive(Args, Clone)]
 pub struct ListFilesArgs {
     #[arg(long, value_name = "type", help = "Filter by MIME type (e.g. image/webp)")]
-    mime: Option<String>,
+    pub mime: Option<String>,
 
     #[arg(long, value_name = "name", help = "Filter by storage provider")]
-    provider: Option<String>,
+    pub provider: Option<String>,
 
     #[arg(long, value_name = "DATE", help = "ISO 8601 date lower bound")]
-    from: Option<String>,
+    pub from: Option<String>,
 
     #[arg(long, value_name = "DATE", help = "ISO 8601 date upper bound")]
-    to: Option<String>,
+    pub to: Option<String>,
 
     #[arg(long, value_name = "N", default_value_t = 100)]
-    limit: usize,
+    pub limit: usize,
 
-    #[arg(long, value_name = "fmt", value_enum, help = "Output format for final summary", default_value_t = OutputFormat::Table)]
-    output: OutputFormat,
+    #[arg(long, value_name = "fmt", value_enum, help = "Output format", default_value_t = OutputFormat::Table)]
+    pub output: OutputFormat,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum, Deserialize)]
@@ -198,14 +199,18 @@ pub enum LogFormat {
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
-enum OutputFormat {
+pub enum OutputFormat {
     Table,
     Json
 }
 
-pub fn load_config(path: &PathBuf) -> Result<IngestionConfig, BoxedError> {
+pub fn load_config(path: &PathBuf) -> Result<IngestionConfig, ToolError> {
     let content = std::fs::read_to_string(path)?;
-    let request: IngestionConfig = serde_yaml::from_str(&content)?;
+    let request: IngestionConfig = serde_yaml::from_str(&content)
+        .map_err(|e| {
+            tracing::error!("YAML parse error: {}", e);
+            ToolError::ConfigError(format!("YAML parse error: {}", e))
+        })?;
     Ok(request)
 }
 
@@ -216,11 +221,24 @@ pub struct CliConfig {
     pub cli : Cli,
 }
 
-pub fn get_config() -> Result<CliConfig, BoxedError> {
+pub fn get_config() -> Result<CliConfig, ToolError> {
     let cli = Cli::parse();
     let toml_config = load_toml_config(&cli.config)?;
-    let redis_uri = std::env::var("REDIS_URI").unwrap_or_else(|_| "redis://localhost:6379".to_string());
-    let mongo_uri = std::env::var("MONGODB_URI").unwrap_or_else(|_| "mongodb://localhost:27017/ingestion".to_string());
+
+    let redis_uri = std::env::var("REDIS_URI")
+        .map_err(|_| {
+            tracing::error!("REDIS_URI environment variable is required");
+            ToolError::ConfigError("REDIS_URI not set".to_string())
+        })?;
+
+    let mongo_uri = std::env::var("MONGODB_URI")
+        .map_err(|_| {
+            tracing::error!("MONGODB_URI environment variable is required");
+            ToolError::ConfigError("MONGODB_URI not set".to_string())
+        })?;
+
+    // Validate secret environment variables based on providers used
+    validate_secrets()?;
 
     Ok(CliConfig {
         toml_config,
@@ -228,4 +246,32 @@ pub fn get_config() -> Result<CliConfig, BoxedError> {
         mongo_uri,
         cli
     })
+}
+
+fn validate_secrets() -> Result<(), ToolError> {
+    // Check AWS credentials if S3 provider is needed
+    if std::env::var("AWS_S3_BUCKET").is_ok() {
+        if std::env::var("AWS_ACCESS_KEY_ID").is_err() || std::env::var("AWS_SECRET_ACCESS_KEY").is_err() {
+            tracing::error!("AWS credentials required: set AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION, AWS_S3_BUCKET");
+            return Err(ToolError::AuthError("AWS credentials required: set AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION, AWS_S3_BUCKET".to_string()));
+        }
+    }
+
+    // Check Google Drive credentials if needed
+    if std::env::var("GDRIVE_CLIENT_ID").is_ok() {
+        if std::env::var("GDRIVE_CLIENT_SECRET").is_err() || std::env::var("GDRIVE_REFRESH_TOKEN").is_err() {
+            tracing::error!("Google Drive credentials incomplete");
+            return Err(ToolError::AuthError("Google Drive credentials incomplete".to_string()));
+        }
+    }
+
+    // Check Dropbox credentials if needed
+    if std::env::var("DROPBOX_APP_KEY").is_ok() {
+        if std::env::var("DROPBOX_APP_SECRET").is_err() || std::env::var("DROPBOX_REFRESH_TOKEN").is_err() {
+            tracing::error!("Dropbox credentials incomplete");
+            return Err(ToolError::AuthError("Dropbox credentials incomplete".to_string()));
+        }
+    }
+
+    Ok(())
 }

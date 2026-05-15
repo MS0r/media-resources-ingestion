@@ -16,17 +16,17 @@ pub struct Headers {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Metadata {
     pub file_hash: String, // SHA256 or similar
-    original_url: Url,
-    storage_provider: Provider,
-    storage_path: String,
-    original_file_size: u64,
-    compressed_file_size: Option<u64>,
-    compression_ratio: Option<f32>,
-    mime_type: String,
-    chunk_manifest: Option<Manifest>, // List of chunk identifiers if applicable
-    upload_date: MongoDateTime,
-    duplicate_reference_count: u32,
-    update_date: Option<MongoDateTime>,
+    pub original_url: Url,
+    pub storage_provider: Provider,
+    pub storage_path: String,
+    pub original_file_size: u64,
+    pub compressed_file_size: Option<u64>,
+    pub compression_ratio: Option<f32>,
+    pub mime_type: String,
+    pub chunk_manifest: Option<Manifest>, // List of chunk identifiers if applicable
+    pub upload_date: MongoDateTime,
+    pub duplicate_reference_count: u32,
+    pub update_date: Option<MongoDateTime>,
 }
 
 impl Metadata {
@@ -49,26 +49,21 @@ impl Metadata {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct Manifest {
-    file_hash: String,
-    original_file_size: u64,
-    compressed_file_size: Option<u64>,
-    compression_method: Option<String>,
-    chunking_strategy: Option<String>,
-    chunk_size_bytes: Option<u64>,
-    sequence: Option<u32>,
-    chunks: Option<Vec<Chunk>>,
-    reconstruction_instructions: Option<String>,
+pub struct Manifest {
+    pub chunks: Vec<ChunkRef>,
+    pub compression: Option<String>, // e.g. "image/webp"
+    pub original_size: u64,
+    pub compressed_size: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct Chunk {
-    hash: String,
-    size_original: u64,
-    size_compressed: Option<u64>,
-    storage_path: String,
-    offset_start: u64,
-    offset_end: u64,
+pub struct ChunkRef {
+    pub hash: String,
+    pub size_original: u64,
+    pub size_compressed: Option<u64>,
+    pub storage_path: String,
+    pub offset_start: u64,
+    pub offset_end: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -167,10 +162,6 @@ pub struct IngestionConfig {
     pub resources: Vec<Resource>,
 }
 
-fn default_uuid() -> String {
-    uuid::Uuid::new_v4().to_string()
-}
-
 pub struct MainConfig {
     pub toml_config: TomlConfig,
     pub yaml_config: IngestionConfig,
@@ -178,3 +169,8 @@ pub struct MainConfig {
     pub redis_uri: String,
     pub mongo_uri: String,
 }
+
+fn default_uuid() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
