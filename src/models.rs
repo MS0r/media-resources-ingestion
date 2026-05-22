@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 
-use serde::{Deserialize, Serialize};
 use crate::{settings::TomlConfig, storage::Provider};
 use mongodb::bson::DateTime as MongoDateTime;
+use serde::{Deserialize, Serialize};
 use url::Url;
 
 /// Core data models for the media resources ingestion system
@@ -30,7 +30,15 @@ pub struct Metadata {
 }
 
 impl Metadata {
-    pub fn new(file_hash: String, original_url: Url, storage_provider: Provider, storage_path: String, original_file_size: u64, compressed_file_size: Option<u64>, mime_type: String) -> Self {
+    pub fn new(
+        file_hash: String,
+        original_url: Url,
+        storage_provider: Provider,
+        storage_path: String,
+        original_file_size: u64,
+        compressed_file_size: Option<u64>,
+        mime_type: String,
+    ) -> Self {
         Self {
             file_hash,
             original_url,
@@ -73,7 +81,6 @@ pub enum ImageCompressionStrategy {
     Avif,
     Webp,
     LosslessWebp,
-    OriginalFormat,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -82,13 +89,13 @@ pub enum VideoCompressionStrategy {
     #[default]
     H265,
     Av1,
-    OriginalFormat,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum GenericCompressionStrategy {
     #[default]
+    OriginalFormat,
     Zstd,
     Zip,
     SevenZ,
@@ -147,7 +154,6 @@ pub struct Resource {
     pub config: Option<ResourceLevelConfig>,
 }
 
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IngestionConfig {
     #[serde(flatten)]
@@ -173,4 +179,3 @@ pub struct MainConfig {
 fn default_uuid() -> String {
     uuid::Uuid::new_v4().to_string()
 }
-

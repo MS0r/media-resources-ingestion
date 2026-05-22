@@ -4,7 +4,7 @@ use crate::{
     services::{mongo::MongoService, redis::RedisService},
     settings::TomlConfig,
 };
-use std::{sync::Arc};
+use std::sync::Arc;
 
 pub struct ContextFactory {
     mongo: Arc<MongoService>,

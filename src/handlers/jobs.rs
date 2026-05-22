@@ -1,6 +1,9 @@
 use crate::{
     error::{JobError, JobErrorOutcome},
-    models::{Metadata, Resource},
+    models::{
+        CompressionOverride, GenericCompressionStrategy, ImageCompressionStrategy, Metadata,
+        Resource, UniversalCompressionStrategy, VideoCompressionStrategy,
+    },
     services::{
         mongo::{MongoService, UpsertResult},
         redis::RedisService,
@@ -11,12 +14,12 @@ use crate::{
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
-use reqwest::Response;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{path::PathBuf, sync::Arc};
-use tokio::io::{AsyncWriteExt};
+use std::{fmt::Debug, path::PathBuf, sync::Arc};
+use tokio::io::AsyncWriteExt;
 use url::Url;
+use wreq::Response;
 
 type JobId = String;
 type BatchId = String;
@@ -131,7 +134,7 @@ pub struct Batch {
 pub struct FileJob {
     pub _id: JobId,
     pub batch_id: BatchId,
-    pub resource: Resource, // ← move Resource in here; it belongs with the job
+    pub resource: Resource,
     pub priority: i32,
     pub status: JobStatus,
     pub retry_count: u8,
@@ -187,39 +190,47 @@ fn expand_path(path: &str, filename: &str) -> PathBuf {
     PathBuf::from(expanded_path).join(filename)
 }
 
-fn filename_from_url(url: &Url) -> Option<String> {
-    url.path_segments()
-        .and_then(|segments| segments.filter(|s| !s.is_empty()).next_back())
-        .map(|s| s.to_string())
+fn filename_from_url(url: &Url) -> (Option<String>, Option<String>) {
+    let path = url
+        .path_segments()
+        .and_then(|segments| segments.filter(|s| !s.is_empty()).last())
+        .map(|s| s.to_string());
+
+    match path {
+        None => (None, None),
+        Some(p) => match p.rfind('.') {
+            None => (Some(p), None),
+            Some(dot_pos) => {
+                let name = p[..dot_pos].to_string();
+                let ext = p[dot_pos + 1..].to_string();
+                (Some(name), Some(ext))
+            }
+        },
+    }
 }
 
-async fn uploading_resource(
+async fn download_to_temp(
     response: Response,
-    storage_provider: Arc<dyn StorageProvider>,
-    storage_path: String,
-) -> Result<String, JobError> {
+    temp_dir: &str,
+    filename: &str,
+    job_id: &str,
+) -> Result<(String, String), JobError> {
+    let temp_path = expand_path(temp_dir, &format!("{}.tmp_{}", filename, job_id))
+        .to_string_lossy()
+        .to_string();
+    let mut file = tokio::fs::File::create(&temp_path).await?;
     let mut stream = response.bytes_stream();
     let mut hasher = Sha256::new();
 
-    let (mut writer, mut upload_reader) = tokio::io::duplex(64 * 1024);
-
-    let handle = tokio::spawn(async move {
-        let _ = storage_provider
-            .upload(&storage_path, &mut upload_reader)
-            .await;
-    });
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
-
-        hasher.update(&chunk); // hash branch
-        writer.write_all(&chunk).await?; // upload branch
+        hasher.update(&chunk);
+        file.write_all(&chunk).await?;
     }
 
-    drop(writer);
-
-    let _ = handle.await.map_err(|e| JobError::from(e))?;
-
-    Ok(hex::encode(hasher.finalize()))
+    tracing::info!(job_id = %job_id, "Download complete, temp file at {}", temp_path);
+    let hash = hex::encode(hasher.finalize());
+    Ok((temp_path, hash))
 }
 
 fn extract_file_job(job: &JobEnvelope) -> Result<&FileJob, JobError> {
@@ -233,16 +244,37 @@ fn extract_file_job(job: &JobEnvelope) -> Result<&FileJob, JobError> {
 
 struct DownloadInfo {
     filename: String,
+    extension: String,
     content_length: u64,
     mime_type: String,
 }
 
 async fn initiate_download(resource: &Resource) -> Result<(Response, DownloadInfo), JobError> {
-    let mut request = reqwest::Client::new().get(resource.url.as_str());
+    let mut default_headers = wreq::header::HeaderMap::new();
+    default_headers.insert(
+        wreq::header::ACCEPT,
+        wreq::header::HeaderValue::from_static("image/*, */*"),
+    );
+
+    let client = wreq::Client::builder()
+        .emulation(wreq_util::Emulation::Chrome124)
+        .default_headers(default_headers)
+        .build()?;
+
+    let mut request = client.get(resource.url.as_str());
+
+    let origin = resource.url.origin();
+
+    if let Ok(val) = wreq::header::HeaderValue::from_str(&origin.ascii_serialization()) {
+        request = request.header(wreq::header::REFERER, val);
+    }
 
     if let Some(headers) = &resource.config.as_ref().and_then(|c| c.headers.as_ref()) {
         if let Some(auth) = &headers.authorization {
-            request = request.header(reqwest::header::AUTHORIZATION, auth);
+            request = request.header(wreq::header::AUTHORIZATION, auth);
+        }
+        if let Some(cookie) = &headers.cookie {
+            request = request.header(wreq::header::COOKIE, cookie);
         }
     }
 
@@ -260,135 +292,159 @@ async fn initiate_download(resource: &Resource) -> Result<(Response, DownloadInf
     // First try Content-Type header
     let mut mime_type = response
         .headers()
-        .get(reqwest::header::CONTENT_TYPE)
+        .get(wreq::header::CONTENT_TYPE)
         .and_then(|ct| ct.to_str().ok())
         .and_then(|ct| ct.split(';').next())
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|| "application/octet-stream".to_string());
 
     // If MIME is generic, try to detect from URL extension
+    // If MIME is generic, try to detect from URL extension
+    // If MIME is generic, try to detect from URL extension
     if mime_type == "application/octet-stream" || mime_type == "text/plain" {
-        if let Some(filename) = filename_from_url(&resource.url) {
-            if let Some(mime) = mime_guess::from_path(&filename).first_raw() {
+        if let (Some(name), Some(ext)) = filename_from_url(&resource.url) {
+            let detection_name = format!("{}.{}", name, ext);
+            if let Some(mime) = mime_guess::from_path(&detection_name).first_raw() {
                 mime_type = mime.to_string();
             }
         }
     }
 
-    let filename =
-        filename_from_url(&resource.url).unwrap_or_else(|| "downloaded_file".to_string());
+    // Set filename: resource.name (+ ext from URL) first, fallback to name.ext from URL
+    let (filename, extension) = match filename_from_url(&resource.url) {
+        (Some(name), Some(ext)) => {
+            let fname = resource
+                .name
+                .as_deref()
+                .map(|n| format!("{}.{}", n, ext))
+                .unwrap_or_else(|| format!("{}.{}", name, ext));
+            (Some(fname), Some(ext))
+        }
+        (Some(name), None) => {
+            let fname = resource
+                .name
+                .as_deref()
+                .map(|n| format!("{}.{}", n, "bin"))
+                .unwrap_or_else(|| name);
+            (Some(fname), Some("bin".to_string()))
+        }
+        (None, Some(ext)) => {
+            let fname = resource
+                .name
+                .as_deref()
+                .map(|n| format!("{}.{}", n, ext))
+                .unwrap_or_else(|| format!("downloaded_file.{}", ext));
+            (Some(fname), Some(ext))
+        }
+        (None, None) => (resource.name.clone(), None),
+    };
 
-    tracing::info!("Downloading from URL: {}", resource.url);
+    tracing::info!("Downloaded from URL: {}", resource.url);
+    tracing::debug!(
+        "Using filename: {}, extension: {}",
+        filename.as_deref().unwrap_or("<none>"),
+        extension.as_deref().unwrap_or("<none>")
+    );
 
     Ok((
         response,
         DownloadInfo {
-            filename,
+            filename: filename.unwrap_or_else(|| "downloaded_file".to_string()),
+            extension: extension.unwrap_or_else(|| "bin".to_string()),
             content_length,
             mime_type,
         },
     ))
 }
 
-#[derive(Debug)]
-struct StagingPaths {
-    temp: String,
-    final_path: String,
-    provider: Option<Provider>,
-}
-
-impl StagingPaths {
-    fn resolve(resource: &Resource, filename: &str, job_id: &str) -> Result<Self, JobError> {
-        let dest = resource
-            .dest
-            .as_ref()
-            .and_then(|d| d.path.as_ref())
-            .ok_or(JobError::OtherFatal("Missing destination path".into()))?;
-
-        let provider = resource
-            .dest
-            .as_ref()
-            .and_then(|d| d.provider.as_ref())
-            .cloned();
-
-        let temp = expand_path(dest, &format!("{}.tmp_{}", filename, job_id))
-            .to_string_lossy()
-            .to_string();
-        let final_path = expand_path(dest, filename).to_string_lossy().to_string();
-
-        Ok(Self {
-            temp,
-            final_path,
-            provider,
-        })
-    }
-}
-
-async fn stream_to_storage(
-    response: Response,
-    storage: Arc<dyn StorageProvider>,
-    staging: &StagingPaths,
-) -> Result<String, JobErrorOutcome> {
-    let upload_path = if storage.requires_local_staging() {
-        &staging.temp
-    } else {
-        &staging.final_path
-    };
-    match uploading_resource(response, storage, upload_path.clone()).await {
-        Ok(hash) => Ok(hash),
-        Err(e) => {
-            tracing::error!("Error during streaming upload: {}", e);
-            Err(JobErrorOutcome::from(e))
-        }
-    }
-}
-
 async fn handle_new_file(
     ctx: &JobContext,
     file_job: &FileJob,
     download: DownloadInfo,
-    staging: StagingPaths,
+    temp_path: String,
     hash_hex: String,
 ) -> Result<JobOutcome, JobErrorOutcome> {
     tracing::info!("New file metadata inserted with hash: {}", hash_hex);
 
-    let threshold_bytes = ctx.config.compression.threshold_mb * 1024 * 1024;
-    if download.content_length > threshold_bytes {
-        tracing::info!(
-            "Large file ({} bytes), spawning chunks",
-            download.content_length
-        );
-        return Ok(JobOutcome::SpawnedChunks(vec![])); // TODO: build chunk plan
-    }
+    let resource = &file_job.resource;
 
-    ctx.storage
-        .commit_temp(&staging.temp, &staging.final_path)
-        .await?;
+    let dest_path = resource
+        .dest
+        .as_ref()
+        .and_then(|d| d.path.as_ref())
+        .ok_or(JobErrorOutcome::Fatal("Missing destination path".into()))?;
 
-    // Try to compress if it's an image
-    let (final_path, compressed_size, final_mime) = if download.mime_type.starts_with("image/") {
-        match compress_image(&staging.final_path, &download.mime_type).await {
-            Ok((path, size, mime)) => {
-                tracing::info!(
-                    "Image compressed: {} -> {} bytes",
+    let provider = resource
+        .dest
+        .as_ref()
+        .and_then(|d| d.provider.as_ref())
+        .ok_or(JobErrorOutcome::Fatal(
+            "Missing destination provider".into(),
+        ))?;
+
+    let final_path = expand_path(
+        &dest_path,
+        &format!("{}.{}", download.filename, download.extension),
+    )
+    .to_string_lossy()
+    .to_string();
+
+    let override_strategy = resource
+        .config
+        .as_ref()
+        .and_then(|c| c.compression_override.as_ref());
+
+    let (local_file, compressed_size, final_mime) = match override_strategy {
+        Some(strategy) => match strategy {
+            CompressionOverride::Image(image_s) => {
+                match compress_image_local(
+                    &download.filename,
+                    &temp_path,
+                    &download.mime_type,
                     download.content_length,
-                    size
-                );
-                (path, Some(size), mime)
+                    ctx.config.compression.quality,
+                    image_s,
+                )
+                .await
+                {
+                    Ok((path, size, mime)) => {
+                        tracing::info!(
+                            "Image compressed: {} -> {} bytes",
+                            download.content_length,
+                            size
+                        );
+                        (path, Some(size), mime)
+                    }
+                    Err(e) => {
+                        tracing::warn!("Image compression failed: {}, keeping original", e);
+                        (temp_path.clone(), Some(0), download.mime_type)
+                    }
+                }
             }
-            Err(e) => {
-                tracing::warn!("Image compression failed: {}, keeping original", e);
-                (staging.final_path.clone(), Some(0), download.mime_type)
+            CompressionOverride::Video(video_s) => (temp_path.clone(), Some(0), download.mime_type),
+            CompressionOverride::Generic(generic_s) => {
+                (temp_path.clone(), Some(0), download.mime_type)
             }
-        }
-    } else {
-        (staging.final_path.clone(), Some(0), download.mime_type)
+            CompressionOverride::Universal(universal_s) => {
+                (temp_path.clone(), Some(0), download.mime_type)
+            }
+        },
+        None => (temp_path.clone(), Some(0), download.mime_type),
     };
+
+    let mut file = tokio::fs::File::open(&local_file)
+        .await
+        .map_err(|e| JobErrorOutcome::from(JobError::from(e)))?;
+    ctx.storage.upload(&final_path, &mut file).await?;
+
+    if local_file != temp_path {
+        tokio::fs::remove_file(&temp_path).await.ok();
+    }
 
     let metadata = Metadata::new(
         hash_hex,
-        file_job.resource.url.clone(),
-        staging.provider.unwrap_or(Provider::Local),
+        resource.url.clone(),
+        provider.clone(),
         final_path,
         download.content_length,
         compressed_size,
@@ -400,22 +456,16 @@ async fn handle_new_file(
 }
 
 async fn handle_duplicate(
-    ctx: &JobContext,
-    staging: StagingPaths,
+    temp_path: &str,
     existing_hash: &str,
 ) -> Result<JobOutcome, JobErrorOutcome> {
     tracing::info!(
         "Duplicate detected (existing hash: {}), cleaning up",
         existing_hash
     );
-
-    let path_to_delete = if ctx.storage.requires_local_staging() {
-        &staging.temp
-    } else {
-        &staging.final_path
-    };
-    ctx.storage.delete(path_to_delete).await.ok();
-
+    tokio::fs::remove_file(temp_path)
+        .await
+        .map_err(|e| JobErrorOutcome::Retryable(e.to_string()))?;
     Ok(JobOutcome::Completed)
 }
 
@@ -424,57 +474,116 @@ impl JobHandler for FileJobHandler {
     async fn execute(&self, ctx: &JobContext) -> Result<JobOutcome, JobErrorOutcome> {
         let file_job = extract_file_job(&ctx.job)?;
         let (response, download) = initiate_download(&file_job.resource).await?;
-        let staging = StagingPaths::resolve(&file_job.resource, &download.filename, &ctx.job_id)?;
 
-        let hash_hex = stream_to_storage(response, ctx.storage.clone(), &staging).await?;
+        let threshold_bytes = ctx.config.compression.threshold_mb * 1024 * 1024;
+        if download.content_length > threshold_bytes {
+            tracing::info!(
+                "Large file ({} bytes), spawning chunks",
+                download.content_length
+            );
+            return Ok(JobOutcome::SpawnedChunks(vec![]));
+        }
+
+        let temp_dir = &ctx.config.storage.temp_dir;
+        let (temp_path, hash_hex) =
+            download_to_temp(response, temp_dir, &download.filename, &ctx.job_id).await?;
 
         match ctx.db.upsert_file_metadata(&hash_hex).await {
             Ok(UpsertResult::Inserted) => {
-                handle_new_file(ctx, file_job, download, staging, hash_hex).await
+                handle_new_file(ctx, file_job, download, temp_path, hash_hex).await
             }
             Ok(UpsertResult::Duplicate(existing)) => {
-                handle_duplicate(ctx, staging, &existing.file_hash).await
+                handle_duplicate(&temp_path, &existing.file_hash).await
             }
             Err(e) => {
-                tracing::error!("Error upserting file metadata: {}", e);
+                tokio::fs::remove_file(&temp_path).await.ok();
                 Err(JobErrorOutcome::from(e))
             }
         }
     }
 }
 
-async fn compress_image(path: &str, mime_type: &str) -> Result<(String, u64, String), JobError> {
-    use image::{ImageFormat, ImageReader};
+async fn compress_image_local(
+    original_name: &str,
+    temp_path: &str,
+    mime_type: &str,
+    original_size: u64,
+    _quality: u8,
+    strategy: &ImageCompressionStrategy,
+) -> Result<(String, u64, String), JobError> {
+    use image::{
+        ExtendedColorType, ImageEncoder, ImageFormat, ImageReader,
+        codecs::{avif::AvifEncoder, webp::WebPEncoder},
+    };
     use std::fs::File;
     use std::io::BufWriter;
+    use std::path::Path;
 
-    let format = match mime_type {
-        "image/jpeg" | "image/jpg" => Some(ImageFormat::Jpeg),
-        "image/png" => Some(ImageFormat::Png),
-        "image/webp" => Some(ImageFormat::WebP),
-        "image/gif" => Some(ImageFormat::Gif),
-        _ => None,
-    };
-
-    if let Some(_) = format {
-        tracing::info!("Compressing image: {}", path);
-        // Open and decode the image
-        let img = ImageReader::open(path)?.decode()?;
-
-        // Save as WebP for compression
-        let output_path = format!("{}.webp", path);
-        let file = File::create(&output_path)?;
-        let writer = BufWriter::new(file);
-
-        img.write_to(writer, ImageFormat::WebP)?;
-
-        let metadata = std::fs::metadata(&output_path)?;
-        return Ok((output_path, metadata.len(), "image/webp".to_string()));
+    if mime_type == "image/webp" {
+        let meta = std::fs::metadata(temp_path)?;
+        return Ok((temp_path.to_string(), meta.len(), mime_type.to_string()));
     }
 
-    Err(JobError::OtherFatal(
-        "Unsupported image format for compression".into(),
-    ))
+    let format = match mime_type {
+        "image/jpeg" | "image/jpg" => ImageFormat::Jpeg,
+        "image/png" => ImageFormat::Png,
+        "image/gif" => ImageFormat::Gif,
+        _ => {
+            return Err(JobError::OtherFatal(
+                "Unsupported image format for compression".into(),
+            ));
+        }
+    };
+
+    tracing::info!("Compressing image: {}", original_name);
+    let mut reader = ImageReader::open(temp_path)?;
+    reader.set_format(format);
+    let img = reader.decode()?;
+    let rgba = img.to_rgba8();
+    let (width, height) = rgba.dimensions();
+
+    let ext = match strategy {
+        ImageCompressionStrategy::Avif => "avif",
+        _ => "webp",
+    };
+    let output_path = Path::new(original_name).with_extension(ext);
+    let output_path_str = output_path.to_string_lossy().to_string();
+
+    match strategy {
+        ImageCompressionStrategy::Avif => {
+            let file = File::create(&output_path)?;
+            AvifEncoder::new(BufWriter::new(file)).write_image(
+                rgba.as_raw(),
+                width,
+                height,
+                ExtendedColorType::Rgba8,
+            )?;
+        }
+        ImageCompressionStrategy::LosslessWebp | ImageCompressionStrategy::Webp => {
+            let file = File::create(&output_path)?;
+            WebPEncoder::new_lossless(BufWriter::new(file)).write_image(
+                rgba.as_raw(),
+                width,
+                height,
+                ExtendedColorType::Rgba8,
+            )?;
+        }
+    }
+
+    let compressed_size = std::fs::metadata(&output_path)?.len();
+
+    if compressed_size >= original_size {
+        std::fs::remove_file(&output_path)?;
+        let meta = std::fs::metadata(temp_path)?;
+        return Ok((temp_path.to_string(), meta.len(), mime_type.to_string()));
+    }
+
+    std::fs::remove_file(temp_path)?;
+    let final_mime = match strategy {
+        ImageCompressionStrategy::Avif => "image/avif",
+        _ => "image/webp",
+    };
+    Ok((output_path_str, compressed_size, final_mime.to_string()))
 }
 
 pub struct ChunkJobHandler;
@@ -507,170 +616,116 @@ impl JobHandler for ChunkJobHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::Destination;
     use url::Url;
 
     #[test]
     fn test_filename_from_url_standard() {
         let url = Url::parse("https://example.com/images/photo.png").unwrap();
-        assert_eq!(filename_from_url(&url), Some("photo.png".into()));
+        assert_eq!(
+            filename_from_url(&url),
+            (Some("photo".into()), Some("png".into()))
+        );
     }
 
     #[test]
     fn test_filename_from_url_no_path() {
         let url = Url::parse("https://example.com").unwrap();
-        assert_eq!(filename_from_url(&url), None);
+        assert_eq!(filename_from_url(&url), (None, None));
     }
 
     #[test]
     fn test_filename_from_url_root() {
         let url = Url::parse("https://example.com/").unwrap();
-        assert_eq!(filename_from_url(&url), None);
+        assert_eq!(filename_from_url(&url), (None, None));
     }
 
     #[test]
     fn test_filename_from_url_deep_path() {
         let url = Url::parse("https://cdn.example.com/a/b/c/d/file.txt?query=1").unwrap();
-        assert_eq!(filename_from_url(&url), Some("file.txt".into()));
+        assert_eq!(
+            filename_from_url(&url),
+            (Some("file".into()), Some("txt".into()))
+        );
     }
 
     #[test]
     fn test_filename_from_url_trailing_slash() {
         let url = Url::parse("https://example.com/dir/").unwrap();
-        assert_eq!(filename_from_url(&url), Some("dir".into()));
+        assert_eq!(filename_from_url(&url), (Some("dir".into()), None));
     }
+}
 
-    #[test]
-    fn test_expand_path_simple() {
-        let result = expand_path("/base", "file.txt");
-        assert_eq!(result, PathBuf::from("/base/file.txt"));
-    }
+#[test]
+fn test_expand_path_simple() {
+    let result = expand_path("/base", "file.txt");
+    assert_eq!(result, PathBuf::from("/base/file.txt"));
+}
 
-    #[test]
-    fn test_expand_path_nested() {
-        let result = expand_path("/base/dir", "sub/file.txt");
-        assert_eq!(result, PathBuf::from("/base/dir/sub/file.txt"));
-    }
+#[test]
+fn test_expand_path_nested() {
+    let result = expand_path("/base/dir", "sub/file.txt");
+    assert_eq!(result, PathBuf::from("/base/dir/sub/file.txt"));
+}
 
-    #[test]
-    fn test_expand_path_tilde_root() {
-        let home = dirs::home_dir().expect("home dir should exist in test env");
-        let result = expand_path("~/downloads", "file.txt");
-        assert_eq!(result, home.join("downloads/file.txt"));
-    }
+#[test]
+fn test_expand_path_tilde_root() {
+    let home = dirs::home_dir().expect("home dir should exist in test env");
+    let result = expand_path("~/downloads", "file.txt");
+    assert_eq!(result, home.join("downloads/file.txt"));
+}
 
-    #[test]
-    fn test_expand_path_tilde_only() {
-        let home = dirs::home_dir().expect("home dir should exist in test env");
-        let result = expand_path("~", "file.txt");
-        assert_eq!(result, home.join("file.txt"));
-    }
+#[test]
+fn test_expand_path_tilde_only() {
+    let home = dirs::home_dir().expect("home dir should exist in test env");
+    let result = expand_path("~", "file.txt");
+    assert_eq!(result, home.join("file.txt"));
+}
 
-    #[test]
-    fn test_staging_paths_resolve_basic() {
-        let url = Url::parse("https://example.com/file.png").unwrap();
-        let resource = Resource {
-            id: "test-id".into(),
-            url,
-            name: None,
-            priority: None,
-            dest: Some(Destination {
-                provider: None,
-                path: Some("/tmp".into()),
-            }),
-            config: None,
-        };
-        let paths = StagingPaths::resolve(&resource, "file.png", "job-1").unwrap();
-        assert_eq!(paths.final_path, "/tmp/file.png");
-        assert!(paths.temp.contains("/tmp/file.png.tmp_job-1"));
-        assert!(paths.provider.is_none());
-    }
-
-    #[test]
-    fn test_staging_paths_resolve_missing_dest() {
-        let url = Url::parse("https://example.com/f.png").unwrap();
-        let resource = Resource {
-            id: "test-id".into(),
-            url,
+#[test]
+fn test_extract_file_job_file() {
+    let file_job = FileJob {
+        _id: "j1".into(),
+        batch_id: "b1".into(),
+        resource: Resource {
+            id: "r1".into(),
+            url: Url::parse("https://example.com/f.png").unwrap(),
             name: None,
             priority: None,
             dest: None,
             config: None,
-        };
-        let result = StagingPaths::resolve(&resource, "f.png", "job-2");
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("Missing destination path")
-        );
-    }
+        },
+        priority: 0,
+        status: JobStatus::Pending,
+        retry_count: 0,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+        file_hash: None,
+        error: None,
+    };
+    let envelope = JobEnvelope::File(file_job);
+    let result = extract_file_job(&envelope);
+    assert!(result.is_ok());
+    assert_eq!(result.unwrap()._id, "j1");
+}
 
-    #[test]
-    fn test_staging_paths_resolve_with_provider() {
-        let url = Url::parse("https://example.com/f.png").unwrap();
-        let resource = Resource {
-            id: "test-id".into(),
-            url,
-            name: None,
-            priority: None,
-            dest: Some(Destination {
-                provider: Some(Provider::S3),
-                path: Some("/bucket".into()),
-            }),
-            config: None,
-        };
-        let paths = StagingPaths::resolve(&resource, "f.png", "job-3").unwrap();
-        assert_eq!(paths.provider, Some(Provider::S3));
-    }
-
-    #[test]
-    fn test_extract_file_job_file() {
-        let file_job = FileJob {
-            _id: "j1".into(),
-            batch_id: "b1".into(),
-            resource: Resource {
-                id: "r1".into(),
-                url: Url::parse("https://example.com/f.png").unwrap(),
-                name: None,
-                priority: None,
-                dest: None,
-                config: None,
-            },
-            priority: 0,
-            status: JobStatus::Pending,
-            retry_count: 0,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-            file_hash: None,
-            error: None,
-        };
-        let envelope = JobEnvelope::File(file_job);
-        let result = extract_file_job(&envelope);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap()._id, "j1");
-    }
-
-    #[test]
-    fn test_extract_file_job_chunk_fails() {
-        let chunk_job = ChunkJob {
-            _id: "c1".into(),
-            parent_job_id: "j1".into(),
-            file_hash: "abc".into(),
-            chunk_index: 0,
-            offset_start: 0,
-            offset_end: 99,
-            priority: 0,
-            status: JobStatus::Pending,
-            retry_count: 0,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-            chunk_hash: None,
-            error: None,
-        };
-        let envelope = JobEnvelope::Chunk(chunk_job);
-        let result = extract_file_job(&envelope);
-        assert!(result.is_err());
-    }
+#[test]
+fn test_extract_file_job_chunk_fails() {
+    let chunk_job = ChunkJob {
+        _id: "c1".into(),
+        parent_job_id: "j1".into(),
+        file_hash: "abc".into(),
+        chunk_index: 0,
+        offset_start: 0,
+        offset_end: 99,
+        priority: 0,
+        status: JobStatus::Pending,
+        retry_count: 0,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+        chunk_hash: None,
+        error: None,
+    };
+    let envelope = JobEnvelope::Chunk(chunk_job);
+    let result = extract_file_job(&envelope);
+    assert!(result.is_err());
 }

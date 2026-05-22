@@ -15,7 +15,9 @@ use crate::{
     settings::merge_configs_yaml,
 };
 use colored::*;
-use tracing_subscriber::{EnvFilter, filter::LevelFilter, layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::{
+    EnvFilter, filter::LevelFilter, layer::SubscriberExt, util::SubscriberInitExt,
+};
 
 fn setup_logging(global: Global) {
     use tracing_subscriber::fmt::format;
@@ -30,9 +32,7 @@ fn setup_logging(global: Global) {
         .and_then(|v| v.parse::<u8>().ok())
         .unwrap_or(global.verbose);
 
-
-    let builder = EnvFilter::builder()
-        .with_default_directive(LevelFilter::WARN.into());
+    let builder = EnvFilter::builder().with_default_directive(LevelFilter::WARN.into());
 
     let filter: EnvFilter = if global.quiet {
         builder
@@ -88,7 +88,10 @@ async fn main() -> Result<(), ToolError> {
     setup_logging(global.clone());
 
     if is_pipe() {
-        eprintln!("{}", "Detected piped output, auto-switching to JSON mode".yellow());
+        eprintln!(
+            "{}",
+            "Detected piped output, auto-switching to JSON mode".yellow()
+        );
     }
 
     tracing::info!("Starting ingest CLI");

@@ -1,5 +1,6 @@
-use media_resources_ingestion::settings::TomlConfig;
+use media_resources_ingestion::cli::load_config;
 use media_resources_ingestion::models::IngestionConfig;
+use media_resources_ingestion::settings::TomlConfig;
 use media_resources_ingestion::settings::merge_configs_yaml;
 
 const TOML_FULL: &str = r#"
@@ -205,7 +206,8 @@ mod yaml_tests {
 
     #[test]
     fn test_yaml_config_full_deserialization() {
-        let config: IngestionConfig = serde_yaml::from_str(YAML_FULL).expect("Failed to parse YAML");
+        let config: IngestionConfig =
+            serde_yaml::from_str(YAML_FULL).expect("Failed to parse YAML");
 
         assert!(config.default_dest.is_some());
         let default_dest = config.default_dest.unwrap();
@@ -226,8 +228,17 @@ mod yaml_tests {
         assert_eq!(resource.priority, Some(10));
 
         let dest = resource.dest.as_ref().expect("dest should be present");
-        assert_eq!(dest.provider.as_ref().expect("provider should be present").to_string(), "local");
-        assert_eq!(dest.path.as_ref().expect("path should be present"), "~/downloads");
+        assert_eq!(
+            dest.provider
+                .as_ref()
+                .expect("provider should be present")
+                .to_string(),
+            "local"
+        );
+        assert_eq!(
+            dest.path.as_ref().expect("path should be present"),
+            "~/downloads"
+        );
 
         let resource_config = resource.config.as_ref().expect("config should be present");
         assert_eq!(resource_config.quality, Some(95));
@@ -235,7 +246,8 @@ mod yaml_tests {
 
     #[test]
     fn test_yaml_config_minimal() {
-        let config: IngestionConfig = serde_yaml::from_str(YAML_MINIMAL).expect("Failed to parse YAML");
+        let config: IngestionConfig =
+            serde_yaml::from_str(YAML_MINIMAL).expect("Failed to parse YAML");
 
         assert!(config.default_dest.is_some());
         assert!(config.default_dest.as_ref().unwrap().provider.is_none());
@@ -255,7 +267,8 @@ mod yaml_tests {
 
     #[test]
     fn test_yaml_config_multiple_resources() {
-        let config: IngestionConfig = serde_yaml::from_str(YAML_MULTIPLE_RESOURCES).expect("Failed to parse YAML");
+        let config: IngestionConfig =
+            serde_yaml::from_str(YAML_MULTIPLE_RESOURCES).expect("Failed to parse YAML");
 
         assert_eq!(config.resources.len(), 3);
 
@@ -265,22 +278,30 @@ mod yaml_tests {
         assert_eq!(config.resources[1].name, Some("second_image".to_string()));
         assert!(config.resources[1].priority.is_none());
 
-        assert_eq!(config.resources[2].url.to_string(), "https://example.com/image3.gif");
+        assert_eq!(
+            config.resources[2].url.to_string(),
+            "https://example.com/image3.gif"
+        );
         assert!(config.resources[2].name.is_none());
     }
 
     #[test]
     fn test_yaml_config_destination_defaults() {
-        let config: IngestionConfig = serde_yaml::from_str(YAML_DEST).expect("Failed to parse YAML");
+        let config: IngestionConfig =
+            serde_yaml::from_str(YAML_DEST).expect("Failed to parse YAML");
 
-        let dest = config.resources[0].dest.as_ref().expect("dest should be present");
+        let dest = config.resources[0]
+            .dest
+            .as_ref()
+            .expect("dest should be present");
         assert!(dest.provider.is_none());
         assert_eq!(dest.path, Some("/custom/path".to_string()));
     }
 
     #[test]
     fn test_yaml_config_headers_only() {
-        let config: IngestionConfig = serde_yaml::from_str(YAML_HEADERS).expect("Failed to parse YAML");
+        let config: IngestionConfig =
+            serde_yaml::from_str(YAML_HEADERS).expect("Failed to parse YAML");
 
         let headers = config.headers.expect("headers should be present");
         assert_eq!(headers.authorization, Some("Bearer mytoken123".to_string()));
@@ -289,9 +310,13 @@ mod yaml_tests {
 
     #[test]
     fn test_yaml_config_resource_level_config() {
-        let config: IngestionConfig = serde_yaml::from_str(YAML_RESOURCE_CONFIG).expect("Failed to parse YAML");
+        let config: IngestionConfig =
+            serde_yaml::from_str(YAML_RESOURCE_CONFIG).expect("Failed to parse YAML");
 
-        let resource_config = config.resources[0].config.as_ref().expect("config should be present");
+        let resource_config = config.resources[0]
+            .config
+            .as_ref()
+            .expect("config should be present");
         assert_eq!(resource_config.quality, Some(80));
         assert!(resource_config.compression_override.is_none());
     }
@@ -354,7 +379,8 @@ resources:
     #[test]
     fn test_merge_provider_from_toml() -> Result<(), ToolError> {
         let toml: TomlConfig = toml::from_str(TOML_DEFAULTS).expect("Failed to parse TOML");
-        let yaml: IngestionConfig = serde_yaml::from_str(YAML_MINIMAL_NO_PROVIDER).expect("Failed to parse YAML");
+        let yaml: IngestionConfig =
+            serde_yaml::from_str(YAML_MINIMAL_NO_PROVIDER).expect("Failed to parse YAML");
 
         let merged = merge_configs_yaml(&yaml, toml)?;
 
@@ -363,9 +389,10 @@ resources:
     }
 
     #[test]
-    fn test_merge_path_from_toml() -> Result<(), ToolError>  {
+    fn test_merge_path_from_toml() -> Result<(), ToolError> {
         let toml: TomlConfig = toml::from_str(TOML_DEFAULTS).expect("Failed to parse TOML");
-        let yaml: IngestionConfig = serde_yaml::from_str(YAML_MINIMAL_NO_PROVIDER).expect("Failed to parse YAML");
+        let yaml: IngestionConfig =
+            serde_yaml::from_str(YAML_MINIMAL_NO_PROVIDER).expect("Failed to parse YAML");
 
         let merged = merge_configs_yaml(&yaml, toml)?;
 
@@ -374,9 +401,10 @@ resources:
     }
 
     #[test]
-    fn test_merge_chunk_size_from_toml() -> Result<(), ToolError>  {
+    fn test_merge_chunk_size_from_toml() -> Result<(), ToolError> {
         let toml: TomlConfig = toml::from_str(TOML_DEFAULTS).expect("Failed to parse TOML");
-        let yaml: IngestionConfig = serde_yaml::from_str(YAML_MINIMAL_NO_PROVIDER).expect("Failed to parse YAML");
+        let yaml: IngestionConfig =
+            serde_yaml::from_str(YAML_MINIMAL_NO_PROVIDER).expect("Failed to parse YAML");
 
         let merged = merge_configs_yaml(&yaml, toml)?;
 
@@ -385,9 +413,10 @@ resources:
     }
 
     #[test]
-    fn test_merge_yaml_overrides_toml() -> Result<(), ToolError>  {
+    fn test_merge_yaml_overrides_toml() -> Result<(), ToolError> {
         let toml: TomlConfig = toml::from_str(TOML_DEFAULTS).expect("Failed to parse TOML");
-        let yaml: IngestionConfig = serde_yaml::from_str(YAML_WITH_PROVIDER).expect("Failed to parse YAML");
+        let yaml: IngestionConfig =
+            serde_yaml::from_str(YAML_WITH_PROVIDER).expect("Failed to parse YAML");
 
         let merged = merge_configs_yaml(&yaml, toml)?;
 
@@ -397,13 +426,43 @@ resources:
     }
 
     #[test]
-    fn test_merge_yaml_chunk_size_overrides_toml() -> Result<(), ToolError>  {
+    fn test_merge_yaml_chunk_size_overrides_toml() -> Result<(), ToolError> {
         let toml: TomlConfig = toml::from_str(TOML_DEFAULTS).expect("Failed to parse TOML");
-        let yaml: IngestionConfig = serde_yaml::from_str(YAML_WITH_CHUNK_SIZE).expect("Failed to parse YAML");
+        let yaml: IngestionConfig =
+            serde_yaml::from_str(YAML_WITH_CHUNK_SIZE).expect("Failed to parse YAML");
 
         let merged = merge_configs_yaml(&yaml, toml)?;
 
         assert_eq!(merged.storage.chunk_size, "256MB");
         Ok(())
+    }
+}
+
+mod load_config_tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn test_load_config_applies_default_dest_when_missing() {
+        let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        let yaml_path = dir.join("test.yaml");
+        let mut f = std::fs::File::create(&yaml_path).unwrap();
+        f.write_all(b"resources:\n  - url: https://example.com/f.png\n")
+            .unwrap();
+        f.flush().unwrap();
+
+        let config = load_config(&yaml_path).unwrap();
+        let dest = config.default_dest.expect("default_dest should be Some");
+        assert_eq!(dest.provider.unwrap().to_string(), "local");
+        assert_eq!(
+            dest.path.unwrap(),
+            std::env::current_dir()
+                .unwrap()
+                .to_string_lossy()
+                .to_string()
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

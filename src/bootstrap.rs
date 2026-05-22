@@ -6,7 +6,9 @@ use crate::{
         jobs::{Batch, ChunkJobHandler, FileJob, FileJobHandler, JobStatus},
         scheduler::scheduler_loop,
     },
-    models::MainConfig,
+    models::{
+        CompressionOverride, Destination, Headers, MainConfig, Resource, ResourceLevelConfig,
+    },
     services::{mongo::MongoService, redis::RedisService},
 };
 use chrono::Utc;
@@ -14,6 +16,80 @@ use colored::*;
 use indicatif::{ProgressBar, ProgressStyle};
 use std::sync::Arc;
 use uuid::Uuid;
+
+fn parent_values(
+    mut res: Resource,
+    compression: &Option<CompressionOverride>,
+    dest: &Option<Destination>,
+    priority: i32,
+    headers: &Option<Headers>,
+) -> (Resource, i32) {
+    let resource_priority = match res.priority {
+        Some(p) => p,
+        None => priority,
+    };
+
+    // Inherit parent compression_override if child has none
+    if res
+        .config
+        .as_ref()
+        .and_then(|c| c.compression_override.as_ref())
+        .is_none()
+    {
+        if let Some(parent_co) = compression {
+            match &mut res.config {
+                Some(cfg) => cfg.compression_override = Some(parent_co.clone()),
+                None => {
+                    res.config = Some(ResourceLevelConfig {
+                        compression_override: Some(parent_co.clone()),
+                        quality: None,
+                        headers: None,
+                    });
+                }
+            }
+        }
+    }
+
+    // Inherit parent dest fields if resource has none
+    if let Some(parent_dest) = dest {
+        if res.dest.is_none() {
+            res.dest = Some(Destination {
+                provider: parent_dest.provider.clone(),
+                path: parent_dest.path.clone(),
+            });
+        } else if let Some(ref mut res_dest) = res.dest {
+            if res_dest.provider.is_none() {
+                res_dest.provider = parent_dest.provider.clone();
+            }
+            if res_dest.path.is_none() {
+                res_dest.path = parent_dest.path.clone();
+            }
+        }
+    }
+
+    // Inherit parent headers if child has none
+    if let Some(parent_headers) = headers {
+        if res
+            .config
+            .as_ref()
+            .and_then(|c| c.headers.as_ref())
+            .is_none()
+        {
+            match &mut res.config {
+                Some(cfg) => cfg.headers = Some(parent_headers.clone()),
+                None => {
+                    res.config = Some(ResourceLevelConfig {
+                        compression_override: None,
+                        quality: None,
+                        headers: Some(parent_headers.clone()),
+                    });
+                }
+            }
+        }
+    }
+
+    (res, resource_priority)
+}
 
 pub async fn run(config: MainConfig, args: RunArgs) -> Result<(), ToolError> {
     tracing::info!(
@@ -31,14 +107,16 @@ pub async fn run(config: MainConfig, args: RunArgs) -> Result<(), ToolError> {
     for resource in &config.yaml_config.resources {
         if !urls.insert(resource.url.as_str()) {
             tracing::error!("Duplicate URL found in YAML: {}", resource.url);
-            return Err(ToolError::ValidationError("Duplicate URL found in YAML".to_string()));
+            return Err(ToolError::ValidationError(
+                "Duplicate URL found in YAML".to_string(),
+            ));
         }
     }
 
     // --dry-run: validate YAML and preflight URLs without downloading
     if args.dry_run {
         return validate_dry_run(&config.yaml_config).await;
-    }  
+    }
 
     // -- Services ----------------------------------------------------------
     let redis_service = match RedisService::new(&config.redis_uri) {
@@ -65,6 +143,9 @@ pub async fn run(config: MainConfig, args: RunArgs) -> Result<(), ToolError> {
 
     let priority = args.priority.or(config.yaml_config.priority).unwrap_or(0);
 
+    let temp_dir = &config.toml_config.storage.temp_dir;
+    tokio::fs::create_dir_all(temp_dir).await?;
+
     // -- Initial batch ------------------------------------------------------
     let batch_id = Uuid::new_v4().to_string();
     let mut batch = Batch {
@@ -76,16 +157,18 @@ pub async fn run(config: MainConfig, args: RunArgs) -> Result<(), ToolError> {
     };
 
     for resource in &config.yaml_config.resources {
-
-        let resource_priority = match resource.priority {
-            Some(p) => p,
-            None => priority,
-        };
+        let (res, resource_priority) = parent_values(
+            resource.clone(),
+            &config.yaml_config.compression_override,
+            &config.yaml_config.default_dest,
+            priority,
+            &config.yaml_config.headers,
+        );
 
         let file_job = FileJob {
             _id: resource.id.clone(),
             batch_id: batch_id.clone(),
-            resource: resource.clone(),
+            resource: res,
             priority: resource_priority,
             status: JobStatus::Pending,
             retry_count: 0,
@@ -154,7 +237,9 @@ pub async fn run(config: MainConfig, args: RunArgs) -> Result<(), ToolError> {
 
     // Check if any jobs failed
     let mongo = MongoService::new(&config.mongo_uri).await?;
-    let failed_jobs = mongo.list_jobs(Some(crate::cli::JobStatus::Failed), 1000).await?;
+    let failed_jobs = mongo
+        .list_jobs(Some(crate::cli::JobStatus::Failed), 1000)
+        .await?;
 
     if !failed_jobs.is_empty() {
         had_failures = true;
@@ -168,7 +253,7 @@ pub async fn run(config: MainConfig, args: RunArgs) -> Result<(), ToolError> {
     }
 }
 
-pub async fn status(scope: StatusScope, mongo_uri : String) -> Result<(), ToolError> {
+pub async fn status(scope: StatusScope, mongo_uri: String) -> Result<(), ToolError> {
     let mongo = MongoService::new(&mongo_uri).await?;
 
     match scope {
@@ -202,11 +287,14 @@ pub async fn status(scope: StatusScope, mongo_uri : String) -> Result<(), ToolEr
             let output = args.output;
             tracing::info!("Checking status of all jobs with filter {:?}", filter);
             let jobs = mongo.list_jobs(filter, limit).await?;
-            
+
             match output {
                 crate::cli::OutputFormat::Table => {
                     for job in jobs {
-                        println!("Job: {} - Status: {:?} - URL: {}", job._id, job.status, job.resource.url);
+                        println!(
+                            "Job: {} - Status: {:?} - URL: {}",
+                            job._id, job.status, job.resource.url
+                        );
                     }
                 }
                 crate::cli::OutputFormat::Json => {
@@ -218,7 +306,11 @@ pub async fn status(scope: StatusScope, mongo_uri : String) -> Result<(), ToolEr
     Ok(())
 }
 
-pub async fn cancel(scope: CancelScope, mongo_uri : String, redis_uri: String) -> Result<(), ToolError> {
+pub async fn cancel(
+    scope: CancelScope,
+    mongo_uri: String,
+    redis_uri: String,
+) -> Result<(), ToolError> {
     let mongo = MongoService::new(&mongo_uri).await?;
 
     let redis = RedisService::new(&redis_uri)?;
@@ -245,7 +337,7 @@ pub async fn cancel(scope: CancelScope, mongo_uri : String, redis_uri: String) -
     Ok(())
 }
 
-pub async fn retry(scope: RetryScope, mongo_uri : String) -> Result<(), ToolError> {
+pub async fn retry(scope: RetryScope, mongo_uri: String) -> Result<(), ToolError> {
     let mongo = MongoService::new(&mongo_uri).await?;
 
     match scope {
@@ -262,19 +354,23 @@ pub async fn retry(scope: RetryScope, mongo_uri : String) -> Result<(), ToolErro
     Ok(())
 }
 
-pub async fn files(scope: FilesScope, mongo_uri : String) -> Result<(), ToolError> {
+pub async fn files(scope: FilesScope, mongo_uri: String) -> Result<(), ToolError> {
     let mongo = MongoService::new(&mongo_uri).await?;
 
     match scope {
         FilesScope::List(args) => {
             tracing::info!("Listing stored files with filters");
-            let files = mongo.list_files(args.mime.as_deref(), args.provider.as_deref(), args.limit).await?;
-            
+            let files = mongo
+                .list_files(args.mime.as_deref(), args.provider.as_deref(), args.limit)
+                .await?;
+
             match args.output {
                 crate::cli::OutputFormat::Table => {
                     for file in files {
-                        println!("Hash: {} - MIME: {} - Size: {} bytes", 
-                            file.file_hash, file.mime_type, file.original_file_size);
+                        println!(
+                            "Hash: {} - MIME: {} - Size: {} bytes",
+                            file.file_hash, file.mime_type, file.original_file_size
+                        );
                     }
                 }
                 crate::cli::OutputFormat::Json => {
@@ -312,8 +408,14 @@ pub async fn files(scope: FilesScope, mongo_uri : String) -> Result<(), ToolErro
                 // Check if file is chunked
                 if let Some(manifest) = &metadata.chunk_manifest {
                     // Chunked file - reconstruct from chunks
-                    tracing::info!("Reconstructing chunked file with {} chunks", manifest.chunks.len());
-                    eprintln!("{}", "Downloading chunked file (reconstructing from chunks)...".yellow());
+                    tracing::info!(
+                        "Reconstructing chunked file with {} chunks",
+                        manifest.chunks.len()
+                    );
+                    eprintln!(
+                        "{}",
+                        "Downloading chunked file (reconstructing from chunks)...".yellow()
+                    );
 
                     if let Some(ref dest_path) = dest {
                         // Write to file
@@ -325,7 +427,10 @@ pub async fn files(scope: FilesScope, mongo_uri : String) -> Result<(), ToolErro
                                 }
                                 Err(e) => {
                                     eprintln!("Failed to download chunk {}: {}", chunk_ref.hash, e);
-                                    return Err(ToolError::JobExecutionError(format!("Failed to download chunk {}: {}", chunk_ref.hash, e)));
+                                    return Err(ToolError::JobExecutionError(format!(
+                                        "Failed to download chunk {}: {}",
+                                        chunk_ref.hash, e
+                                    )));
                                 }
                             }
                         }
@@ -340,7 +445,10 @@ pub async fn files(scope: FilesScope, mongo_uri : String) -> Result<(), ToolErro
                                 }
                                 Err(e) => {
                                     eprintln!("Failed to download chunk {}: {}", chunk_ref.hash, e);
-                                    return Err(ToolError::JobExecutionError(format!("Failed to download chunk {}: {}", chunk_ref.hash, e)));
+                                    return Err(ToolError::JobExecutionError(format!(
+                                        "Failed to download chunk {}: {}",
+                                        chunk_ref.hash, e
+                                    )));
                                 }
                             }
                         }
@@ -360,18 +468,27 @@ pub async fn files(scope: FilesScope, mongo_uri : String) -> Result<(), ToolErro
                         }
                         Err(e) => {
                             eprintln!("Download failed: {}", e);
-                            return Err(ToolError::JobExecutionError(format!("Download failed: {}", e)));
+                            return Err(ToolError::JobExecutionError(format!(
+                                "Download failed: {}",
+                                e
+                            )));
                         }
                     }
                 }
             } else {
                 eprintln!("File with hash {} not found", hash);
-                return Err(ToolError::ConfigError(format!("File with hash {} not found", hash)));
+                return Err(ToolError::ConfigError(format!(
+                    "File with hash {} not found",
+                    hash
+                )));
             }
         }
         FilesScope::Delete { hash, yes } => {
             if !yes {
-                println!("{}", "Are you sure you want to delete this file? (y/N)".yellow());
+                println!(
+                    "{}",
+                    "Are you sure you want to delete this file? (y/N)".yellow()
+                );
                 let mut input = String::new();
                 std::io::stdin().read_line(&mut input)?;
                 if !input.trim().eq_ignore_ascii_case("y") {
@@ -392,7 +509,10 @@ async fn validate_dry_run(yaml_config: &crate::models::IngestionConfig) -> Resul
     use colored::*;
 
     println!("{}", "Dry-run mode: validating configuration...".bold());
-    println!("Found {} resources to validate\n", yaml_config.resources.len());
+    println!(
+        "Found {} resources to validate\n",
+        yaml_config.resources.len()
+    );
 
     let mut all_valid = true;
 
@@ -414,18 +534,23 @@ async fn validate_dry_run(yaml_config: &crate::models::IngestionConfig) -> Resul
     }
 
     if all_valid {
-        println!("\n{}", "✓ All resources validated successfully.".green().bold());
+        println!(
+            "\n{}",
+            "✓ All resources validated successfully.".green().bold()
+        );
         Ok(())
     } else {
         eprintln!("\n{}", "✗ Some resources failed validation.".red().bold());
-        Err(ToolError::ValidationError("Some resources failed validation".to_string()))
+        Err(ToolError::ValidationError(
+            "Some resources failed validation".to_string(),
+        ))
     }
 }
 
 /// Perform a preflight check on a URL (HEAD request for HTTP/HTTPS)
 async fn preflight_url(url: &url::Url) -> Result<String, String> {
     if url.scheme() == "http" || url.scheme() == "https" {
-        let response = reqwest::Client::new()
+        let response = wreq::Client::new()
             .head(url.as_str())
             .send()
             .await
@@ -434,7 +559,7 @@ async fn preflight_url(url: &url::Url) -> Result<String, String> {
         if response.status().is_success() {
             let content_type = response
                 .headers()
-                .get(reqwest::header::CONTENT_TYPE)
+                .get(wreq::header::CONTENT_TYPE)
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("unknown");
             Ok(format!("content-type: {}", content_type))
@@ -456,5 +581,175 @@ async fn preflight_url(url: &url::Url) -> Result<String, String> {
         }
     } else {
         Err(format!("Unsupported scheme: {}", url.scheme()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::Provider;
+    use url::Url;
+
+    fn resource_with_dest(provider: Option<Provider>, path: Option<String>) -> Resource {
+        Resource {
+            id: uuid::Uuid::new_v4().to_string(),
+            url: Url::parse("https://example.com/f.png").unwrap(),
+            name: None,
+            priority: None,
+            dest: Some(Destination { provider, path }),
+            config: None,
+        }
+    }
+
+    fn resource_no_dest() -> Resource {
+        Resource {
+            id: uuid::Uuid::new_v4().to_string(),
+            url: Url::parse("https://example.com/f.png").unwrap(),
+            name: None,
+            priority: None,
+            dest: None,
+            config: None,
+        }
+    }
+
+    fn parent_dest() -> Option<Destination> {
+        Some(Destination {
+            provider: Some(Provider::Local),
+            path: Some("/default/path".to_string()),
+        })
+    }
+
+    fn parent_headers() -> Option<Headers> {
+        Some(Headers {
+            authorization: Some("Bearer token".to_string()),
+            cookie: None,
+        })
+    }
+
+    fn resource_with_config(headers: Option<Headers>) -> Resource {
+        Resource {
+            id: uuid::Uuid::new_v4().to_string(),
+            url: Url::parse("https://example.com/f.png").unwrap(),
+            name: None,
+            priority: None,
+            dest: None,
+            config: Some(ResourceLevelConfig {
+                compression_override: None,
+                quality: None,
+                headers,
+            }),
+        }
+    }
+
+    fn resource_no_config() -> Resource {
+        Resource {
+            id: uuid::Uuid::new_v4().to_string(),
+            url: Url::parse("https://example.com/f.png").unwrap(),
+            name: None,
+            priority: None,
+            dest: None,
+            config: None,
+        }
+    }
+
+    #[test]
+    fn inherits_full_dest_when_resource_has_none() {
+        let res = resource_no_dest();
+        let (updated, _) = parent_values(res, &None, &parent_dest(), 0, &None);
+        let d = updated.dest.unwrap();
+        assert_eq!(d.provider.unwrap().to_string(), "local");
+        assert_eq!(d.path.unwrap(), "/default/path");
+    }
+
+    #[test]
+    fn keeps_resource_dest_when_fully_specified() {
+        let res = resource_with_dest(Some(Provider::S3), Some("/custom".to_string()));
+        let (updated, _) = parent_values(res, &None, &parent_dest(), 0, &None);
+        let d = updated.dest.unwrap();
+        assert_eq!(d.provider.unwrap().to_string(), "s3");
+        assert_eq!(d.path.unwrap(), "/custom");
+    }
+
+    #[test]
+    fn fills_missing_provider_from_parent() {
+        let res = resource_with_dest(None, Some("/custom".to_string()));
+        let (updated, _) = parent_values(res, &None, &parent_dest(), 0, &None);
+        let d = updated.dest.unwrap();
+        assert_eq!(d.provider.unwrap().to_string(), "local");
+        assert_eq!(d.path.unwrap(), "/custom");
+    }
+
+    #[test]
+    fn fills_missing_path_from_parent() {
+        let res = resource_with_dest(Some(Provider::S3), None);
+        let (updated, _) = parent_values(res, &None, &parent_dest(), 0, &None);
+        let d = updated.dest.unwrap();
+        assert_eq!(d.provider.unwrap().to_string(), "s3");
+        assert_eq!(d.path.unwrap(), "/default/path");
+    }
+
+    #[test]
+    fn leaves_dest_none_when_parent_also_none() {
+        let res = resource_no_dest();
+        let (updated, _) = parent_values(res, &None, &None, 0, &None);
+        assert!(updated.dest.is_none());
+    }
+
+    #[test]
+    fn inherits_headers_when_resource_has_no_config() {
+        let res = resource_no_config();
+        let (updated, _) = parent_values(res, &None, &None, 0, &parent_headers());
+        assert_eq!(
+            updated
+                .config
+                .unwrap()
+                .headers
+                .unwrap()
+                .authorization
+                .unwrap(),
+            "Bearer token"
+        );
+    }
+
+    #[test]
+    fn keeps_resource_headers_when_specified() {
+        let res = resource_with_config(Some(Headers {
+            authorization: Some("Custom".to_string()),
+            cookie: None,
+        }));
+        let (updated, _) = parent_values(res, &None, &None, 0, &parent_headers());
+        assert_eq!(
+            updated
+                .config
+                .unwrap()
+                .headers
+                .unwrap()
+                .authorization
+                .unwrap(),
+            "Custom"
+        );
+    }
+
+    #[test]
+    fn inherits_headers_into_existing_config() {
+        let res = resource_with_config(None);
+        let (updated, _) = parent_values(res, &None, &None, 0, &parent_headers());
+        assert_eq!(
+            updated
+                .config
+                .unwrap()
+                .headers
+                .unwrap()
+                .authorization
+                .unwrap(),
+            "Bearer token"
+        );
+    }
+
+    #[test]
+    fn leaves_headers_none_when_parent_also_none() {
+        let res = resource_no_config();
+        let (updated, _) = parent_values(res, &None, &None, 0, &None);
+        assert!(updated.config.is_none());
     }
 }

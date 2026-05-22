@@ -9,21 +9,22 @@ fn make_mongo_error() -> mongodb::error::Error {
 }
 
 fn make_image_error() -> image::ImageError {
-    image::ImageError::Unsupported(
-        image::error::UnsupportedError::from_format_and_kind(
-            image::error::ImageFormatHint::Name("unknown".into()),
-            image::error::UnsupportedErrorKind::Format(
-                image::error::ImageFormatHint::Name("unknown".into()),
-            ),
-        ),
-    )
+    image::ImageError::Unsupported(image::error::UnsupportedError::from_format_and_kind(
+        image::error::ImageFormatHint::Name("unknown".into()),
+        image::error::UnsupportedErrorKind::Format(image::error::ImageFormatHint::Name(
+            "unknown".into(),
+        )),
+    ))
 }
 
 #[test]
 fn test_exit_code_config() {
     assert_eq!(ToolError::ConfigError("bad".into()).exit_code(), 2);
     assert_eq!(ToolError::ValidationError("bad".into()).exit_code(), 2);
-    assert_eq!(ToolError::ConfigParseError(make_toml_error()).exit_code(), 2);
+    assert_eq!(
+        ToolError::ConfigParseError(make_toml_error()).exit_code(),
+        2
+    );
 }
 
 #[test]
@@ -33,16 +34,29 @@ fn test_exit_code_auth() {
 
 #[test]
 fn test_exit_code_backend() {
-    assert_eq!(ToolError::RedisError(redis::RedisError::from(std::io::Error::new(std::io::ErrorKind::Other, "no server"))).exit_code(), 3);
+    assert_eq!(
+        ToolError::RedisError(redis::RedisError::from(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "no server"
+        )))
+        .exit_code(),
+        3
+    );
     assert_eq!(ToolError::MongoError(make_mongo_error()).exit_code(), 3);
 }
 
 #[test]
 fn test_exit_code_job_failure() {
     assert_eq!(ToolError::JobExecutionError("fail".into()).exit_code(), 1);
-    assert_eq!(ToolError::IoError(std::io::Error::new(std::io::ErrorKind::Other, "fail")).exit_code(), 1);
+    assert_eq!(
+        ToolError::IoError(std::io::Error::new(std::io::ErrorKind::Other, "fail")).exit_code(),
+        1
+    );
     assert_eq!(ToolError::Message("msg".into()).exit_code(), 1);
-    assert_eq!(ToolError::JsonError(serde_json::from_str::<()>("").unwrap_err()).exit_code(), 1);
+    assert_eq!(
+        ToolError::JsonError(serde_json::from_str::<()>("").unwrap_err()).exit_code(),
+        1
+    );
 }
 
 #[test]

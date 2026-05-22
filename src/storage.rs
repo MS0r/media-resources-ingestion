@@ -1,11 +1,11 @@
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use tokio::fs::File;
-use tokio_util::io::ReaderStream;
 use std::error::Error;
 use std::sync::Arc;
+use tokio::fs::File;
 use tokio::io::AsyncRead;
 use tokio_stream::StreamExt;
-use async_trait::async_trait;
+use tokio_util::io::ReaderStream;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(rename_all = "lowercase")]
@@ -43,7 +43,7 @@ pub struct LocalProvider;
 pub struct GDriveProvider;
 
 async fn start_drive_session(token: &str, filename: &str) -> Result<String, DynError> {
-    let client = reqwest::Client::new();
+    let client = wreq::Client::new();
 
     let res = client
         .post("https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable")
@@ -80,10 +80,7 @@ pub trait StorageProvider: Send + Sync {
         data: &mut (dyn AsyncRead + Send + Unpin),
     ) -> Result<(), DynError>;
 
-    async fn download(
-        &self,
-        key: &str,
-    ) -> Result<Box<dyn AsyncRead + Send + Unpin>, DynError>;
+    async fn download(&self, key: &str) -> Result<Box<dyn AsyncRead + Send + Unpin>, DynError>;
 
     async fn delete(&self, key: &str) -> Result<(), DynError>;
 
@@ -112,10 +109,7 @@ impl StorageProvider for LocalProvider {
         Ok(())
     }
 
-    async fn download(
-        &self,
-        key: &str,
-    ) -> Result<Box<dyn AsyncRead + Send + Unpin>, DynError> {
+    async fn download(&self, key: &str) -> Result<Box<dyn AsyncRead + Send + Unpin>, DynError> {
         println!("Downloading locally: {}", key);
         let file = File::open(key).await?;
         Ok(Box::new(file) as Box<dyn AsyncRead + Send + Unpin>)
@@ -144,10 +138,9 @@ impl StorageProvider for GDriveProvider {
         key: &str,
         data: &mut (dyn AsyncRead + Send + Unpin),
     ) -> Result<(), DynError> {
-
         let token = std::env::var("GDRIVE_TOKEN")?;
         let upload_url = start_drive_session(&token, key).await?;
-        let client = reqwest::Client::new();
+        let client = wreq::Client::new();
 
         let mut stream = ReaderStream::new(data);
 
@@ -155,7 +148,9 @@ impl StorageProvider for GDriveProvider {
 
         while let Some(chunk) = stream.next().await {
             let chunk = chunk?;
-            if chunk.is_empty() { continue; }
+            if chunk.is_empty() {
+                continue;
+            }
             let len = chunk.len() as u64;
             let end = offset + len - 1;
 
@@ -175,10 +170,7 @@ impl StorageProvider for GDriveProvider {
         Ok(())
     }
 
-    async fn download(
-        &self,
-        key: &str,
-    ) -> Result<Box<dyn AsyncRead + Send + Unpin>, DynError> {
+    async fn download(&self, key: &str) -> Result<Box<dyn AsyncRead + Send + Unpin>, DynError> {
         Err("Not implemented".into())
     }
 
@@ -198,10 +190,7 @@ impl StorageProvider for DropboxProvider {
         Ok(())
     }
 
-    async fn download(
-        &self,
-        key: &str,
-    ) -> Result<Box<dyn AsyncRead + Send + Unpin>, DynError> {
+    async fn download(&self, key: &str) -> Result<Box<dyn AsyncRead + Send + Unpin>, DynError> {
         Err("Not implemented".into())
     }
 
@@ -240,10 +229,7 @@ impl StorageProvider for S3Provider {
         // Ok(())
     }
 
-    async fn download(
-        &self,
-        key: &str,
-    ) -> Result<Box<dyn AsyncRead + Send + Unpin>, DynError> {
+    async fn download(&self, key: &str) -> Result<Box<dyn AsyncRead + Send + Unpin>, DynError> {
         Err("Not implemented".into())
     }
 

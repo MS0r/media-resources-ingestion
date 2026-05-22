@@ -5,15 +5,14 @@ chunk_size: 128MB
 compression_override: webp
 headers:
   Authorization: Bearer Token
-  Cookie: session=abc
 resources:
-  - url: https://www.gemacauchosca.com/images/mobil/mobil_super_3000_xe_5w_30.webp
-    name: image
+  - url: https://www.adobe.com/creativecloud/photography/discover/media_131179edca5f92db203e2b78cb8a308605afbc958.png
+    name: perro
     priority: 10
     dest:
       path: ~/randproj/
     config:
-      compression_override: webp
+      compression_override: avif
       quality: 95
   # - url: ftp://files.example.com/resource.mp4
   #   dest:

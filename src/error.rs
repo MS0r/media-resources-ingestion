@@ -1,12 +1,12 @@
-use thiserror::Error;
-use redis::RedisError as redis_error;
-use mongodb::error::Error as mongodb_error;
 use bb8::RunError as bb8_error;
 use bb8_mongodb::Error as bb8_mongodb_error;
 use mongodb::bson::error::Error as bson_error;
-use toml::de::Error as toml_error;
+use mongodb::error::Error as mongodb_error;
+use redis::RedisError as redis_error;
 use serde_json::Error as json_error;
 use std::io::Error as io_error;
+use thiserror::Error;
+use toml::de::Error as toml_error;
 
 use crate::storage::DynError;
 
@@ -80,7 +80,7 @@ pub enum JobErrorOutcome {
 #[derive(Error, Debug)]
 pub enum JobError {
     #[error("Network error: {0}")]
-    ReqwestError(#[from] reqwest::Error),
+    WreqError(#[from] wreq::Error),
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
     #[error("Image error {0}")]
@@ -117,10 +117,13 @@ impl From<ToolError> for JobErrorOutcome {
 impl From<JobError> for JobErrorOutcome {
     fn from(e: JobError) -> Self {
         match e {
-            JobError::ReqwestError(_) | JobError::IoError(_) | JobError::OtherRetryable(_) | JobError::JoinError(_) => {
-                JobErrorOutcome::Retryable(e.to_string())
+            JobError::WreqError(_)
+            | JobError::IoError(_)
+            | JobError::OtherRetryable(_)
+            | JobError::JoinError(_) => JobErrorOutcome::Retryable(e.to_string()),
+            JobError::ImageError(_) | JobError::OtherFatal(_) => {
+                JobErrorOutcome::Fatal(e.to_string())
             }
-            JobError::ImageError(_) | JobError::OtherFatal(_) => JobErrorOutcome::Fatal(e.to_string()),
         }
     }
 }

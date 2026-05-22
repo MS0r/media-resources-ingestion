@@ -45,7 +45,8 @@ pub async fn scheduler_loop(
                             }
                             Err(JobErrorOutcome::Retryable(e)) => {
                                 tracing::error!(?job_id, "retrying job due to error: ({e})");
-                                if let Err(err) = ctx.redis.retry_job(&job_id, JobKind::File).await {
+                                if let Err(err) = ctx.redis.retry_job(&job_id, JobKind::File).await
+                                {
                                     tracing::error!(?err, "failed to reenqueue retryable job");
                                 }
                             }
@@ -79,8 +80,12 @@ pub async fn scheduler_loop(
                             }
                             Err(JobErrorOutcome::Retryable(e)) => {
                                 tracing::error!(?job_id, "retrying chunk job due to error: ({e})");
-                                if let Err(err) = ctx.redis.retry_job(&job_id, JobKind::Chunk).await {
-                                    tracing::error!(?err, "failed to reenqueue retryable chunk job");
+                                if let Err(err) = ctx.redis.retry_job(&job_id, JobKind::Chunk).await
+                                {
+                                    tracing::error!(
+                                        ?err,
+                                        "failed to reenqueue retryable chunk job"
+                                    );
                                 }
                             }
                             Err(JobErrorOutcome::Fatal(e)) => {

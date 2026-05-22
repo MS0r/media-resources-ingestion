@@ -4,19 +4,27 @@ use media_resources_ingestion::cli::*;
 #[test]
 fn test_cli_run_basic() {
     let cli = Cli::try_parse_from(["ingest", "run", "test.yaml"]).unwrap();
-    assert!(matches!(cli.command, Commands::Run(ref args) if args.yaml_path.to_string_lossy() == "test.yaml"));
+    assert!(
+        matches!(cli.command, Commands::Run(ref args) if args.yaml_path.to_string_lossy() == "test.yaml")
+    );
 }
 
 #[test]
 fn test_cli_run_all_flags() {
     let cli = Cli::try_parse_from([
-        "ingest", "run", "test.yaml",
+        "ingest",
+        "run",
+        "test.yaml",
         "--dry-run",
-        "--priority", "42",
-        "--workers", "10",
+        "--priority",
+        "42",
+        "--workers",
+        "10",
         "--no-follow",
-        "--output", "json",
-    ]).unwrap();
+        "--output",
+        "json",
+    ])
+    .unwrap();
     match cli.command {
         Commands::Run(args) => {
             assert!(args.dry_run);
@@ -47,10 +55,8 @@ fn test_cli_run_defaults() {
 
 #[test]
 fn test_cli_run_follow_overrides_no_follow() {
-    let cli = Cli::try_parse_from([
-        "ingest", "run", "test.yaml",
-        "--no-follow", "--follow",
-    ]).unwrap();
+    let cli =
+        Cli::try_parse_from(["ingest", "run", "test.yaml", "--no-follow", "--follow"]).unwrap();
     match cli.command {
         Commands::Run(args) => {
             assert!(args.follow);
@@ -62,10 +68,8 @@ fn test_cli_run_follow_overrides_no_follow() {
 
 #[test]
 fn test_cli_run_no_follow_overrides_follow() {
-    let cli = Cli::try_parse_from([
-        "ingest", "run", "test.yaml",
-        "--follow", "--no-follow",
-    ]).unwrap();
+    let cli =
+        Cli::try_parse_from(["ingest", "run", "test.yaml", "--follow", "--no-follow"]).unwrap();
     match cli.command {
         Commands::Run(args) => {
             assert!(!args.follow);
@@ -118,11 +122,9 @@ fn test_cli_status_jobs_defaults() {
 #[test]
 fn test_cli_status_jobs_all_flags() {
     let cli = Cli::try_parse_from([
-        "ingest", "status", "jobs",
-        "--filter", "failed",
-        "--limit", "100",
-        "--output", "json",
-    ]).unwrap();
+        "ingest", "status", "jobs", "--filter", "failed", "--limit", "100", "--output", "json",
+    ])
+    .unwrap();
     match cli.command {
         Commands::Status { scope } => match scope {
             StatusScope::Jobs(args) => {
@@ -193,14 +195,23 @@ fn test_cli_files_list_defaults() {
 #[test]
 fn test_cli_files_list_all_filters() {
     let cli = Cli::try_parse_from([
-        "ingest", "files", "list",
-        "--mime", "image/webp",
-        "--provider", "local",
-        "--from", "2024-01-01",
-        "--to", "2024-12-31",
-        "--limit", "50",
-        "--output", "json",
-    ]).unwrap();
+        "ingest",
+        "files",
+        "list",
+        "--mime",
+        "image/webp",
+        "--provider",
+        "local",
+        "--from",
+        "2024-01-01",
+        "--to",
+        "2024-12-31",
+        "--limit",
+        "50",
+        "--output",
+        "json",
+    ])
+    .unwrap();
     match cli.command {
         Commands::Files { scope } => match scope {
             FilesScope::List(args) => {
@@ -231,7 +242,8 @@ fn test_cli_files_get() {
 
 #[test]
 fn test_cli_files_download_with_dest() {
-    let cli = Cli::try_parse_from(["ingest", "files", "download", "hash123", "/tmp/output.bin"]).unwrap();
+    let cli =
+        Cli::try_parse_from(["ingest", "files", "download", "hash123", "/tmp/output.bin"]).unwrap();
     match cli.command {
         Commands::Files { scope } => match scope {
             FilesScope::Download { hash, dest } => {
@@ -292,11 +304,18 @@ fn test_cli_files_delete_no_flag() {
 #[test]
 fn test_cli_global_flags() {
     let cli = Cli::try_parse_from([
-        "ingest", "--config", "/custom/config.toml",
-        "--log-format", "json",
-        "-v", "-q", "--no-color",
-        "run", "test.yaml",
-    ]).unwrap();
+        "ingest",
+        "--config",
+        "/custom/config.toml",
+        "--log-format",
+        "json",
+        "-v",
+        "-q",
+        "--no-color",
+        "run",
+        "test.yaml",
+    ])
+    .unwrap();
     assert_eq!(cli.config.to_string_lossy(), "/custom/config.toml");
     assert!(matches!(cli.global.log_format, LogFormat::Json));
     assert_eq!(cli.global.verbose, 1);

@@ -159,7 +159,7 @@ impl RedisService {
         let _: () = conn.hdel("jobs:running", job_id).await?;
 
         let state_key = format!("jobs:state:{}", job_id);
-        
+
         let retry_count: u8 = redis::cmd("HGET")
             .arg(&state_key)
             .arg("retry_count")
@@ -169,7 +169,9 @@ impl RedisService {
         // Enforce 3-attempt cap
         if retry_count >= 3 {
             tracing::error!(job_id = %job_id, "Exceeded max retries, failing job");
-            return self.fail_job(job_id, "Exceeded maximum retry attempts").await;
+            return self
+                .fail_job(job_id, "Exceeded maximum retry attempts")
+                .await;
         }
 
         let member = match kind {
@@ -193,7 +195,9 @@ impl RedisService {
         let retry_after = chrono::Utc::now()
             .checked_add_signed(chrono::Duration::seconds(backoff_secs as i64))
             .unwrap();
-        let _: () = conn.hset(&state_key, "retry_after", retry_after.to_rfc3339()).await?;
+        let _: () = conn
+            .hset(&state_key, "retry_after", retry_after.to_rfc3339())
+            .await?;
 
         // Use priority score 0 so it's picked up after backoff
         let _: () = conn.zadd("jobs:pending", &member, 0).await?;
@@ -231,11 +235,7 @@ impl RedisService {
     }
 
     /// Records a completed chunk hash in the crash-recovery set for its file.
-    pub async fn register_chunk(
-        &self,
-        file_hash: &str,
-        chunk_hash: &str,
-    ) -> Result<(), ToolError> {
+    pub async fn register_chunk(&self, file_hash: &str, chunk_hash: &str) -> Result<(), ToolError> {
         let mut conn = self.get_connection().await?;
         let key = format!("jobs:chunks:{file_hash}");
         let _: () = conn.sadd(&key, chunk_hash).await?;
@@ -264,30 +264,30 @@ impl RedisService {
     pub async fn find_orphaned_chunks(&self) -> Result<Vec<String>, ToolError> {
         let mut conn = self.get_connection().await?;
         let mut orphaned = Vec::new();
-        
+
         // Get all chunk keys
         let keys: Vec<String> = redis::cmd("KEYS")
             .arg("jobs:chunks:*")
             .query_async(&mut conn)
             .await?;
-        
+
         for key in keys {
             orphaned.push(key);
         }
-        
+
         Ok(orphaned)
     }
 
     /// Cleans up orphaned chunks (simplified version).
     pub async fn cleanup_orphaned_chunks(&self) -> Result<usize, ToolError> {
         let mut conn = self.get_connection().await?;
-        
+
         // Get all chunk keys
         let keys: Vec<String> = redis::cmd("KEYS")
             .arg("jobs:chunks:*")
             .query_async(&mut conn)
             .await?;
-        
+
         for key in keys {
             let file_hash = key.trim_start_matches("jobs:chunks:");
             // Check if file exists in MongoDB
@@ -295,7 +295,7 @@ impl RedisService {
             // This is a simplified version - in reality you'd check MongoDB
             tracing::debug!("Checking orphaned chunks for file: {}", file_hash);
         }
-        
+
         Ok(0)
     }
 }
