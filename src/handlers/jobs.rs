@@ -442,8 +442,8 @@ async fn handle_new_file(
         .map_err(|e| JobErrorOutcome::from(JobError::from(e)))?;
     ctx.storage.upload(&final_path, &mut file).await?;
 
-    if local_file != temp_path {
-        tokio::fs::remove_file(&temp_path).await.ok();
+    if final_path != local_file {
+        tokio::fs::remove_file(&local_file).await.ok();
     }
 
     let metadata = Metadata::new(
