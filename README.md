@@ -216,7 +216,7 @@ Only the `run` command is fully implemented. The remaining subcommands are decla
 
 - Only `local` storage is active; `gdrive`, `dropbox`, and `s3` are modelled but not wired
 - Chunk job execution is not implemented; large files are downloaded as a single stream
-- Compression settings and per-resource overrides are parsed and stored but not applied
+- Image compression (WebP/AVIF) is applied; video, PDF, and zstd are not implemented
 - FTP/FTPS protocol support is declared in the stack but not connected to the download path
 - `status`, `cancel`, `retry`, and `files` command handlers return "not implemented"
 

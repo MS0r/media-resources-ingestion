@@ -45,7 +45,7 @@ fn test_cli_run_defaults() {
             assert!(!args.dry_run);
             assert_eq!(args.priority, None);
             assert_eq!(args.workers, None);
-            assert!(args.follow);
+            assert!(!args.follow);
             assert!(!args.no_follow);
             assert!(matches!(args.output, OutputFormat::Table));
         }

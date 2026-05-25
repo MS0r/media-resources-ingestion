@@ -1,19 +1,20 @@
 pub mod bootstrap;
 pub mod cli;
 pub mod context;
+pub mod error;
 pub mod handlers;
 pub mod models;
 pub mod services;
 pub mod settings;
 pub mod storage;
-pub mod error;
 
 use crate::{
-    cli::{Commands, Global, LogFormat, get_config, load_config},
+    cli::{Cli, Commands, Global, LogFormat, load_config, load_env_uris},
     error::ToolError,
-    models::MainConfig,
-    settings::merge_configs_yaml,
+    models::AppConfig,
+    settings::load_toml,
 };
+use clap::Parser;
 use colored::*;
 use tracing_subscriber::{
     EnvFilter, filter::LevelFilter, layer::SubscriberExt, util::SubscriberInitExt,
@@ -76,16 +77,26 @@ fn is_pipe() -> bool {
 async fn main() -> Result<(), ToolError> {
     dotenvy::dotenv().ok();
 
-    let cli_config = match get_config() {
-        Ok(config) => config,
+    let cli = Cli::parse();
+    let global = cli.global.clone();
+
+    setup_logging(global.clone());
+
+    let (redis_uri, mongo_uri) = match load_env_uris() {
+        Ok(uris) => uris,
         Err(e) => {
             println!("{} {}", "Error loading configuration:".red(), e);
             std::process::exit(e.exit_code());
         }
     };
-    let global = cli_config.cli.global;
 
-    setup_logging(global.clone());
+    let toml_config = match load_toml(&cli.config) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            println!("{} {}", "Error loading configuration:".red(), e);
+            std::process::exit(e.exit_code());
+        }
+    };
 
     if is_pipe() {
         eprintln!(
@@ -98,27 +109,25 @@ async fn main() -> Result<(), ToolError> {
 
     let result = tokio::select! {
         result = async {
-            match cli_config.cli.command {
+            match cli.command {
                 Commands::Run(run_args) => {
                     tracing::info!("Running ingestion...");
-                    let yaml_path = run_args.yaml_path.clone();
-                    let yaml_config = load_config(&yaml_path)?;
+                    let yaml_config = load_config(&run_args.yaml_path)?;
 
-                    let toml_config = merge_configs_yaml(&yaml_config, cli_config.toml_config)?;
+                    let config = AppConfig::from_sources(
+                        toml_config,
+                        &yaml_config,
+                        &run_args,
+                        redis_uri,
+                        mongo_uri,
+                    );
 
-                    let config = MainConfig {
-                        toml_config: toml_config,
-                        yaml_config: yaml_config,
-                        yaml_path: yaml_path,
-                        redis_uri: cli_config.redis_uri,
-                        mongo_uri: cli_config.mongo_uri,
-                    };
-                    bootstrap::run(config, run_args).await
+                    bootstrap::run(config, &yaml_config).await
                 }
-                Commands::Status { scope } => bootstrap::status(scope, cli_config.mongo_uri).await,
-                Commands::Cancel { scope } => bootstrap::cancel(scope, cli_config.mongo_uri, cli_config.redis_uri).await,
-                Commands::Retry { scope } =>  bootstrap::retry(scope, cli_config.mongo_uri).await,
-                Commands::Files { scope } => bootstrap::files(scope, cli_config.mongo_uri).await,
+                Commands::Status { scope } => bootstrap::status(scope, mongo_uri).await,
+                Commands::Cancel { scope } => bootstrap::cancel(scope, mongo_uri, redis_uri).await,
+                Commands::Retry { scope } =>  bootstrap::retry(scope, mongo_uri).await,
+                Commands::Files { scope } => bootstrap::files(scope, mongo_uri).await,
             }
         } => result,
         _ = tokio::signal::ctrl_c() => {
@@ -140,4 +149,3 @@ async fn main() -> Result<(), ToolError> {
         }
     }
 }
-

@@ -1,14 +1,13 @@
 use crate::{
     error::{JobError, JobErrorOutcome},
     models::{
-        CompressionOverride, GenericCompressionStrategy, ImageCompressionStrategy, Metadata,
-        Resource, UniversalCompressionStrategy, VideoCompressionStrategy,
+        AppConfig, CompressionOverride, GenericCompressionStrategy, ImageCompressionStrategy,
+        Metadata, Resource, UniversalCompressionStrategy, VideoCompressionStrategy,
     },
     services::{
         mongo::{MongoService, UpsertResult},
         redis::RedisService,
     },
-    settings::TomlConfig,
     storage::{Provider, StorageProvider},
 };
 use async_trait::async_trait;
@@ -39,9 +38,8 @@ pub struct JobContext {
     pub storage: Arc<dyn StorageProvider>,
     pub db: Arc<MongoService>,
     pub redis: Arc<RedisService>,
-    pub config: Arc<TomlConfig>,
+    pub config: Arc<AppConfig>,
     pub job: JobEnvelope,
-    pub dry_run: bool,
 }
 
 impl JobContext {
@@ -49,8 +47,7 @@ impl JobContext {
         job: FileJob,
         db: Arc<MongoService>,
         redis: Arc<RedisService>,
-        config: Arc<TomlConfig>,
-        dry_run: bool,
+        config: Arc<AppConfig>,
     ) -> Self {
         if let Some(dest) = &job.resource.dest
             && let Some(provider) = &dest.provider
@@ -63,7 +60,6 @@ impl JobContext {
                 redis,
                 config,
                 job: JobEnvelope::File(job),
-                dry_run,
             };
         }
 
@@ -74,7 +70,6 @@ impl JobContext {
             redis,
             config,
             job: JobEnvelope::File(job),
-            dry_run,
         }
     }
 
@@ -82,8 +77,7 @@ impl JobContext {
         job: ChunkJob,
         db: Arc<MongoService>,
         redis: Arc<RedisService>,
-        config: Arc<TomlConfig>,
-        dry_run: bool,
+        config: Arc<AppConfig>,
     ) -> Self {
         Self {
             job_id: job._id.clone(),
@@ -92,7 +86,6 @@ impl JobContext {
             redis,
             config,
             job: JobEnvelope::Chunk(job),
-            dry_run,
         }
     }
     /// Convenience — panics if called on a chunk context
@@ -188,6 +181,14 @@ pub struct FileJobHandler;
 fn expand_path(path: &str, filename: &str) -> PathBuf {
     let expanded_path = shellexpand::tilde(path).to_string();
     PathBuf::from(expanded_path).join(filename)
+}
+
+fn mime_to_extension(mime: &str) -> Option<&'static str> {
+    match mime {
+        "image/webp" => Some("webp"),
+        "image/avif" => Some("avif"),
+        _ => None,
+    }
 }
 
 fn filename_from_url(url: &Url) -> (Option<String>, Option<String>) {
@@ -313,27 +314,18 @@ async fn initiate_download(resource: &Resource) -> Result<(Response, DownloadInf
     // Set filename: resource.name (+ ext from URL) first, fallback to name.ext from URL
     let (filename, extension) = match filename_from_url(&resource.url) {
         (Some(name), Some(ext)) => {
-            let fname = resource
-                .name
-                .as_deref()
-                .map(|n| format!("{}.{}", n, ext))
-                .unwrap_or_else(|| format!("{}.{}", name, ext));
+            let fname = resource.name.clone().unwrap_or(name);
             (Some(fname), Some(ext))
         }
         (Some(name), None) => {
-            let fname = resource
-                .name
-                .as_deref()
-                .map(|n| format!("{}.{}", n, "bin"))
-                .unwrap_or_else(|| name);
+            let fname = resource.name.clone().unwrap_or(name);
             (Some(fname), Some("bin".to_string()))
         }
         (None, Some(ext)) => {
             let fname = resource
                 .name
-                .as_deref()
-                .map(|n| format!("{}.{}", n, ext))
-                .unwrap_or_else(|| format!("downloaded_file.{}", ext));
+                .clone()
+                .unwrap_or_else(|| "downloaded_file".to_string());
             (Some(fname), Some(ext))
         }
         (None, None) => (resource.name.clone(), None),
@@ -382,7 +374,9 @@ async fn handle_new_file(
             "Missing destination provider".into(),
         ))?;
 
-    let final_path = expand_path(
+    let original_mime = download.mime_type.clone();
+
+    let mut final_path = expand_path(
         &dest_path,
         &format!("{}.{}", download.filename, download.extension),
     )
@@ -402,7 +396,7 @@ async fn handle_new_file(
                     &temp_path,
                     &download.mime_type,
                     download.content_length,
-                    ctx.config.compression.quality,
+                    ctx.config.compression_quality,
                     image_s,
                 )
                 .await
@@ -431,6 +425,17 @@ async fn handle_new_file(
         },
         None => (temp_path.clone(), Some(0), download.mime_type),
     };
+
+    if final_mime != original_mime {
+        if let Some(new_ext) = mime_to_extension(&final_mime) {
+            final_path = expand_path(
+                &dest_path,
+                &format!("{}.{}", download.filename, new_ext),
+            )
+            .to_string_lossy()
+            .to_string();
+        }
+    }
 
     let mut file = tokio::fs::File::open(&local_file)
         .await
@@ -475,7 +480,7 @@ impl JobHandler for FileJobHandler {
         let file_job = extract_file_job(&ctx.job)?;
         let (response, download) = initiate_download(&file_job.resource).await?;
 
-        let threshold_bytes = ctx.config.compression.threshold_mb * 1024 * 1024;
+        let threshold_bytes = ctx.config.compression_threshold_mb * 1024 * 1024;
         if download.content_length > threshold_bytes {
             tracing::info!(
                 "Large file ({} bytes), spawning chunks",
@@ -484,7 +489,7 @@ impl JobHandler for FileJobHandler {
             return Ok(JobOutcome::SpawnedChunks(vec![]));
         }
 
-        let temp_dir = &ctx.config.storage.temp_dir;
+        let temp_dir = &ctx.config.temp_dir;
         let (temp_path, hash_hex) =
             download_to_temp(response, temp_dir, &download.filename, &ctx.job_id).await?;
 
@@ -546,9 +551,12 @@ async fn compress_image_local(
         ImageCompressionStrategy::Avif => "avif",
         _ => "webp",
     };
-    let output_path = Path::new(original_name).with_extension(ext);
+    
+    let parent = Path::new(temp_path).parent().unwrap_or(Path::new("."));
+    let output_path = parent.join(original_name).with_extension(ext);
     let output_path_str = output_path.to_string_lossy().to_string();
 
+    tracing::debug!("Decoding image for compression with strategy: {:?}, on temp_path: {}", strategy, temp_path);
     match strategy {
         ImageCompressionStrategy::Avif => {
             let file = File::create(&output_path)?;

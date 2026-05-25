@@ -1,7 +1,7 @@
 use crate::{
     error::ToolError,
     models::{Destination, IngestionConfig},
-    settings::{TomlConfig, load_config as load_toml_config},
+    settings::TomlRawConfig,
     storage::Provider,
 };
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
@@ -210,39 +210,15 @@ pub enum OutputFormat {
 
 pub fn load_config(path: &PathBuf) -> Result<IngestionConfig, ToolError> {
     let content = std::fs::read_to_string(path)?;
-    let mut request: IngestionConfig = serde_yaml::from_str(&content).map_err(|e| {
+    let request: IngestionConfig = serde_yaml::from_str(&content).map_err(|e| {
         tracing::error!("YAML parse error: {}", e);
         ToolError::ConfigError(format!("YAML parse error: {}", e))
     })?;
 
-    let dest = request.default_dest.get_or_insert_with(|| Destination {
-        provider: None,
-        path: None,
-    });
-    if dest.provider.is_none() {
-        dest.provider = Some(Provider::Local);
-    }
-    if dest.path.is_none() {
-        let cwd = std::env::current_dir().map_err(|e| {
-            ToolError::ConfigError(format!("Failed to get current directory: {}", e))
-        })?;
-        dest.path = Some(cwd.to_string_lossy().to_string());
-    }
-
     Ok(request)
 }
 
-pub struct CliConfig {
-    pub toml_config: TomlConfig,
-    pub redis_uri: String,
-    pub mongo_uri: String,
-    pub cli: Cli,
-}
-
-pub fn get_config() -> Result<CliConfig, ToolError> {
-    let cli = Cli::parse();
-    let toml_config = load_toml_config(&cli.config)?;
-
+pub fn load_env_uris() -> Result<(String, String), ToolError> {
     let redis_uri = std::env::var("REDIS_URI").map_err(|_| {
         tracing::error!("REDIS_URI environment variable is required");
         ToolError::ConfigError("REDIS_URI not set".to_string())
@@ -253,15 +229,9 @@ pub fn get_config() -> Result<CliConfig, ToolError> {
         ToolError::ConfigError("MONGODB_URI not set".to_string())
     })?;
 
-    // Validate secret environment variables based on providers used
     validate_secrets()?;
 
-    Ok(CliConfig {
-        toml_config,
-        redis_uri,
-        mongo_uri,
-        cli,
-    })
+    Ok((redis_uri, mongo_uri))
 }
 
 fn validate_secrets() -> Result<(), ToolError> {

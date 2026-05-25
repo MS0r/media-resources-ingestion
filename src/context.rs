@@ -1,19 +1,19 @@
 use crate::{
     error::ToolError,
     handlers::jobs::JobContext,
+    models::AppConfig,
     services::{mongo::MongoService, redis::RedisService},
-    settings::TomlConfig,
 };
 use std::sync::Arc;
 
 pub struct ContextFactory {
     mongo: Arc<MongoService>,
     redis: Arc<RedisService>,
-    config: Arc<TomlConfig>,
+    config: Arc<AppConfig>,
 }
 
 impl ContextFactory {
-    pub fn new(mongo: MongoService, redis: RedisService, config: TomlConfig) -> Self {
+    pub fn new(mongo: MongoService, redis: RedisService, config: AppConfig) -> Self {
         Self {
             mongo: Arc::new(mongo),
             redis: Arc::new(redis),
@@ -32,13 +32,11 @@ impl ContextFactory {
     pub async fn build_file_context(&self, job_id: &str) -> Result<JobContext, ToolError> {
         if let Some(file_job) = self.mongo.get_file_job(job_id).await? {
             tracing::info!(job_id = %job_id, url = %file_job.resource.url, "Building file job context from Mongo");
-            let dry_run = self.config.cli.custom_flags.dry_run;
             return Ok(JobContext::from_file_job(
                 file_job,
                 self.mongo.clone(),
                 self.redis.clone(),
                 self.config.clone(),
-                dry_run,
             ));
         } else {
             Err(format!("File job {job_id} not found in Mongo").into())
@@ -48,17 +46,14 @@ impl ContextFactory {
     pub async fn build_chunk_context(&self, job_id: &str) -> Result<JobContext, ToolError> {
         if let Some(chunk_job) = self.mongo.get_chunk_job(job_id).await? {
             tracing::info!(job_id = %job_id, "Building chunk job context from Mongo");
-            let dry_run = self.config.cli.custom_flags.dry_run;
             return Ok(JobContext::from_chunk_job(
                 chunk_job,
                 self.mongo.clone(),
                 self.redis.clone(),
                 self.config.clone(),
-                dry_run,
             ));
         } else {
             Err(format!("Chunk job {job_id} not found in Mongo").into())
         }
     }
 }
-

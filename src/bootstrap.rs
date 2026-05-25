@@ -1,5 +1,5 @@
 use crate::{
-    cli::{CancelScope, FilesScope, RetryScope, RunArgs, StatusScope},
+    cli::{CancelScope, FilesScope, RetryScope, StatusScope},
     context::ContextFactory,
     error::ToolError,
     handlers::{
@@ -7,9 +7,11 @@ use crate::{
         scheduler::scheduler_loop,
     },
     models::{
-        CompressionOverride, Destination, Headers, MainConfig, Resource, ResourceLevelConfig,
+        AppConfig, CompressionOverride, Destination, Headers, IngestionConfig, Resource,
+        ResourceLevelConfig,
     },
     services::{mongo::MongoService, redis::RedisService},
+    storage::Provider,
 };
 use chrono::Utc;
 use colored::*;
@@ -20,7 +22,7 @@ use uuid::Uuid;
 fn parent_values(
     mut res: Resource,
     compression: &Option<CompressionOverride>,
-    dest: &Option<Destination>,
+    dest: &Destination,
     priority: i32,
     headers: &Option<Headers>,
 ) -> (Resource, i32) {
@@ -51,19 +53,17 @@ fn parent_values(
     }
 
     // Inherit parent dest fields if resource has none
-    if let Some(parent_dest) = dest {
-        if res.dest.is_none() {
-            res.dest = Some(Destination {
-                provider: parent_dest.provider.clone(),
-                path: parent_dest.path.clone(),
-            });
-        } else if let Some(ref mut res_dest) = res.dest {
-            if res_dest.provider.is_none() {
-                res_dest.provider = parent_dest.provider.clone();
-            }
-            if res_dest.path.is_none() {
-                res_dest.path = parent_dest.path.clone();
-            }
+    if res.dest.is_none() {
+        res.dest = Some(Destination {
+            provider: dest.provider.clone(),
+            path: dest.path.clone(),
+        });
+    } else if let Some(ref mut res_dest) = res.dest {
+        if res_dest.provider.is_none() {
+            res_dest.provider = dest.provider.clone();
+        }
+        if res_dest.path.is_none() {
+            res_dest.path = dest.path.clone();
         }
     }
 
@@ -91,20 +91,17 @@ fn parent_values(
     (res, resource_priority)
 }
 
-pub async fn run(config: MainConfig, args: RunArgs) -> Result<(), ToolError> {
-    tracing::info!(
-        resources = config.yaml_config.resources.len(),
-        "Config loaded"
-    );
+pub async fn run(config: AppConfig, yaml_config: &IngestionConfig) -> Result<(), ToolError> {
+    tracing::info!(resources = yaml_config.resources.len(), "Config loaded");
 
-    if config.yaml_config.resources.is_empty() {
+    if yaml_config.resources.is_empty() {
         tracing::warn!("Empty YAML file - no jobs created");
         return Ok(());
     }
 
     // Validate YAML - check for duplicate URLs
     let mut urls = std::collections::HashSet::new();
-    for resource in &config.yaml_config.resources {
+    for resource in &yaml_config.resources {
         if !urls.insert(resource.url.as_str()) {
             tracing::error!("Duplicate URL found in YAML: {}", resource.url);
             return Err(ToolError::ValidationError(
@@ -114,8 +111,8 @@ pub async fn run(config: MainConfig, args: RunArgs) -> Result<(), ToolError> {
     }
 
     // --dry-run: validate YAML and preflight URLs without downloading
-    if args.dry_run {
-        return validate_dry_run(&config.yaml_config).await;
+    if config.dry_run {
+        return validate_dry_run(yaml_config).await;
     }
 
     // -- Services ----------------------------------------------------------
@@ -141,28 +138,33 @@ pub async fn run(config: MainConfig, args: RunArgs) -> Result<(), ToolError> {
         }
     };
 
-    let priority = args.priority.or(config.yaml_config.priority).unwrap_or(0);
+    let priority = config.priority;
 
-    let temp_dir = &config.toml_config.storage.temp_dir;
+    let temp_dir = &config.temp_dir;
     tokio::fs::create_dir_all(temp_dir).await?;
+
+    let default_dest = Destination {
+        provider: Some(Provider::from(config.default_provider.clone())),
+        path: Some(config.default_path.clone()),
+    };
 
     // -- Initial batch ------------------------------------------------------
     let batch_id = Uuid::new_v4().to_string();
     let mut batch = Batch {
         _id: batch_id.clone(),
         created_at: Utc::now(),
-        yaml_path: config.yaml_path,
+        yaml_path: config.yaml_path.clone(),
         status: JobStatus::Pending,
         job_ids: vec![],
     };
 
-    for resource in &config.yaml_config.resources {
+    for resource in &yaml_config.resources {
         let (res, resource_priority) = parent_values(
             resource.clone(),
-            &config.yaml_config.compression_override,
-            &config.yaml_config.default_dest,
+            &yaml_config.compression_override,
+            &default_dest,
             priority,
-            &config.yaml_config.headers,
+            &yaml_config.headers,
         );
 
         let file_job = FileJob {
@@ -191,23 +193,18 @@ pub async fn run(config: MainConfig, args: RunArgs) -> Result<(), ToolError> {
     let chunk_handler = Arc::new(ChunkJobHandler);
 
     // -- Context factory ---------------------------------------------------
-    let max_file_workers = config.toml_config.scheduler.file_workers;
-    let max_chunk_workers = config.toml_config.scheduler.chunk_workers;
+    let max_file_workers = config.file_workers;
+    let max_chunk_workers = config.chunk_workers;
+    let follow = config.follow;
+    let mongo_uri = config.mongo_uri.clone();
 
-    let ctx_factory = Arc::new(ContextFactory::new(
-        mongo_service,
-        redis_service,
-        config.toml_config,
-    ));
-
-    // Check if follow mode is enabled (default: true)
-    let follow = args.follow || !args.no_follow;
+    let ctx_factory = Arc::new(ContextFactory::new(mongo_service, redis_service, config));
 
     let mut had_failures = false;
 
     if follow && atty::is(atty::Stream::Stdout) {
         // Show progress bar
-        let pb = ProgressBar::new(config.yaml_config.resources.len() as u64);
+        let pb = ProgressBar::new(yaml_config.resources.len() as u64);
         pb.set_style(
             ProgressStyle::default_bar()
                 .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} jobs ({eta})")
@@ -236,7 +233,7 @@ pub async fn run(config: MainConfig, args: RunArgs) -> Result<(), ToolError> {
     }
 
     // Check if any jobs failed
-    let mongo = MongoService::new(&config.mongo_uri).await?;
+    let mongo = MongoService::new(&mongo_uri).await?;
     let failed_jobs = mongo
         .list_jobs(Some(crate::cli::JobStatus::Failed), 1000)
         .await?;
@@ -612,11 +609,11 @@ mod tests {
         }
     }
 
-    fn parent_dest() -> Option<Destination> {
-        Some(Destination {
+    fn parent_dest() -> Destination {
+        Destination {
             provider: Some(Provider::Local),
             path: Some("/default/path".to_string()),
-        })
+        }
     }
 
     fn parent_headers() -> Option<Headers> {
@@ -689,16 +686,22 @@ mod tests {
     }
 
     #[test]
-    fn leaves_dest_none_when_parent_also_none() {
+    fn inherits_appconfig_default_dest_when_resource_has_no_dest() {
         let res = resource_no_dest();
-        let (updated, _) = parent_values(res, &None, &None, 0, &None);
-        assert!(updated.dest.is_none());
+        let dest = Destination {
+            provider: Some(Provider::Local),
+            path: Some("/default/path".to_string()),
+        };
+        let (updated, _) = parent_values(res, &None, &dest, 0, &None);
+        let d = updated.dest.unwrap();
+        assert_eq!(d.provider.unwrap().to_string(), "local");
+        assert_eq!(d.path.unwrap(), "/default/path");
     }
 
     #[test]
     fn inherits_headers_when_resource_has_no_config() {
         let res = resource_no_config();
-        let (updated, _) = parent_values(res, &None, &None, 0, &parent_headers());
+        let (updated, _) = parent_values(res, &None, &parent_dest(), 0, &parent_headers());
         assert_eq!(
             updated
                 .config
@@ -717,7 +720,7 @@ mod tests {
             authorization: Some("Custom".to_string()),
             cookie: None,
         }));
-        let (updated, _) = parent_values(res, &None, &None, 0, &parent_headers());
+        let (updated, _) = parent_values(res, &None, &parent_dest(), 0, &parent_headers());
         assert_eq!(
             updated
                 .config
@@ -733,7 +736,7 @@ mod tests {
     #[test]
     fn inherits_headers_into_existing_config() {
         let res = resource_with_config(None);
-        let (updated, _) = parent_values(res, &None, &None, 0, &parent_headers());
+        let (updated, _) = parent_values(res, &None, &parent_dest(), 0, &parent_headers());
         assert_eq!(
             updated
                 .config
@@ -749,7 +752,7 @@ mod tests {
     #[test]
     fn leaves_headers_none_when_parent_also_none() {
         let res = resource_no_config();
-        let (updated, _) = parent_values(res, &None, &None, 0, &None);
+        let (updated, _) = parent_values(res, &None, &parent_dest(), 0, &None);
         assert!(updated.config.is_none());
     }
 }

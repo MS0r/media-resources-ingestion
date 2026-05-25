@@ -1,18 +1,8 @@
-use media_resources_ingestion::cli::load_config;
-use media_resources_ingestion::models::IngestionConfig;
-use media_resources_ingestion::settings::TomlConfig;
-use media_resources_ingestion::settings::merge_configs_yaml;
+use media_resources_ingestion::cli::{Cli, Commands, load_config};
+use media_resources_ingestion::models::{AppConfig, IngestionConfig};
+use media_resources_ingestion::settings::TomlRawConfig;
 
 const TOML_FULL: &str = r#"
-[cli]
-log_format = "Pretty"
-no_color = false
-
-[cli.custom_flags]
-dry_run = false
-follow = true
-output = "table"
-
 [scheduler]
 file_workers = 5
 chunk_workers = 20
@@ -27,23 +17,10 @@ quality = 95
 default_provider = "local"
 default_path = "~/downloads"
 chunk_size = "128MB"
-
-[retry]
-attempt_1_secs = 5
-attempt_2_secs = 30
-attempt_3_secs = 120
+temp_dir = "/tmp/ingest"
 "#;
 
 const TOML_MINIMAL: &str = r#"
-[cli]
-log_format = "Json"
-no_color = true
-
-[cli.custom_flags]
-dry_run = false
-follow = true
-output = "table"
-
 [scheduler]
 file_workers = 1
 chunk_workers = 1
@@ -58,23 +35,10 @@ quality = 0
 default_provider = "s3"
 default_path = "~"
 chunk_size = "64MB"
-
-[retry]
-attempt_1_secs = 1
-attempt_2_secs = 1
-attempt_3_secs = 1
+temp_dir = "/tmp/ingest"
 "#;
 
 const TOML_LARGE: &str = r#"
-[cli]
-log_format = "Pretty"
-no_color = false
-
-[cli.custom_flags]
-dry_run = false
-follow = true
-output = "table"
-
 [scheduler]
 file_workers = 100
 chunk_workers = 200
@@ -89,11 +53,7 @@ quality = 100
 default_provider = "s3"
 default_path = "/mnt/storage"
 chunk_size = "512MB"
-
-[retry]
-attempt_1_secs = 60
-attempt_2_secs = 300
-attempt_3_secs = 600
+temp_dir = "/tmp/ingest"
 "#;
 
 const YAML_FULL: &str = r#"
@@ -161,10 +121,8 @@ mod toml_tests {
 
     #[test]
     fn test_toml_config_full_deserialization() {
-        let config: TomlConfig = toml::from_str(TOML_FULL).expect("Failed to parse TOML");
+        let config: TomlRawConfig = toml::from_str(TOML_FULL).expect("Failed to parse TOML");
 
-        assert_eq!(config.cli.log_format, "Pretty");
-        assert_eq!(config.cli.no_color, false);
         assert_eq!(config.scheduler.file_workers, 5);
         assert_eq!(config.scheduler.chunk_workers, 20);
         assert_eq!(config.scheduler.max_pending_jobs, 10000);
@@ -174,24 +132,20 @@ mod toml_tests {
         assert_eq!(config.storage.default_provider, "local");
         assert_eq!(config.storage.default_path, "~/downloads");
         assert_eq!(config.storage.chunk_size, "128MB");
-        assert_eq!(config.retry.attempt_1_secs, 5);
-        assert_eq!(config.retry.attempt_2_secs, 30);
-        assert_eq!(config.retry.attempt_3_secs, 120);
     }
 
     #[test]
     fn test_toml_config_minimal_values() {
-        let config: TomlConfig = toml::from_str(TOML_MINIMAL).expect("Failed to parse TOML");
+        let config: TomlRawConfig = toml::from_str(TOML_MINIMAL).expect("Failed to parse TOML");
 
-        assert_eq!(config.cli.log_format, "Json");
-        assert_eq!(config.cli.no_color, true);
         assert_eq!(config.scheduler.file_workers, 1);
+        assert_eq!(config.scheduler.max_per_host, 1);
         assert_eq!(config.compression.quality, 0);
     }
 
     #[test]
     fn test_toml_config_large_values() {
-        let config: TomlConfig = toml::from_str(TOML_LARGE).expect("Failed to parse TOML");
+        let config: TomlRawConfig = toml::from_str(TOML_LARGE).expect("Failed to parse TOML");
 
         assert_eq!(config.scheduler.file_workers, 100);
         assert_eq!(config.scheduler.chunk_workers, 200);
@@ -322,21 +276,12 @@ mod yaml_tests {
     }
 }
 
-mod merge_tests {
-    use media_resources_ingestion::error::ToolError;
-
+mod app_config_tests {
     use super::*;
+    use clap::Parser;
+    use media_resources_ingestion::cli::RunArgs;
 
     const TOML_DEFAULTS: &str = r#"
-[cli]
-log_format = "Pretty"
-no_color = false
-
-[cli.custom_flags]
-dry_run = false
-follow = true
-output = "table"
-
 [scheduler]
 file_workers = 5
 chunk_workers = 20
@@ -351,11 +296,7 @@ quality = 95
 default_provider = "local"
 default_path = "~/downloads"
 chunk_size = "128MB"
-
-[retry]
-attempt_1_secs = 5
-attempt_2_secs = 30
-attempt_3_secs = 120
+temp_dir = "/tmp/ingest"
 "#;
 
     const YAML_MINIMAL_NO_PROVIDER: &str = r#"
@@ -376,65 +317,89 @@ resources:
   - url: https://example.com/file.txt
 "#;
 
-    #[test]
-    fn test_merge_provider_from_toml() -> Result<(), ToolError> {
-        let toml: TomlConfig = toml::from_str(TOML_DEFAULTS).expect("Failed to parse TOML");
-        let yaml: IngestionConfig =
-            serde_yaml::from_str(YAML_MINIMAL_NO_PROVIDER).expect("Failed to parse YAML");
-
-        let merged = merge_configs_yaml(&yaml, toml)?;
-
-        assert_eq!(merged.storage.default_provider, "local");
-        Ok(())
+    fn default_run_args() -> RunArgs {
+        let cli = Cli::try_parse_from(["ingest", "run", "test.yaml"]).unwrap();
+        match cli.command {
+            Commands::Run(a) => a,
+            _ => panic!("expected Run"),
+        }
     }
 
     #[test]
-    fn test_merge_path_from_toml() -> Result<(), ToolError> {
-        let toml: TomlConfig = toml::from_str(TOML_DEFAULTS).expect("Failed to parse TOML");
-        let yaml: IngestionConfig =
-            serde_yaml::from_str(YAML_MINIMAL_NO_PROVIDER).expect("Failed to parse YAML");
+    fn test_app_config_uses_toml_defaults_when_yaml_omits_them() {
+        let toml: TomlRawConfig = toml::from_str(TOML_DEFAULTS).unwrap();
+        let yaml: IngestionConfig = serde_yaml::from_str(YAML_MINIMAL_NO_PROVIDER).unwrap();
+        let args = default_run_args();
 
-        let merged = merge_configs_yaml(&yaml, toml)?;
+        let cfg = AppConfig::from_sources(toml, &yaml, &args, "r://h".into(), "m://h".into());
 
-        assert_eq!(merged.storage.default_path, "~/downloads");
-        Ok(())
+        assert_eq!(cfg.default_provider, "local");
+        assert_eq!(cfg.default_path, "~/downloads");
+        assert_eq!(cfg.chunk_size, "128MB");
     }
 
     #[test]
-    fn test_merge_chunk_size_from_toml() -> Result<(), ToolError> {
-        let toml: TomlConfig = toml::from_str(TOML_DEFAULTS).expect("Failed to parse TOML");
-        let yaml: IngestionConfig =
-            serde_yaml::from_str(YAML_MINIMAL_NO_PROVIDER).expect("Failed to parse YAML");
+    fn test_app_config_yaml_overrides_storage() {
+        let toml: TomlRawConfig = toml::from_str(TOML_DEFAULTS).unwrap();
+        let yaml: IngestionConfig = serde_yaml::from_str(YAML_WITH_PROVIDER).unwrap();
+        let args = default_run_args();
 
-        let merged = merge_configs_yaml(&yaml, toml)?;
+        let cfg = AppConfig::from_sources(toml, &yaml, &args, "r://h".into(), "m://h".into());
 
-        assert_eq!(merged.storage.chunk_size, "128MB");
-        Ok(())
+        assert_eq!(cfg.default_provider, "s3");
+        assert_eq!(cfg.default_path, "/custom/path");
     }
 
     #[test]
-    fn test_merge_yaml_overrides_toml() -> Result<(), ToolError> {
-        let toml: TomlConfig = toml::from_str(TOML_DEFAULTS).expect("Failed to parse TOML");
-        let yaml: IngestionConfig =
-            serde_yaml::from_str(YAML_WITH_PROVIDER).expect("Failed to parse YAML");
+    fn test_app_config_yaml_chunk_size_overrides_toml() {
+        let toml: TomlRawConfig = toml::from_str(TOML_DEFAULTS).unwrap();
+        let yaml: IngestionConfig = serde_yaml::from_str(YAML_WITH_CHUNK_SIZE).unwrap();
+        let args = default_run_args();
 
-        let merged = merge_configs_yaml(&yaml, toml)?;
+        let cfg = AppConfig::from_sources(toml, &yaml, &args, "r://h".into(), "m://h".into());
 
-        assert_eq!(merged.storage.default_provider, "s3");
-        assert_eq!(merged.storage.default_path, "/custom/path");
-        Ok(())
+        assert_eq!(cfg.chunk_size, "256MB");
     }
 
     #[test]
-    fn test_merge_yaml_chunk_size_overrides_toml() -> Result<(), ToolError> {
-        let toml: TomlConfig = toml::from_str(TOML_DEFAULTS).expect("Failed to parse TOML");
-        let yaml: IngestionConfig =
-            serde_yaml::from_str(YAML_WITH_CHUNK_SIZE).expect("Failed to parse YAML");
+    fn test_app_config_cli_priority_overrides_yaml() {
+        let toml: TomlRawConfig = toml::from_str(TOML_DEFAULTS).unwrap();
+        let yaml: IngestionConfig = serde_yaml::from_str(YAML_WITH_PROVIDER).unwrap();
+        let cli = Cli::try_parse_from(["ingest", "run", "test.yaml", "--priority", "99"]).unwrap();
+        let args = match cli.command {
+            Commands::Run(a) => a,
+            _ => panic!("expected Run"),
+        };
 
-        let merged = merge_configs_yaml(&yaml, toml)?;
+        let cfg = AppConfig::from_sources(toml, &yaml, &args, "r://h".into(), "m://h".into());
 
-        assert_eq!(merged.storage.chunk_size, "256MB");
-        Ok(())
+        assert_eq!(cfg.priority, 99);
+    }
+
+    #[test]
+    fn test_app_config_cli_workers_overrides_toml() {
+        let toml: TomlRawConfig = toml::from_str(TOML_DEFAULTS).unwrap();
+        let yaml: IngestionConfig = serde_yaml::from_str(YAML_MINIMAL_NO_PROVIDER).unwrap();
+        let cli = Cli::try_parse_from(["ingest", "run", "test.yaml", "--workers", "42"]).unwrap();
+        let args = match cli.command {
+            Commands::Run(a) => a,
+            _ => panic!("expected Run"),
+        };
+
+        let cfg = AppConfig::from_sources(toml, &yaml, &args, "r://h".into(), "m://h".into());
+
+        assert_eq!(cfg.file_workers, 42);
+    }
+
+    #[test]
+    fn test_app_config_default_priority() {
+        let toml: TomlRawConfig = toml::from_str(TOML_DEFAULTS).unwrap();
+        let yaml: IngestionConfig = serde_yaml::from_str(YAML_MINIMAL_NO_PROVIDER).unwrap();
+        let args = default_run_args();
+
+        let cfg = AppConfig::from_sources(toml, &yaml, &args, "r://h".into(), "m://h".into());
+
+        assert_eq!(cfg.priority, 0);
     }
 }
 
@@ -443,7 +408,7 @@ mod load_config_tests {
     use std::io::Write;
 
     #[test]
-    fn test_load_config_applies_default_dest_when_missing() {
+    fn test_load_config_yields_none_default_dest_when_omitted() {
         let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
         std::fs::create_dir_all(&dir).unwrap();
         let yaml_path = dir.join("test.yaml");
@@ -453,15 +418,13 @@ mod load_config_tests {
         f.flush().unwrap();
 
         let config = load_config(&yaml_path).unwrap();
+        // load_config is a pure deserializer — no defaults applied.
+        // AppConfig::from_sources merges TOML defaults later.
+        // YAML with no provider/path still produces Some(Destination{provider:None, path:None})
+        // due to #[serde(flatten)] on default_dest.
         let dest = config.default_dest.expect("default_dest should be Some");
-        assert_eq!(dest.provider.unwrap().to_string(), "local");
-        assert_eq!(
-            dest.path.unwrap(),
-            std::env::current_dir()
-                .unwrap()
-                .to_string_lossy()
-                .to_string()
-        );
+        assert!(dest.provider.is_none());
+        assert!(dest.path.is_none());
 
         std::fs::remove_dir_all(&dir).ok();
     }
