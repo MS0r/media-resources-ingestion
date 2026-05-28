@@ -44,3 +44,5 @@ atty = "0.2.14"
 thiserror = "2.0.18"
 wreq = { version = "5.3.0", features = ["stream", "json"] }
 wreq-util = "2.2.5"
+ffmpeg-next = "8.1.0"
+mimetype-detector = "0.3"

@@ -22,7 +22,7 @@ pub async fn scheduler_loop(
             match kind {
                 JobKind::File => {
                     let permit = file_semaphore.clone().acquire_owned().await.unwrap();
-                    let ctx = match ctx_factory.build_file_context(&job_id).await {
+                    let job_ctx = match ctx_factory.build_file_context(&job_id).await {
                         Ok(ctx) => ctx,
                         Err(e) => {
                             tracing::error!(job_id = %job_id, error = %e, "Failed to build job context");
@@ -33,6 +33,7 @@ pub async fn scheduler_loop(
                     let handler = file_handler.clone();
                     let redis_clone = redis.clone();
                     tokio::spawn(async move {
+                        let ctx = job_ctx;
                         let _permit = permit;
                         match handler.execute(&ctx).await {
                             Ok(JobOutcome::SpawnedChunks(chunks)) => {

@@ -31,7 +31,7 @@ impl ContextFactory {
 
     pub async fn build_file_context(&self, job_id: &str) -> Result<JobContext, ToolError> {
         if let Some(file_job) = self.mongo.get_file_job(job_id).await? {
-            tracing::info!(job_id = %job_id, url = %file_job.resource.url, "Building file job context from Mongo");
+            tracing::info!(job_id = %job_id, "Building file job context from Mongo");
             return Ok(JobContext::from_file_job(
                 file_job,
                 self.mongo.clone(),

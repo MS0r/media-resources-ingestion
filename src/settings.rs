@@ -14,6 +14,12 @@ pub struct SchedulerConfig {
 pub struct CompressionConfig {
     pub threshold_mb: u64,
     pub quality: u8,
+    #[serde(default = "default_compression_timeout")]
+    pub max_compression_seconds: u64,
+}
+
+const fn default_compression_timeout() -> u64 {
+    300
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -20,6 +20,10 @@ use tracing_subscriber::{
     EnvFilter, filter::LevelFilter, layer::SubscriberExt, util::SubscriberInitExt,
 };
 
+fn init_ffmpeg() {
+    ffmpeg_next::init().ok();
+}
+
 fn setup_logging(global: Global) {
     use tracing_subscriber::fmt::format;
 
@@ -81,6 +85,7 @@ async fn main() -> Result<(), ToolError> {
     let global = cli.global.clone();
 
     setup_logging(global.clone());
+    init_ffmpeg();
 
     let (redis_uri, mongo_uri) = match load_env_uris() {
         Ok(uris) => uris,

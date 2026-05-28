@@ -91,6 +91,7 @@ pub enum ImageCompressionStrategy {
 #[serde(rename_all = "lowercase")]
 pub enum VideoCompressionStrategy {
     #[default]
+    H264,
     H265,
     Av1,
 }
@@ -190,6 +191,7 @@ pub struct AppConfig {
     // Compression (TOML)
     pub compression_threshold_mb: u64,
     pub compression_quality: u8,
+    pub compression_timeout_secs: u64,
 
     // Storage (TOML, YAML overrides provider/path/chunk_size)
     pub default_provider: String,
@@ -237,6 +239,7 @@ impl AppConfig {
             max_per_host: toml.scheduler.max_per_host,
             compression_threshold_mb: toml.compression.threshold_mb,
             compression_quality: toml.compression.quality,
+            compression_timeout_secs: toml.compression.max_compression_seconds,
             default_provider,
             default_path,
             chunk_size,
