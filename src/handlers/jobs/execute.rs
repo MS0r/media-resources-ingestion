@@ -31,13 +31,13 @@ impl super::JobHandler for FileJobHandler {
             );
             download.content_length = actual_size;
             if download.content_length > threshold_bytes {
-            tracing::info!(
-                "Large file ({} bytes), spawning chunks",
-                download.content_length
-            );
-            tokio::fs::remove_file(&temp_path).await.ok();
-            return Ok(JobOutcome::SpawnedChunks(vec![]));
-        }
+                tracing::info!(
+                    "Large file ({} bytes), spawning chunks",
+                    download.content_length
+                );
+                tokio::fs::remove_file(&temp_path).await.ok();
+                return Ok(JobOutcome::SpawnedChunks(vec![]));
+            }
         }
 
         if detected_mime != "application/octet-stream" {

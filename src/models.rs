@@ -199,6 +199,9 @@ pub struct AppConfig {
     pub chunk_size: String,
     pub temp_dir: String,
 
+    // Retry (TOML)
+    pub running_job_ttl_secs: u64,
+
     // Run behavior (CLI, YAML fallback)
     pub yaml_path: PathBuf,
     pub priority: i32,
@@ -244,6 +247,7 @@ impl AppConfig {
             default_path,
             chunk_size,
             temp_dir: toml.storage.temp_dir,
+            running_job_ttl_secs: toml.retry.running_job_ttl_secs,
             yaml_path: args.yaml_path.clone(),
             priority,
             dry_run: args.dry_run,

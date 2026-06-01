@@ -8,12 +8,16 @@ use redis::{AsyncCommands, Client, aio::MultiplexedConnection};
 #[derive(Clone)]
 pub struct RedisService {
     client: Client,
+    running_job_ttl_secs: u64,
 }
 
 impl RedisService {
-    pub fn new(redis_url: &str) -> Result<Self, redis::RedisError> {
+    pub fn new(redis_url: &str, running_job_ttl_secs: u64) -> Result<Self, redis::RedisError> {
         let client = Client::open(redis_url)?;
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            running_job_ttl_secs,
+        })
     }
 
     async fn get_connection(&self) -> Result<MultiplexedConnection, redis::RedisError> {
@@ -120,7 +124,10 @@ impl RedisService {
     ///
     /// Returns `None` on timeout (2 s) or any transient error — the scheduler
     /// loop will simply spin and try again.
-    pub async fn dequeue_job(&self) -> Result<Option<(JobKind, String)>, ToolError> {
+    pub async fn dequeue_job(
+        &self,
+        n_worker: usize,
+    ) -> Result<Option<(JobKind, String)>, ToolError> {
         let mut conn = self.get_connection().await?;
 
         // BZPOPMAX blocks up to 2 s; returns (key, member, score) or nothing.
@@ -136,8 +143,13 @@ impl RedisService {
         let state_key = format!("jobs:state:{job_id}");
         let _: () = conn.hset(&state_key, "status", "running").await?;
 
-        // Record it in jobs:running so the scheduler can track live workers.
-        let _: () = conn.hset("jobs:running", &job_id, "worker").await?;
+        // Record it in a TTL-bearing key so the scheduler can track live workers
+        // and stale entries auto-cleanup on worker crash.
+        let running_key = format!("jobs:running:{job_id}");
+        let _: () = conn.set(&running_key, format!("worker{n_worker}")).await?;
+        let _: () = conn
+            .expire(&running_key, self.running_job_ttl_secs as i64)
+            .await?;
 
         Ok(Some((kind, job_id)))
     }
@@ -148,7 +160,8 @@ impl RedisService {
         let mut conn = self.get_connection().await?;
         let state_key = format!("jobs:state:{}", job_id);
         let _: () = conn.hset(&state_key, "status", "completed").await?;
-        let _: () = conn.hdel("jobs:running", job_id).await?;
+        let running_key = format!("jobs:running:{job_id}");
+        let _: () = conn.del(&running_key).await?;
         Ok(())
     }
 
@@ -156,7 +169,8 @@ impl RedisService {
     /// Backoff: 5s (1st), 30s (2nd), 120s (3rd).
     pub async fn retry_job(&self, job_id: &str, kind: JobKind) -> Result<(), ToolError> {
         let mut conn = self.get_connection().await?;
-        let _: () = conn.hdel("jobs:running", job_id).await?;
+        let running_key = format!("jobs:running:{job_id}");
+        let _: () = conn.del(&running_key).await?;
 
         let state_key = format!("jobs:state:{}", job_id);
 
@@ -212,7 +226,8 @@ impl RedisService {
         let state_key = format!("jobs:state:{}", job_id);
         let _: () = conn.hset(&state_key, "status", "failed").await?;
         let _: () = conn.hset(&state_key, "error", error).await?;
-        let _: () = conn.hdel("jobs:running", job_id).await?;
+        let running_key = format!("jobs:running:{job_id}");
+        let _: () = conn.del(&running_key).await?;
         tracing::error!(job_id = %job_id, error = %error, "Job marked as failed");
         Ok(())
     }

@@ -180,7 +180,7 @@ Redis key schema:
 | Key | Type | Purpose |
 |---|---|---|
 | `jobs:pending` | Sorted Set | Priority queue; `ZPOPMAX` dequeues highest priority first |
-| `jobs:running` | Hash | Maps job ID → worker ID for active jobs |
+| `jobs:running:<job_id>` | String | Worker ID for active job; TTL `retry.running_job_ttl_secs` (default 3600s) |
 | `jobs:state:<job_id>` | Hash | Full job state: status, retry count, timestamps |
 | `batches:state:<batch_id>` | Hash | Batch-level state |
 

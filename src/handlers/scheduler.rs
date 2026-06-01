@@ -18,7 +18,8 @@ pub async fn scheduler_loop(
     let chunk_semaphore = Arc::new(Semaphore::new(max_chunk_workers));
 
     loop {
-        if let Ok(Some((kind, job_id))) = redis.dequeue_job().await {
+        let worker = max_file_workers - file_semaphore.available_permits() + 1;
+        if let Ok(Some((kind, job_id))) = redis.dequeue_job(worker).await {
             match kind {
                 JobKind::File => {
                     let permit = file_semaphore.clone().acquire_owned().await.unwrap();
@@ -42,6 +43,7 @@ pub async fn scheduler_loop(
                                 }
                             }
                             Ok(JobOutcome::Completed) => {
+                                ctx.redis.complete_job(&job_id).await.ok();
                                 tracing::info!(job_id = %job_id, "File job completed");
                             }
                             Err(JobErrorOutcome::Retryable(e)) => {

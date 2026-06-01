@@ -116,7 +116,7 @@ pub async fn run(config: AppConfig, yaml_config: &IngestionConfig) -> Result<(),
     }
 
     // -- Services ----------------------------------------------------------
-    let redis_service = match RedisService::new(&config.redis_uri) {
+    let redis_service = match RedisService::new(&config.redis_uri, config.running_job_ttl_secs) {
         Ok(svc) => {
             tracing::info!(url = %config.redis_uri, "Redis connected");
             svc
@@ -310,7 +310,7 @@ pub async fn cancel(
 ) -> Result<(), ToolError> {
     let mongo = MongoService::new(&mongo_uri).await?;
 
-    let redis = RedisService::new(&redis_uri)?;
+    let redis = RedisService::new(&redis_uri, 3600)?;
 
     match scope {
         CancelScope::Batch { batch_id } => {

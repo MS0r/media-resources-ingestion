@@ -31,10 +31,30 @@ pub struct StorageConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct RetryConfig {
+    #[serde(default = "default_running_job_ttl")]
+    pub running_job_ttl_secs: u64,
+}
+
+const fn default_running_job_ttl() -> u64 {
+    3600
+}
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        Self {
+            running_job_ttl_secs: default_running_job_ttl(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct TomlRawConfig {
     pub scheduler: SchedulerConfig,
     pub compression: CompressionConfig,
     pub storage: StorageConfig,
+    #[serde(default)]
+    pub retry: RetryConfig,
 }
 
 pub fn load_toml(path: &PathBuf) -> Result<TomlRawConfig, ToolError> {
