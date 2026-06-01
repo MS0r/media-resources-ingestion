@@ -8,6 +8,12 @@ pub struct SchedulerConfig {
     pub chunk_workers: usize,
     pub max_pending_jobs: usize,
     pub max_per_host: usize,
+    #[serde(default = "default_job_timeout")]
+    pub job_timeout_secs: u64,
+}
+
+const fn default_job_timeout() -> u64 {
+    7200
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -34,16 +40,30 @@ pub struct StorageConfig {
 pub struct RetryConfig {
     #[serde(default = "default_running_job_ttl")]
     pub running_job_ttl_secs: u64,
+    #[serde(default = "default_max_attempts")]
+    pub max_attempts: u8,
+    #[serde(default = "default_backoff_secs")]
+    pub backoff_secs: Vec<u64>,
 }
 
 const fn default_running_job_ttl() -> u64 {
     3600
 }
 
+const fn default_max_attempts() -> u8 {
+    3
+}
+
+fn default_backoff_secs() -> Vec<u64> {
+    vec![5, 30, 120]
+}
+
 impl Default for RetryConfig {
     fn default() -> Self {
         Self {
             running_job_ttl_secs: default_running_job_ttl(),
+            max_attempts: default_max_attempts(),
+            backoff_secs: default_backoff_secs(),
         }
     }
 }

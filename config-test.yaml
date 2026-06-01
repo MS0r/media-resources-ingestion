@@ -4,9 +4,11 @@ compression_override: avif
 headers:
   Authorization: Bearer Token
 resources:
-  # - url: https://www.adobe.com/creativecloud/photography/discover/media_131179edca5f92db203e2b78cb8a308605afbc958.png
-  #   name: perro
-  #   priority: 10
+  - url: https://www.adobe.com/creativecloud/photography/discover/media_131179edca5f92db203e2b78cb8a308605afbc958.png
+    name: perro
+    priority: 10
+    config:
+      quality: 90
   - url: https://myapi.app/savetwt/proxy/eyJpdiI6ImlERlRlUlYzalJNdm5UU0RTVE9oQkE9PSIsInZhbHVlIjoiZmUwdVJjRlE1VlJlbkZYQWNtVnp5Nm1RUTVvVGl3Unk1dE9ERFVPUnN0Q3FjZVZZVmFleUtIeUIyRFpDS0pGRkRRMlZHSmdDMWNTejBYVTZJeEMxSEdwVTlEdW5pdVk4QkVmSmpuR0d1cE45MEQvYTJJdG5CSU5mQWp0UUJmUXhhcE1TNHRWd3d0WWlBakhKNjFuMmdIWlMzbm1MTkhWOTUraTdrK0JsbVVCNkw0d245VlRoa2huRGxYYUdTNUhaOXpYeC9HQVlGZUpFd2w3cEd5ZDVSK0xQT2hIWWlZZ1l5M3BuKzRaR09JOGtxblZzNGJMdzFReU9wc2lOYjJuU2JlS1FpSTNmNXNiTnJRMjR4YnVwRHB4YnExdUFPTkFNc2VsZUJmMUtSZ0pEUksyMDJrdjZHbFVlcUJyS1UvRW4iLCJtYWMiOiI5NzU0OGU1OWVjYzEwMTY1MWE4OWY4NTgwZTMyNjY5YWRiNDYzNGM2OWIzY2FhNzIxZmZkMzM2NTQzMDZkMzdlIiwidGFnIjoiIn0%3D
     name: video
     dest:

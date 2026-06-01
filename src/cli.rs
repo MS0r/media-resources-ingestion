@@ -1,9 +1,4 @@
-use crate::{
-    error::ToolError,
-    models::{Destination, IngestionConfig},
-    settings::TomlRawConfig,
-    storage::Provider,
-};
+use crate::{error::ToolError, models::IngestionConfig};
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -46,6 +41,10 @@ pub struct Global {
 pub enum Commands {
     ///Submit a YAML config and process all resources
     Run(RunArgs),
+    ///Parse YAML and enqueue jobs to Redis; no download (same as run --no-follow)
+    Enqueue(EnqueueArgs),
+    ///Start a standalone worker that picks up pending jobs from Redis
+    Worker(WorkerArgs),
     ///Inspect jobs and batches
     Status {
         #[command(subcommand)]
@@ -89,6 +88,30 @@ pub struct RunArgs {
     /// Output format for final summary
     #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
     pub output: OutputFormat,
+}
+
+#[derive(Args, Clone)]
+pub struct EnqueueArgs {
+    pub yaml_path: PathBuf,
+    /// Validate YAML and preflight URLs without downloading
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Override top-level priority for this batch
+    #[arg(long)]
+    pub priority: Option<i32>,
+    /// Override SCHEDULER_FILE_WORKERS for this run
+    #[arg(long)]
+    pub workers: Option<usize>,
+    /// Output format for final summary
+    #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+    pub output: OutputFormat,
+}
+
+#[derive(Args, Clone)]
+pub struct WorkerArgs {
+    /// Override SCHEDULER_FILE_WORKERS for this worker
+    #[arg(long)]
+    pub workers: Option<usize>,
 }
 
 #[derive(Subcommand, Clone)]

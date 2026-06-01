@@ -3,6 +3,7 @@ file_workers = 5
 chunk_workers = 20
 max_pending_jobs = 10_000
 max_per_host = 2
+job_timeout_secs = 7200          # max wall-clock per job (download+compress+upload)
 
 [compression]
 threshold_mb = 512
@@ -16,4 +17,6 @@ chunk_size = "16MB"
 temp_dir = "/tmp/ingest"
 
 [retry]
-running_job_ttl_secs = 3600
+running_job_ttl_secs = 3600      # lease TTL; heartbeat refreshes every 30s while running
+max_attempts = 3                 # max retries per job before permanent failure
+backoff_secs = [5, 30, 120]      # delay before each retry attempt (indexed by retry_count)

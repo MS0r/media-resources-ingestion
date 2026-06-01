@@ -160,6 +160,12 @@ pub(crate) async fn handle_new_file(
         }
     }
 
+    // Verify storage provider is healthy before attempting upload
+    ctx.storage.health_check().await.map_err(|e| {
+        tracing::error!(error = %e, "Storage provider health check failed before upload");
+        JobErrorOutcome::Retryable(format!("Storage health check failed: {e}"))
+    })?;
+
     let mut file = tokio::fs::File::open(&local_file)
         .await
         .map_err(|e| JobErrorOutcome::from(JobError::from(e)))?;

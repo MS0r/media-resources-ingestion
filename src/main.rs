@@ -129,6 +129,32 @@ async fn main() -> Result<(), ToolError> {
 
                     bootstrap::run(config, &yaml_config).await
                 }
+                Commands::Enqueue(enqueue_args) => {
+                    tracing::info!("Enqueuing jobs...");
+                    let yaml_config = load_config(&enqueue_args.yaml_path)?;
+
+                    let config = AppConfig::from_enqueue_args(
+                        toml_config,
+                        &yaml_config,
+                        &enqueue_args,
+                        redis_uri,
+                        mongo_uri,
+                    );
+
+                    let batch_id = bootstrap::enqueue(&config, &yaml_config).await?;
+                    println!("Batch ID: {}", batch_id);
+                    Ok(())
+                }
+                Commands::Worker(worker_args) => {
+                    tracing::info!("Starting standalone worker...");
+                    let config = AppConfig::from_toml_env(
+                        toml_config,
+                        redis_uri,
+                        mongo_uri,
+                        worker_args.workers,
+                    );
+                    bootstrap::worker(config).await
+                }
                 Commands::Status { scope } => bootstrap::status(scope, mongo_uri).await,
                 Commands::Cancel { scope } => bootstrap::cancel(scope, mongo_uri, redis_uri).await,
                 Commands::Retry { scope } =>  bootstrap::retry(scope, mongo_uri).await,

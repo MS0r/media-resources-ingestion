@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use crate::{
-    cli::{OutputFormat, RunArgs},
+    cli::{EnqueueArgs, OutputFormat, RunArgs},
     settings::TomlRawConfig,
     storage::Provider,
 };
@@ -177,6 +177,7 @@ fn default_uuid() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
+#[derive(Clone)]
 pub struct AppConfig {
     // Environment
     pub redis_uri: String,
@@ -187,6 +188,7 @@ pub struct AppConfig {
     pub chunk_workers: usize,
     pub max_pending_jobs: usize,
     pub max_per_host: usize,
+    pub job_timeout_secs: u64,
 
     // Compression (TOML)
     pub compression_threshold_mb: u64,
@@ -201,6 +203,8 @@ pub struct AppConfig {
 
     // Retry (TOML)
     pub running_job_ttl_secs: u64,
+    pub max_retries: u8,
+    pub backoff_secs: Vec<u64>,
 
     // Run behavior (CLI, YAML fallback)
     pub yaml_path: PathBuf,
@@ -240,6 +244,7 @@ impl AppConfig {
             chunk_workers: toml.scheduler.chunk_workers,
             max_pending_jobs: toml.scheduler.max_pending_jobs,
             max_per_host: toml.scheduler.max_per_host,
+            job_timeout_secs: toml.scheduler.job_timeout_secs,
             compression_threshold_mb: toml.compression.threshold_mb,
             compression_quality: toml.compression.quality,
             compression_timeout_secs: toml.compression.max_compression_seconds,
@@ -248,10 +253,92 @@ impl AppConfig {
             chunk_size,
             temp_dir: toml.storage.temp_dir,
             running_job_ttl_secs: toml.retry.running_job_ttl_secs,
+            max_retries: toml.retry.max_attempts,
+            backoff_secs: toml.retry.backoff_secs.clone(),
             yaml_path: args.yaml_path.clone(),
             priority,
             dry_run: args.dry_run,
             follow,
+            output: args.output,
+        }
+    }
+
+    pub fn from_toml_env(
+        toml: TomlRawConfig,
+        redis_uri: String,
+        mongo_uri: String,
+        workers: Option<usize>,
+    ) -> Self {
+        let file_workers = workers.unwrap_or(toml.scheduler.file_workers);
+        Self {
+            redis_uri,
+            mongo_uri,
+            file_workers,
+            chunk_workers: toml.scheduler.chunk_workers,
+            max_pending_jobs: toml.scheduler.max_pending_jobs,
+            max_per_host: toml.scheduler.max_per_host,
+            job_timeout_secs: toml.scheduler.job_timeout_secs,
+            compression_threshold_mb: toml.compression.threshold_mb,
+            compression_quality: toml.compression.quality,
+            compression_timeout_secs: toml.compression.max_compression_seconds,
+            default_provider: toml.storage.default_provider,
+            default_path: toml.storage.default_path,
+            chunk_size: toml.storage.chunk_size,
+            temp_dir: toml.storage.temp_dir,
+            running_job_ttl_secs: toml.retry.running_job_ttl_secs,
+            max_retries: toml.retry.max_attempts,
+            backoff_secs: toml.retry.backoff_secs.clone(),
+            yaml_path: PathBuf::new(),
+            priority: 0,
+            dry_run: false,
+            follow: false,
+            output: OutputFormat::Table,
+        }
+    }
+
+    pub fn from_enqueue_args(
+        toml: TomlRawConfig,
+        yaml: &IngestionConfig,
+        args: &EnqueueArgs,
+        redis_uri: String,
+        mongo_uri: String,
+    ) -> Self {
+        let default_provider = yaml
+            .default_dest
+            .as_ref()
+            .and_then(|d| d.provider.as_ref().map(|p| p.to_string()))
+            .unwrap_or(toml.storage.default_provider);
+        let default_path = yaml
+            .default_dest
+            .as_ref()
+            .and_then(|d| d.path.clone())
+            .unwrap_or(toml.storage.default_path);
+        let chunk_size = yaml.chunk_size.clone().unwrap_or(toml.storage.chunk_size);
+        let priority = args.priority.or(yaml.priority).unwrap_or(0);
+        let file_workers = args.workers.unwrap_or(toml.scheduler.file_workers);
+
+        Self {
+            redis_uri,
+            mongo_uri,
+            file_workers,
+            chunk_workers: toml.scheduler.chunk_workers,
+            max_pending_jobs: toml.scheduler.max_pending_jobs,
+            max_per_host: toml.scheduler.max_per_host,
+            job_timeout_secs: toml.scheduler.job_timeout_secs,
+            compression_threshold_mb: toml.compression.threshold_mb,
+            compression_quality: toml.compression.quality,
+            compression_timeout_secs: toml.compression.max_compression_seconds,
+            default_provider,
+            default_path,
+            chunk_size,
+            temp_dir: toml.storage.temp_dir,
+            running_job_ttl_secs: toml.retry.running_job_ttl_secs,
+            max_retries: toml.retry.max_attempts,
+            backoff_secs: toml.retry.backoff_secs.clone(),
+            yaml_path: args.yaml_path.clone(),
+            priority,
+            dry_run: args.dry_run,
+            follow: false,
             output: args.output,
         }
     }

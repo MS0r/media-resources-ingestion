@@ -17,6 +17,7 @@ use chrono::Utc;
 use colored::*;
 use indicatif::{ProgressBar, ProgressStyle};
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use uuid::Uuid;
 
 fn parent_values(
@@ -91,12 +92,15 @@ fn parent_values(
     (res, resource_priority)
 }
 
-pub async fn run(config: AppConfig, yaml_config: &IngestionConfig) -> Result<(), ToolError> {
+pub async fn enqueue(
+    config: &AppConfig,
+    yaml_config: &IngestionConfig,
+) -> Result<String, ToolError> {
     tracing::info!(resources = yaml_config.resources.len(), "Config loaded");
 
     if yaml_config.resources.is_empty() {
         tracing::warn!("Empty YAML file - no jobs created");
-        return Ok(());
+        return Ok(String::new());
     }
 
     // Validate YAML - check for duplicate URLs
@@ -112,11 +116,17 @@ pub async fn run(config: AppConfig, yaml_config: &IngestionConfig) -> Result<(),
 
     // --dry-run: validate YAML and preflight URLs without downloading
     if config.dry_run {
-        return validate_dry_run(yaml_config).await;
+        validate_dry_run(yaml_config).await?;
+        return Ok(String::new());
     }
 
     // -- Services ----------------------------------------------------------
-    let redis_service = match RedisService::new(&config.redis_uri, config.running_job_ttl_secs) {
+    let redis_service = match RedisService::new(
+        &config.redis_uri,
+        config.running_job_ttl_secs,
+        config.max_retries,
+        config.backoff_secs.clone(),
+    ) {
         Ok(svc) => {
             tracing::info!(url = %config.redis_uri, "Redis connected");
             svc
@@ -148,7 +158,7 @@ pub async fn run(config: AppConfig, yaml_config: &IngestionConfig) -> Result<(),
         path: Some(config.default_path.clone()),
     };
 
-    // -- Initial batch ------------------------------------------------------
+    // -- Create batch ------------------------------------------------------
     let batch_id = Uuid::new_v4().to_string();
     let mut batch = Batch {
         _id: batch_id.clone(),
@@ -188,22 +198,109 @@ pub async fn run(config: AppConfig, yaml_config: &IngestionConfig) -> Result<(),
     redis_service.enqueue_batch(&batch).await?;
     mongo_service.save_batch(batch).await?;
 
-    // -- Scheduler ---------------------------------------------------------
-    let file_handler = Arc::new(FileJobHandler);
-    let chunk_handler = Arc::new(ChunkJobHandler);
+    Ok(batch_id)
+}
 
-    // -- Context factory ---------------------------------------------------
-    let max_file_workers = config.file_workers;
-    let max_chunk_workers = config.chunk_workers;
-    let follow = config.follow;
-    let mongo_uri = config.mongo_uri.clone();
+pub async fn worker(config: AppConfig) -> Result<(), ToolError> {
+    let redis_service = match RedisService::new(
+        &config.redis_uri,
+        config.running_job_ttl_secs,
+        config.max_retries,
+        config.backoff_secs.clone(),
+    ) {
+        Ok(svc) => {
+            tracing::info!(url = %config.redis_uri, "Redis connected");
+            svc
+        }
+        Err(e) => {
+            tracing::error!("Failed to connect to Redis: {}", e);
+            return Err(ToolError::from(e));
+        }
+    };
+
+    let mongo_service = match MongoService::new(&config.mongo_uri).await {
+        Ok(svc) => {
+            tracing::info!(url = %config.mongo_uri, "MongoDB connected");
+            svc
+        }
+        Err(e) => {
+            tracing::error!("Failed to connect to MongoDB: {}", e);
+            return Err(ToolError::from(e));
+        }
+    };
+
+    // Recover orphaned jobs from previous crashed workers
+    match redis_service.recover_orphaned_jobs().await {
+        Ok(n) => {
+            if n > 0 {
+                tracing::warn!(count = n, "Recovered orphaned jobs at worker startup");
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "Failed to recover orphaned jobs"),
+    }
+
+    // Clean up orphaned chunk tracking keys (files that were chunked but
+    // whose metadata was never committed due to a crash).
+    match redis_service.cleanup_orphaned_chunks(&mongo_service).await {
+        Ok(n) => {
+            if n > 0 {
+                tracing::warn!(count = n, "Cleaned up orphaned chunk tracking keys");
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "Failed to clean up orphaned chunk keys"),
+    }
+
+    // Graceful shutdown signal: first Ctrl+C triggers graceful shutdown,
+    // second Ctrl+C will be caught by main() and force exit.
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let shutdown_clone = shutdown.clone();
+    tokio::spawn(async move {
+        tokio::signal::ctrl_c().await.ok();
+        tracing::warn!(
+            "SIGINT received, initiating graceful shutdown (press Ctrl+C again to force)"
+        );
+        shutdown_clone.store(true, std::sync::atomic::Ordering::Relaxed);
+    });
+
+    let temp_dir = &config.temp_dir;
+    tokio::fs::create_dir_all(temp_dir).await?;
 
     let ctx_factory = Arc::new(ContextFactory::new(mongo_service, redis_service, config));
 
-    let mut had_failures = false;
+    let file_handler = Arc::new(FileJobHandler);
+    let chunk_handler = Arc::new(ChunkJobHandler);
 
-    if follow && atty::is(atty::Stream::Stdout) {
-        // Show progress bar
+    tracing::info!("Starting standalone worker mode");
+    tracing::info!(
+        file_workers = ctx_factory.config().file_workers,
+        chunk_workers = ctx_factory.config().chunk_workers,
+        "Worker pool sizes"
+    );
+
+    let file_workers = ctx_factory.config().file_workers;
+    let chunk_workers = ctx_factory.config().chunk_workers;
+
+    scheduler_loop(
+        file_handler,
+        chunk_handler,
+        ctx_factory,
+        file_workers,
+        chunk_workers,
+        shutdown,
+    )
+    .await;
+
+    Ok(())
+}
+
+pub async fn run(config: AppConfig, yaml_config: &IngestionConfig) -> Result<(), ToolError> {
+    let batch_id = enqueue(&config, yaml_config).await?;
+
+    if config.dry_run || yaml_config.resources.is_empty() {
+        return Ok(());
+    }
+
+    if config.follow && atty::is(atty::Stream::Stdout) {
         let pb = ProgressBar::new(yaml_config.resources.len() as u64);
         pb.set_style(
             ProgressStyle::default_bar()
@@ -213,41 +310,30 @@ pub async fn run(config: AppConfig, yaml_config: &IngestionConfig) -> Result<(),
         );
 
         tracing::info!("Starting ingestion with follow mode enabled");
-        scheduler_loop(
-            file_handler,
-            chunk_handler,
-            ctx_factory,
-            max_file_workers,
-            max_chunk_workers,
-        )
-        .await;
+        worker(config).await?;
 
         pb.finish_with_message("Ingestion complete");
+
+        // Check if any jobs failed
+        let mongo_uri = std::env::var("MONGODB_URI")
+            .map_err(|_| ToolError::ConfigError("MONGODB_URI not set".to_string()))?;
+        let mongo = MongoService::new(&mongo_uri).await?;
+        let failed_jobs = mongo
+            .list_jobs(Some(crate::cli::JobStatus::Failed), 1000)
+            .await?;
+
+        if !failed_jobs.is_empty() {
+            eprintln!("{} jobs failed during ingestion", failed_jobs.len());
+            return Err(ToolError::JobExecutionError("Some jobs failed".to_string()));
+        }
     } else {
-        // No-follow mode or pipe: return immediately with batch ID
         if !atty::is(atty::Stream::Stdout) {
             tracing::info!("Detected pipe, disabling follow mode");
         }
         println!("Batch ID: {}", batch_id);
-        return Ok(());
     }
 
-    // Check if any jobs failed
-    let mongo = MongoService::new(&mongo_uri).await?;
-    let failed_jobs = mongo
-        .list_jobs(Some(crate::cli::JobStatus::Failed), 1000)
-        .await?;
-
-    if !failed_jobs.is_empty() {
-        had_failures = true;
-        eprintln!("{} jobs failed during ingestion", failed_jobs.len());
-    }
-
-    if had_failures {
-        Err(ToolError::JobExecutionError("Some jobs failed".to_string()))
-    } else {
-        Ok(())
-    }
+    Ok(())
 }
 
 pub async fn status(scope: StatusScope, mongo_uri: String) -> Result<(), ToolError> {
@@ -310,15 +396,22 @@ pub async fn cancel(
 ) -> Result<(), ToolError> {
     let mongo = MongoService::new(&mongo_uri).await?;
 
-    let redis = RedisService::new(&redis_uri, 3600)?;
+    let redis = RedisService::new(&redis_uri, 3600, 3, vec![5, 30, 120])?;
 
     match scope {
         CancelScope::Batch { batch_id } => {
             tracing::info!("Cancelling batch {}", batch_id);
             let count = mongo.cancel_batch_jobs(&batch_id).await?;
             println!("Cancelled {} pending jobs in batch {}", count, batch_id);
-            // Also remove from Redis queue
-            redis.cancel_batch_jobs(&batch_id).await?;
+
+            // Fetch the batch to get job IDs, then remove them from Redis
+            if let Some(batch) = mongo.get_batch(&batch_id).await? {
+                let redis_count = redis.cancel_jobs(&batch.job_ids).await?;
+                tracing::info!(
+                    redis_removed = redis_count,
+                    "Removed jobs from Redis pending queue"
+                );
+            }
         }
         CancelScope::Job { job_id } => {
             tracing::info!("Cancelling job {}", job_id);

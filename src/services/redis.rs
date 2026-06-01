@@ -1,7 +1,7 @@
 use crate::{
     cli::JobStatus,
     error::ToolError,
-    handlers::jobs::{Batch, ChunkJob, FileJob, JobKind},
+    handlers::jobs::{Batch, ChunkJob, FileJob, JobKind}, services::mongo::MongoService,
 };
 use redis::{AsyncCommands, Client, aio::MultiplexedConnection};
 
@@ -9,14 +9,23 @@ use redis::{AsyncCommands, Client, aio::MultiplexedConnection};
 pub struct RedisService {
     client: Client,
     running_job_ttl_secs: u64,
+    max_retries: u8,
+    backoff_secs: Vec<u64>,
 }
 
 impl RedisService {
-    pub fn new(redis_url: &str, running_job_ttl_secs: u64) -> Result<Self, redis::RedisError> {
+    pub fn new(
+        redis_url: &str,
+        running_job_ttl_secs: u64,
+        max_retries: u8,
+        backoff_secs: Vec<u64>,
+    ) -> Result<Self, redis::RedisError> {
         let client = Client::open(redis_url)?;
         Ok(Self {
             client,
             running_job_ttl_secs,
+            max_retries,
+            backoff_secs,
         })
     }
 
@@ -165,8 +174,7 @@ impl RedisService {
         Ok(())
     }
 
-    /// Re-enqueues a job for retry with exponential backoff.
-    /// Backoff: 5s (1st), 30s (2nd), 120s (3rd).
+    /// Re-enqueues a job for retry with configurable backoff.
     pub async fn retry_job(&self, job_id: &str, kind: JobKind) -> Result<(), ToolError> {
         let mut conn = self.get_connection().await?;
         let running_key = format!("jobs:running:{job_id}");
@@ -180,11 +188,13 @@ impl RedisService {
             .query_async(&mut conn)
             .await?;
 
-        // Enforce 3-attempt cap
-        if retry_count >= 3 {
-            tracing::error!(job_id = %job_id, "Exceeded max retries, failing job");
+        if retry_count >= self.max_retries {
+            tracing::error!(job_id = %job_id, max_retries = self.max_retries, "Exceeded max retries, failing job");
             return self
-                .fail_job(job_id, "Exceeded maximum retry attempts")
+                .fail_job(
+                    job_id,
+                    &format!("Exceeded maximum retry attempts ({})", self.max_retries),
+                )
                 .await;
         }
 
@@ -193,12 +203,11 @@ impl RedisService {
             JobKind::Chunk => format!("chunk:{}", job_id),
         };
 
-        // Calculate backoff delay: 5s, 30s, 2min
-        let backoff_secs = match retry_count {
-            0 => 5,
-            1 => 30,
-            _ => 120,
-        };
+        let backoff_secs = self
+            .backoff_secs
+            .get(retry_count as usize)
+            .copied()
+            .unwrap_or_else(|| *self.backoff_secs.last().unwrap_or(&120));
 
         let _: () = conn.hset(&state_key, "status", "retrying").await?;
         let _: () = conn
@@ -232,17 +241,102 @@ impl RedisService {
         Ok(())
     }
 
-    /// Cancels all pending jobs in a batch (simplified version).
-    pub async fn cancel_batch_jobs(&self, _batch_id: &str) -> Result<usize, ToolError> {
-        tracing::info!("Cancel batch jobs (simplified)");
-        Ok(0)
+    /// Refreshes the TTL on the running lease so long-running jobs don't
+    /// get their lease stolen by another worker.
+    pub async fn renew_lease(&self, job_id: &str) -> Result<(), ToolError> {
+        let mut conn = self.get_connection().await?;
+        let running_key = format!("jobs:running:{job_id}");
+        let _: () = conn
+            .expire(&running_key, self.running_job_ttl_secs as i64)
+            .await?;
+        Ok(())
     }
 
-    /// Cancels a single pending job.
+    /// Scans for orphaned `jobs:running:*` keys (stale from a crashed worker)
+    /// and re-enqueues them as pending so a healthy worker can pick them up.
+    /// Called once at worker startup.
+    pub async fn recover_orphaned_jobs(&self) -> Result<usize, ToolError> {
+        let mut conn = self.get_connection().await?;
+
+        let running_keys: Vec<String> = conn.keys("jobs:running:*").await?;
+
+        let mut recovered = 0usize;
+        for key in running_keys {
+            let job_id = key
+                .strip_prefix("jobs:running:")
+                .unwrap_or(&key)
+                .to_string();
+
+            let state_key = format!("jobs:state:{job_id}");
+
+            let kind: Option<String> = conn.hget(&state_key, "kind").await?;
+
+            let member = match kind.as_deref() {
+                Some("file") => format!("file:{job_id}"),
+                Some("chunk") => format!("chunk:{job_id}"),
+                _ => {
+                    tracing::warn!(job_id = %job_id, "Orphaned running key with unknown kind, deleting");
+                    let _: () = conn.del(&key).await?;
+                    continue;
+                }
+            };
+
+            let _: () = conn.hset(&state_key, "status", "pending").await?;
+            let _: () = conn.del(&key).await?;
+            let _: () = conn.zadd("jobs:pending", &member, 0.0).await?;
+            recovered += 1;
+            tracing::info!(job_id = %job_id, kind = ?kind, "Recovered orphaned job");
+        }
+
+        if recovered > 0 {
+            tracing::warn!(
+                count = recovered,
+                "Recovered orphaned jobs from crashed workers"
+            );
+        }
+        Ok(recovered)
+    }
+
+    /// Cancels all pending jobs in a batch by removing their IDs from the
+    /// Redis sorted set. Accepts the list of job IDs (from the Batch document
+    /// in Mongo).
+    pub async fn cancel_batch_jobs(&self, job_ids: &[String]) -> Result<usize, ToolError> {
+        let mut conn = self.get_connection().await?;
+        let mut removed = 0usize;
+        for job_id in job_ids {
+            for prefix in &["file", "chunk"] {
+                let member = format!("{}:{}", prefix, job_id);
+                let n: usize = conn.zrem("jobs:pending", &member).await?;
+                removed += n;
+            }
+        }
+        tracing::info!(count = removed, "Cancelled jobs from Redis pending queue");
+        Ok(removed)
+    }
+
+    /// Cancels a list of specific job IDs from the pending queue.
+    pub async fn cancel_jobs(&self, job_ids: &[String]) -> Result<usize, ToolError> {
+        let mut conn = self.get_connection().await?;
+        let mut removed = 0usize;
+        for job_id in job_ids {
+            for prefix in &["file", "chunk"] {
+                let member = format!("{}:{}", prefix, job_id);
+                let n: usize = conn.zrem("jobs:pending", &member).await?;
+                removed += n;
+            }
+        }
+        Ok(removed)
+    }
+
+    /// Cancels a single pending job (handles both file and chunk prefixes).
     pub async fn cancel_job(&self, job_id: &str) -> Result<(), ToolError> {
         let mut conn = self.get_connection().await?;
-        let member = format!("file:{}", job_id);
-        let removed: i32 = conn.zrem("jobs:pending", &member).await?;
+        let mut removed: usize = 0;
+        for prefix in &["file", "chunk"] {
+            let member = format!("{}:{}", prefix, job_id);
+            let n: usize = conn.zrem("jobs:pending", &member).await?;
+            removed += n;
+        }
         if removed > 0 {
             tracing::info!("Cancelled job {} from pending queue", job_id);
         }
@@ -275,43 +369,52 @@ impl RedisService {
         Ok(())
     }
 
-    /// Finds orphaned chunks (simplified version).
+    /// Finds orphaned chunks — chunk tracking keys whose file no longer exists
+    /// in MongoDB. Returns the list of orphaned file hashes.
     pub async fn find_orphaned_chunks(&self) -> Result<Vec<String>, ToolError> {
         let mut conn = self.get_connection().await?;
-        let mut orphaned = Vec::new();
 
-        // Get all chunk keys
         let keys: Vec<String> = redis::cmd("KEYS")
             .arg("jobs:chunks:*")
             .query_async(&mut conn)
             .await?;
 
+        let mut orphaned = Vec::new();
         for key in keys {
-            orphaned.push(key);
+            let file_hash = key.strip_prefix("jobs:chunks:").unwrap_or(&key).to_string();
+            orphaned.push(file_hash);
         }
 
         Ok(orphaned)
     }
 
-    /// Cleans up orphaned chunks (simplified version).
-    pub async fn cleanup_orphaned_chunks(&self) -> Result<usize, ToolError> {
+    /// Cleans up orphaned chunk tracking keys by cross-referencing with
+    /// MongoService. Removes Redis entries for files that no longer exist
+    /// in MongoDB. Returns the number of cleaned keys.
+    pub async fn cleanup_orphaned_chunks(
+        &self,
+        mongo: &MongoService,
+    ) -> Result<usize, ToolError> {
+        let orphans = self.find_orphaned_chunks().await?;
         let mut conn = self.get_connection().await?;
+        let mut cleaned = 0usize;
 
-        // Get all chunk keys
-        let keys: Vec<String> = redis::cmd("KEYS")
-            .arg("jobs:chunks:*")
-            .query_async(&mut conn)
-            .await?;
-
-        for key in keys {
-            let file_hash = key.trim_start_matches("jobs:chunks:");
-            // Check if file exists in MongoDB
-            // If not, remove the chunk set
-            // This is a simplified version - in reality you'd check MongoDB
-            tracing::debug!("Checking orphaned chunks for file: {}", file_hash);
+        for file_hash in &orphans {
+            match mongo.file_exists(file_hash).await {
+                Ok(false) => {
+                    let key = format!("jobs:chunks:{file_hash}");
+                    let _: () = conn.del(&key).await?;
+                    cleaned += 1;
+                    tracing::info!(file_hash = %file_hash, "Cleaned up orphaned chunk tracking key");
+                }
+                Ok(true) => {}
+                Err(e) => {
+                    tracing::warn!(file_hash = %file_hash, error = %e, "Could not check file existence")
+                }
+            }
         }
 
-        Ok(0)
+        Ok(cleaned)
     }
 }
 

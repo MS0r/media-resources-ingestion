@@ -91,8 +91,15 @@ pub trait StorageProvider: Send + Sync {
         false // remote providers override to false (default)
     }
 
-    async fn commit_temp(&self, temp_path: &str, final_path: &str) -> Result<(), DynError> {
+    async fn commit_temp(&self, _temp_path: &str, _final_path: &str) -> Result<(), DynError> {
         // Default implementation does nothing; local provider will override to rename
+        Ok(())
+    }
+
+    /// Verify the storage backend is reachable and operational.
+    /// Called before upload to fail fast when the provider is down.
+    /// Default implementation returns Ok — override to add real checks.
+    async fn health_check(&self) -> Result<(), DynError> {
         Ok(())
     }
 }
@@ -104,6 +111,10 @@ impl StorageProvider for LocalProvider {
         data: &mut (dyn AsyncRead + Send + Unpin),
     ) -> Result<(), DynError> {
         tracing::info!("Uploading locally: {}", key);
+        // Ensure parent directory exists
+        if let Some(parent) = std::path::Path::new(key).parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
         let mut file = File::create(key).await?;
         tokio::io::copy(data, &mut file).await?;
         Ok(())
@@ -127,6 +138,14 @@ impl StorageProvider for LocalProvider {
 
     async fn commit_temp(&self, temp_path: &str, final_path: &str) -> Result<(), DynError> {
         tokio::fs::rename(temp_path, final_path).await?;
+        Ok(())
+    }
+
+    /// Verifies the local filesystem is writable by checking /tmp.
+    async fn health_check(&self) -> Result<(), DynError> {
+        let probe = std::path::Path::new("/tmp/.ingest_health_check");
+        tokio::fs::write(probe, b"").await?;
+        tokio::fs::remove_file(probe).await?;
         Ok(())
     }
 }
@@ -170,32 +189,60 @@ impl StorageProvider for GDriveProvider {
         Ok(())
     }
 
-    async fn download(&self, key: &str) -> Result<Box<dyn AsyncRead + Send + Unpin>, DynError> {
+    async fn download(&self, _key: &str) -> Result<Box<dyn AsyncRead + Send + Unpin>, DynError> {
         Err("Not implemented".into())
     }
 
     async fn delete(&self, key: &str) -> Result<(), DynError> {
         println!("Deleting locally: {}", key);
         Ok(())
+    }
+
+    async fn health_check(&self) -> Result<(), DynError> {
+        let token =
+            std::env::var("GDRIVE_TOKEN").map_err(|_| "GDRIVE_TOKEN not set".to_string())?;
+        let client = wreq::Client::new();
+        let resp = client
+            .get("https://www.googleapis.com/drive/v3/about?fields=kind")
+            .bearer_auth(&token)
+            .send()
+            .await?;
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "Google Drive API health check failed: HTTP {}",
+                resp.status()
+            )
+            .into())
+        }
     }
 }
 #[async_trait]
 impl StorageProvider for DropboxProvider {
     async fn upload(
         &self,
-        key: &str,
-        data: &mut (dyn AsyncRead + Send + Unpin),
+        _key: &str,
+        _data: &mut (dyn AsyncRead + Send + Unpin),
     ) -> Result<(), DynError> {
-        println!("Uploading locally: {}", key);
+        println!("Uploading locally: {}", _key);
         Ok(())
     }
 
-    async fn download(&self, key: &str) -> Result<Box<dyn AsyncRead + Send + Unpin>, DynError> {
+    async fn download(&self, _key: &str) -> Result<Box<dyn AsyncRead + Send + Unpin>, DynError> {
         Err("Not implemented".into())
     }
 
     async fn delete(&self, key: &str) -> Result<(), DynError> {
         println!("Deleting locally: {}", key);
+        Ok(())
+    }
+
+    async fn health_check(&self) -> Result<(), DynError> {
+        let _ =
+            std::env::var("DROPBOX_APP_KEY").map_err(|_| "DROPBOX_APP_KEY not set".to_string())?;
+        let _ = std::env::var("DROPBOX_APP_SECRET")
+            .map_err(|_| "DROPBOX_APP_SECRET not set".to_string())?;
         Ok(())
     }
 }
@@ -203,8 +250,8 @@ impl StorageProvider for DropboxProvider {
 impl StorageProvider for S3Provider {
     async fn upload(
         &self,
-        key: &str,
-        data: &mut (dyn AsyncRead + Send + Unpin),
+        _key: &str,
+        _data: &mut (dyn AsyncRead + Send + Unpin),
     ) -> Result<(), DynError> {
         todo!();
         // let config = aws_config::load_from_env().await;
@@ -229,12 +276,20 @@ impl StorageProvider for S3Provider {
         // Ok(())
     }
 
-    async fn download(&self, key: &str) -> Result<Box<dyn AsyncRead + Send + Unpin>, DynError> {
+    async fn download(&self, _key: &str) -> Result<Box<dyn AsyncRead + Send + Unpin>, DynError> {
         Err("Not implemented".into())
     }
 
     async fn delete(&self, key: &str) -> Result<(), DynError> {
         println!("Deleting locally: {}", key);
+        Ok(())
+    }
+
+    async fn health_check(&self) -> Result<(), DynError> {
+        std::env::var("AWS_ACCESS_KEY_ID").map_err(|_| "AWS_ACCESS_KEY_ID not set".to_string())?;
+        std::env::var("AWS_SECRET_ACCESS_KEY")
+            .map_err(|_| "AWS_SECRET_ACCESS_KEY not set".to_string())?;
+        std::env::var("AWS_S3_BUCKET").map_err(|_| "AWS_S3_BUCKET not set".to_string())?;
         Ok(())
     }
 }

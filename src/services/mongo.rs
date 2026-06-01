@@ -235,6 +235,15 @@ impl MongoService {
         Ok(files)
     }
 
+    pub async fn file_exists(&self, file_hash: &str) -> Result<bool, ToolError> {
+        let client = self.client().await?;
+        let collection: Collection<Metadata> = client.collection("files_metadata");
+        let count = collection
+            .count_documents(doc! { "file_hash": file_hash })
+            .await?;
+        Ok(count > 0)
+    }
+
     pub async fn get_file_metadata(&self, file_hash: &str) -> Result<Option<Metadata>, ToolError> {
         let client = self.client().await?;
         let collection: Collection<Metadata> = client.collection("files_metadata");
