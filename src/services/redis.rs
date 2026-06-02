@@ -1,7 +1,8 @@
 use crate::{
     cli::JobStatus,
     error::ToolError,
-    handlers::jobs::{Batch, ChunkJob, FileJob, JobKind}, services::mongo::MongoService,
+    handlers::jobs::{Batch, ChunkJob, FileJob, JobKind},
+    services::mongo::MongoService,
 };
 use redis::{AsyncCommands, Client, aio::MultiplexedConnection};
 
@@ -391,10 +392,7 @@ impl RedisService {
     /// Cleans up orphaned chunk tracking keys by cross-referencing with
     /// MongoService. Removes Redis entries for files that no longer exist
     /// in MongoDB. Returns the number of cleaned keys.
-    pub async fn cleanup_orphaned_chunks(
-        &self,
-        mongo: &MongoService,
-    ) -> Result<usize, ToolError> {
+    pub async fn cleanup_orphaned_chunks(&self, mongo: &MongoService) -> Result<usize, ToolError> {
         let orphans = self.find_orphaned_chunks().await?;
         let mut conn = self.get_connection().await?;
         let mut cleaned = 0usize;

@@ -168,6 +168,7 @@ pub struct IngestionConfig {
     pub chunk_size: Option<String>,
     #[serde(default)]
     pub compression_override: Option<CompressionOverride>,
+    pub quality: Option<u8>,
     #[serde(default)]
     pub headers: Option<Headers>,
     pub resources: Vec<Resource>,
@@ -206,6 +207,11 @@ pub struct AppConfig {
     pub max_retries: u8,
     pub backoff_secs: Vec<u64>,
 
+    // Compression + headers + quality (YAML, merged in from_sources)
+    pub compression_override: Option<CompressionOverride>,
+    pub headers: Option<Headers>,
+    pub quality: Option<u8>,
+
     // Run behavior (CLI, YAML fallback)
     pub yaml_path: PathBuf,
     pub priority: i32,
@@ -216,9 +222,9 @@ pub struct AppConfig {
 
 impl AppConfig {
     pub fn from_sources(
-        toml: TomlRawConfig,
         yaml: &IngestionConfig,
-        args: &RunArgs,
+        toml: TomlRawConfig,
+        args: RunArgs,
         redis_uri: String,
         mongo_uri: String,
     ) -> Self {
@@ -234,6 +240,7 @@ impl AppConfig {
             .unwrap_or(toml.storage.default_path);
         let chunk_size = yaml.chunk_size.clone().unwrap_or(toml.storage.chunk_size);
         let priority = args.priority.or(yaml.priority).unwrap_or(0);
+        let quality = yaml.quality.or(Some(toml.compression.quality));
         let file_workers = args.workers.unwrap_or(toml.scheduler.file_workers);
         let follow = args.follow || !args.no_follow;
 
@@ -255,6 +262,9 @@ impl AppConfig {
             running_job_ttl_secs: toml.retry.running_job_ttl_secs,
             max_retries: toml.retry.max_attempts,
             backoff_secs: toml.retry.backoff_secs.clone(),
+            compression_override: yaml.compression_override.clone(),
+            headers: yaml.headers.clone(),
+            quality,
             yaml_path: args.yaml_path.clone(),
             priority,
             dry_run: args.dry_run,
@@ -263,7 +273,7 @@ impl AppConfig {
         }
     }
 
-    pub fn from_toml_env(
+    pub fn from_worker_args(
         toml: TomlRawConfig,
         redis_uri: String,
         mongo_uri: String,
@@ -288,6 +298,9 @@ impl AppConfig {
             running_job_ttl_secs: toml.retry.running_job_ttl_secs,
             max_retries: toml.retry.max_attempts,
             backoff_secs: toml.retry.backoff_secs.clone(),
+            compression_override: None,
+            headers: None,
+            quality: None,
             yaml_path: PathBuf::new(),
             priority: 0,
             dry_run: false,
@@ -297,9 +310,9 @@ impl AppConfig {
     }
 
     pub fn from_enqueue_args(
-        toml: TomlRawConfig,
         yaml: &IngestionConfig,
-        args: &EnqueueArgs,
+        toml: TomlRawConfig,
+        args: EnqueueArgs,
         redis_uri: String,
         mongo_uri: String,
     ) -> Self {
@@ -315,6 +328,7 @@ impl AppConfig {
             .unwrap_or(toml.storage.default_path);
         let chunk_size = yaml.chunk_size.clone().unwrap_or(toml.storage.chunk_size);
         let priority = args.priority.or(yaml.priority).unwrap_or(0);
+        let quality = yaml.quality.or(Some(toml.compression.quality));
         let file_workers = args.workers.unwrap_or(toml.scheduler.file_workers);
 
         Self {
@@ -335,6 +349,9 @@ impl AppConfig {
             running_job_ttl_secs: toml.retry.running_job_ttl_secs,
             max_retries: toml.retry.max_attempts,
             backoff_secs: toml.retry.backoff_secs.clone(),
+            compression_override: yaml.compression_override.clone(),
+            headers: yaml.headers.clone(),
+            quality,
             yaml_path: args.yaml_path.clone(),
             priority,
             dry_run: args.dry_run,

@@ -331,7 +331,7 @@ resources:
         let yaml: IngestionConfig = serde_yaml::from_str(YAML_MINIMAL_NO_PROVIDER).unwrap();
         let args = default_run_args();
 
-        let cfg = AppConfig::from_sources(toml, &yaml, &args, "r://h".into(), "m://h".into());
+        let cfg = AppConfig::from_sources(&yaml, toml, args, "r://h".into(), "m://h".into());
 
         assert_eq!(cfg.default_provider, "local");
         assert_eq!(cfg.default_path, "~/downloads");
@@ -344,7 +344,7 @@ resources:
         let yaml: IngestionConfig = serde_yaml::from_str(YAML_WITH_PROVIDER).unwrap();
         let args = default_run_args();
 
-        let cfg = AppConfig::from_sources(toml, &yaml, &args, "r://h".into(), "m://h".into());
+        let cfg = AppConfig::from_sources(&yaml, toml, args, "r://h".into(), "m://h".into());
 
         assert_eq!(cfg.default_provider, "s3");
         assert_eq!(cfg.default_path, "/custom/path");
@@ -356,7 +356,7 @@ resources:
         let yaml: IngestionConfig = serde_yaml::from_str(YAML_WITH_CHUNK_SIZE).unwrap();
         let args = default_run_args();
 
-        let cfg = AppConfig::from_sources(toml, &yaml, &args, "r://h".into(), "m://h".into());
+        let cfg = AppConfig::from_sources(&yaml, toml, args, "r://h".into(), "m://h".into());
 
         assert_eq!(cfg.chunk_size, "256MB");
     }
@@ -371,7 +371,7 @@ resources:
             _ => panic!("expected Run"),
         };
 
-        let cfg = AppConfig::from_sources(toml, &yaml, &args, "r://h".into(), "m://h".into());
+        let cfg = AppConfig::from_sources(&yaml, toml, args, "r://h".into(), "m://h".into());
 
         assert_eq!(cfg.priority, 99);
     }
@@ -386,7 +386,7 @@ resources:
             _ => panic!("expected Run"),
         };
 
-        let cfg = AppConfig::from_sources(toml, &yaml, &args, "r://h".into(), "m://h".into());
+        let cfg = AppConfig::from_sources(&yaml, toml, args, "r://h".into(), "m://h".into());
 
         assert_eq!(cfg.file_workers, 42);
     }
@@ -397,9 +397,79 @@ resources:
         let yaml: IngestionConfig = serde_yaml::from_str(YAML_MINIMAL_NO_PROVIDER).unwrap();
         let args = default_run_args();
 
-        let cfg = AppConfig::from_sources(toml, &yaml, &args, "r://h".into(), "m://h".into());
+        let cfg = AppConfig::from_sources(&yaml, toml, args, "r://h".into(), "m://h".into());
 
         assert_eq!(cfg.priority, 0);
+    }
+
+    const YAML_WITH_COMPRESSION: &str = r#"
+compression_override: webp
+resources:
+  - url: https://example.com/file.txt
+"#;
+
+    #[test]
+    fn test_app_config_yaml_compression_override() {
+        let toml: TomlRawConfig = toml::from_str(TOML_DEFAULTS).unwrap();
+        let yaml: IngestionConfig = serde_yaml::from_str(YAML_WITH_COMPRESSION).unwrap();
+        let args = default_run_args();
+
+        let cfg = AppConfig::from_sources(&yaml, toml, args, "r://h".into(), "m://h".into());
+
+        assert!(cfg.compression_override.is_some());
+    }
+
+    const YAML_WITH_HEADERS: &str = r#"
+headers:
+  authorization: Bearer test-token
+  cookie: session=abc
+resources:
+  - url: https://example.com/file.txt
+"#;
+
+    #[test]
+    fn test_app_config_yaml_headers() {
+        let toml: TomlRawConfig = toml::from_str(TOML_DEFAULTS).unwrap();
+        let yaml: IngestionConfig = serde_yaml::from_str(YAML_WITH_HEADERS).unwrap();
+        let args = default_run_args();
+
+        let cfg = AppConfig::from_sources(&yaml, toml, args, "r://h".into(), "m://h".into());
+
+        let headers = cfg.headers.expect("headers should be set from YAML");
+        assert_eq!(headers.authorization, Some("Bearer test-token".into()));
+        assert_eq!(headers.cookie, Some("session=abc".into()));
+    }
+
+    #[test]
+    fn test_app_config_yaml_no_compression_no_headers() {
+        let toml: TomlRawConfig = toml::from_str(TOML_DEFAULTS).unwrap();
+        let yaml: IngestionConfig = serde_yaml::from_str(YAML_MINIMAL_NO_PROVIDER).unwrap();
+        let args = default_run_args();
+
+        let cfg = AppConfig::from_sources(&yaml, toml, args, "r://h".into(), "m://h".into());
+
+        assert!(cfg.compression_override.is_none());
+        assert!(cfg.headers.is_none());
+        // Falls back to TOML compression.quality
+        assert_eq!(cfg.quality, Some(95));
+    }
+
+    const YAML_WITH_QUALITY: &str = r#"
+quality: 80
+resources:
+  - url: https://example.com/file.txt
+"#;
+
+    #[test]
+    fn test_app_config_yaml_quality() {
+        let toml: TomlRawConfig = toml::from_str(TOML_DEFAULTS).unwrap();
+        let yaml: IngestionConfig = serde_yaml::from_str(YAML_WITH_QUALITY).unwrap();
+        let args = default_run_args();
+
+        let cfg = AppConfig::from_sources(&yaml, toml, args, "r://h".into(), "m://h".into());
+
+        // YAML quality overrides TOML compression.quality
+        assert_eq!(cfg.quality, Some(80));
     }
 }
 

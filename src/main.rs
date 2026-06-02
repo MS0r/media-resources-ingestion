@@ -120,23 +120,23 @@ async fn main() -> Result<(), ToolError> {
                     let yaml_config = load_config(&run_args.yaml_path)?;
 
                     let config = AppConfig::from_sources(
-                        toml_config,
                         &yaml_config,
-                        &run_args,
+                        toml_config,
+                        run_args,
                         redis_uri,
                         mongo_uri,
                     );
 
-                    bootstrap::run(config, &yaml_config).await
+                    bootstrap::run(config, yaml_config).await
                 }
                 Commands::Enqueue(enqueue_args) => {
                     tracing::info!("Enqueuing jobs...");
                     let yaml_config = load_config(&enqueue_args.yaml_path)?;
 
                     let config = AppConfig::from_enqueue_args(
-                        toml_config,
                         &yaml_config,
-                        &enqueue_args,
+                        toml_config,
+                        enqueue_args,
                         redis_uri,
                         mongo_uri,
                     );
@@ -147,7 +147,7 @@ async fn main() -> Result<(), ToolError> {
                 }
                 Commands::Worker(worker_args) => {
                     tracing::info!("Starting standalone worker...");
-                    let config = AppConfig::from_toml_env(
+                    let config = AppConfig::from_worker_args(
                         toml_config,
                         redis_uri,
                         mongo_uri,

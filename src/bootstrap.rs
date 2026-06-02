@@ -6,13 +6,11 @@ use crate::{
         jobs::{Batch, ChunkJobHandler, FileJob, FileJobHandler, JobStatus},
         scheduler::scheduler_loop,
     },
-    models::{
-        AppConfig, CompressionOverride, Destination, Headers, IngestionConfig, Resource,
-        ResourceLevelConfig,
-    },
+    models::{AppConfig, Destination, IngestionConfig, Resource, ResourceLevelConfig},
     services::{mongo::MongoService, redis::RedisService},
     storage::Provider,
 };
+
 use chrono::Utc;
 use colored::*;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -20,73 +18,32 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use uuid::Uuid;
 
-fn parent_values(
-    mut res: Resource,
-    compression: &Option<CompressionOverride>,
-    dest: &Destination,
-    priority: i32,
-    headers: &Option<Headers>,
-) -> (Resource, i32) {
-    let resource_priority = match res.priority {
-        Some(p) => p,
-        None => priority,
-    };
+fn parent_values(mut res: Resource, config: &AppConfig) -> (Resource, i32) {
+    let resource_priority = res.priority.unwrap_or(config.priority);
 
-    // Inherit parent compression_override if child has none
-    if res
-        .config
-        .as_ref()
-        .and_then(|c| c.compression_override.as_ref())
-        .is_none()
-    {
-        if let Some(parent_co) = compression {
-            match &mut res.config {
-                Some(cfg) => cfg.compression_override = Some(parent_co.clone()),
-                None => {
-                    res.config = Some(ResourceLevelConfig {
-                        compression_override: Some(parent_co.clone()),
-                        quality: None,
-                        headers: None,
-                    });
-                }
-            }
-        }
+    // Ensure res.config exists for field inheritance
+    let cfg = res.config.get_or_insert_with(ResourceLevelConfig::default);
+
+    if cfg.compression_override.is_none() {
+        cfg.compression_override = config.compression_override.clone();
+    }
+    if cfg.headers.is_none() {
+        cfg.headers = config.headers.clone();
+    }
+    if cfg.quality.is_none() {
+        cfg.quality = config.quality;
     }
 
     // Inherit parent dest fields if resource has none
-    if res.dest.is_none() {
-        res.dest = Some(Destination {
-            provider: dest.provider.clone(),
-            path: dest.path.clone(),
-        });
-    } else if let Some(ref mut res_dest) = res.dest {
-        if res_dest.provider.is_none() {
-            res_dest.provider = dest.provider.clone();
-        }
-        if res_dest.path.is_none() {
-            res_dest.path = dest.path.clone();
-        }
+    let dest = res.dest.get_or_insert_with(|| Destination {
+        provider: Some(Provider::from(config.default_provider.clone())),
+        path: Some(config.default_path.clone()),
+    });
+    if dest.provider.is_none() {
+        dest.provider = Some(Provider::from(config.default_provider.clone()));
     }
-
-    // Inherit parent headers if child has none
-    if let Some(parent_headers) = headers {
-        if res
-            .config
-            .as_ref()
-            .and_then(|c| c.headers.as_ref())
-            .is_none()
-        {
-            match &mut res.config {
-                Some(cfg) => cfg.headers = Some(parent_headers.clone()),
-                None => {
-                    res.config = Some(ResourceLevelConfig {
-                        compression_override: None,
-                        quality: None,
-                        headers: Some(parent_headers.clone()),
-                    });
-                }
-            }
-        }
+    if dest.path.is_none() {
+        dest.path = Some(config.default_path.clone());
     }
 
     (res, resource_priority)
@@ -148,15 +105,8 @@ pub async fn enqueue(
         }
     };
 
-    let priority = config.priority;
-
     let temp_dir = &config.temp_dir;
     tokio::fs::create_dir_all(temp_dir).await?;
-
-    let default_dest = Destination {
-        provider: Some(Provider::from(config.default_provider.clone())),
-        path: Some(config.default_path.clone()),
-    };
 
     // -- Create batch ------------------------------------------------------
     let batch_id = Uuid::new_v4().to_string();
@@ -169,13 +119,7 @@ pub async fn enqueue(
     };
 
     for resource in &yaml_config.resources {
-        let (res, resource_priority) = parent_values(
-            resource.clone(),
-            &yaml_config.compression_override,
-            &default_dest,
-            priority,
-            &yaml_config.headers,
-        );
+        let (res, resource_priority) = parent_values(resource.clone(), config);
 
         let file_job = FileJob {
             _id: resource.id.clone(),
@@ -293,8 +237,8 @@ pub async fn worker(config: AppConfig) -> Result<(), ToolError> {
     Ok(())
 }
 
-pub async fn run(config: AppConfig, yaml_config: &IngestionConfig) -> Result<(), ToolError> {
-    let batch_id = enqueue(&config, yaml_config).await?;
+pub async fn run(config: AppConfig, yaml_config: IngestionConfig) -> Result<(), ToolError> {
+    let batch_id = enqueue(&config, &yaml_config).await?;
 
     if config.dry_run || yaml_config.resources.is_empty() {
         return Ok(());
@@ -677,6 +621,7 @@ async fn preflight_url(url: &url::Url) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::Headers;
     use crate::storage::Provider;
     use url::Url;
 
@@ -702,18 +647,34 @@ mod tests {
         }
     }
 
-    fn parent_dest() -> Destination {
-        Destination {
-            provider: Some(Provider::Local),
-            path: Some("/default/path".to_string()),
+    fn test_config() -> AppConfig {
+        AppConfig {
+            redis_uri: "redis://localhost".into(),
+            mongo_uri: "mongodb://localhost".into(),
+            file_workers: 0,
+            chunk_workers: 0,
+            max_pending_jobs: 0,
+            max_per_host: 0,
+            job_timeout_secs: 0,
+            compression_threshold_mb: 0,
+            compression_quality: 0,
+            compression_timeout_secs: 0,
+            default_provider: "local".into(),
+            default_path: "/default/path".into(),
+            chunk_size: "".into(),
+            temp_dir: "".into(),
+            running_job_ttl_secs: 0,
+            max_retries: 0,
+            backoff_secs: vec![],
+            compression_override: None,
+            headers: None,
+            quality: None,
+            yaml_path: std::path::PathBuf::new(),
+            priority: 0,
+            dry_run: false,
+            follow: false,
+            output: crate::cli::OutputFormat::Table,
         }
-    }
-
-    fn parent_headers() -> Option<Headers> {
-        Some(Headers {
-            authorization: Some("Bearer token".to_string()),
-            cookie: None,
-        })
     }
 
     fn resource_with_config(headers: Option<Headers>) -> Resource {
@@ -745,7 +706,7 @@ mod tests {
     #[test]
     fn inherits_full_dest_when_resource_has_none() {
         let res = resource_no_dest();
-        let (updated, _) = parent_values(res, &None, &parent_dest(), 0, &None);
+        let (updated, _) = parent_values(res, &test_config());
         let d = updated.dest.unwrap();
         assert_eq!(d.provider.unwrap().to_string(), "local");
         assert_eq!(d.path.unwrap(), "/default/path");
@@ -754,7 +715,7 @@ mod tests {
     #[test]
     fn keeps_resource_dest_when_fully_specified() {
         let res = resource_with_dest(Some(Provider::S3), Some("/custom".to_string()));
-        let (updated, _) = parent_values(res, &None, &parent_dest(), 0, &None);
+        let (updated, _) = parent_values(res, &test_config());
         let d = updated.dest.unwrap();
         assert_eq!(d.provider.unwrap().to_string(), "s3");
         assert_eq!(d.path.unwrap(), "/custom");
@@ -763,7 +724,7 @@ mod tests {
     #[test]
     fn fills_missing_provider_from_parent() {
         let res = resource_with_dest(None, Some("/custom".to_string()));
-        let (updated, _) = parent_values(res, &None, &parent_dest(), 0, &None);
+        let (updated, _) = parent_values(res, &test_config());
         let d = updated.dest.unwrap();
         assert_eq!(d.provider.unwrap().to_string(), "local");
         assert_eq!(d.path.unwrap(), "/custom");
@@ -772,7 +733,7 @@ mod tests {
     #[test]
     fn fills_missing_path_from_parent() {
         let res = resource_with_dest(Some(Provider::S3), None);
-        let (updated, _) = parent_values(res, &None, &parent_dest(), 0, &None);
+        let (updated, _) = parent_values(res, &test_config());
         let d = updated.dest.unwrap();
         assert_eq!(d.provider.unwrap().to_string(), "s3");
         assert_eq!(d.path.unwrap(), "/default/path");
@@ -781,11 +742,7 @@ mod tests {
     #[test]
     fn inherits_appconfig_default_dest_when_resource_has_no_dest() {
         let res = resource_no_dest();
-        let dest = Destination {
-            provider: Some(Provider::Local),
-            path: Some("/default/path".to_string()),
-        };
-        let (updated, _) = parent_values(res, &None, &dest, 0, &None);
+        let (updated, _) = parent_values(res, &test_config());
         let d = updated.dest.unwrap();
         assert_eq!(d.provider.unwrap().to_string(), "local");
         assert_eq!(d.path.unwrap(), "/default/path");
@@ -793,8 +750,13 @@ mod tests {
 
     #[test]
     fn inherits_headers_when_resource_has_no_config() {
+        let mut config = test_config();
+        config.headers = Some(Headers {
+            authorization: Some("Bearer token".to_string()),
+            cookie: None,
+        });
         let res = resource_no_config();
-        let (updated, _) = parent_values(res, &None, &parent_dest(), 0, &parent_headers());
+        let (updated, _) = parent_values(res, &config);
         assert_eq!(
             updated
                 .config
@@ -809,11 +771,16 @@ mod tests {
 
     #[test]
     fn keeps_resource_headers_when_specified() {
+        let mut config = test_config();
+        config.headers = Some(Headers {
+            authorization: Some("Bearer token".to_string()),
+            cookie: None,
+        });
         let res = resource_with_config(Some(Headers {
             authorization: Some("Custom".to_string()),
             cookie: None,
         }));
-        let (updated, _) = parent_values(res, &None, &parent_dest(), 0, &parent_headers());
+        let (updated, _) = parent_values(res, &config);
         assert_eq!(
             updated
                 .config
@@ -828,8 +795,13 @@ mod tests {
 
     #[test]
     fn inherits_headers_into_existing_config() {
+        let mut config = test_config();
+        config.headers = Some(Headers {
+            authorization: Some("Bearer token".to_string()),
+            cookie: None,
+        });
         let res = resource_with_config(None);
-        let (updated, _) = parent_values(res, &None, &parent_dest(), 0, &parent_headers());
+        let (updated, _) = parent_values(res, &config);
         assert_eq!(
             updated
                 .config
@@ -842,10 +814,45 @@ mod tests {
         );
     }
 
+    fn resource_with_quality(quality: Option<u8>) -> Resource {
+        Resource {
+            id: uuid::Uuid::new_v4().to_string(),
+            url: Url::parse("https://example.com/f.png").unwrap(),
+            name: None,
+            priority: None,
+            dest: None,
+            config: Some(ResourceLevelConfig {
+                compression_override: None,
+                quality,
+                headers: None,
+            }),
+        }
+    }
+
     #[test]
-    fn leaves_headers_none_when_parent_also_none() {
+    fn inherits_quality_when_resource_has_no_config() {
+        let mut config = test_config();
+        config.quality = Some(85);
         let res = resource_no_config();
-        let (updated, _) = parent_values(res, &None, &parent_dest(), 0, &None);
-        assert!(updated.config.is_none());
+        let (updated, _) = parent_values(res, &config);
+        assert_eq!(updated.config.unwrap().quality.unwrap(), 85);
+    }
+
+    #[test]
+    fn inherits_quality_into_existing_config() {
+        let mut config = test_config();
+        config.quality = Some(85);
+        let res = resource_with_quality(None);
+        let (updated, _) = parent_values(res, &config);
+        assert_eq!(updated.config.unwrap().quality.unwrap(), 85);
+    }
+
+    #[test]
+    fn keeps_resource_quality_when_specified() {
+        let mut config = test_config();
+        config.quality = Some(85);
+        let res = resource_with_quality(Some(90));
+        let (updated, _) = parent_values(res, &config);
+        assert_eq!(updated.config.unwrap().quality.unwrap(), 90);
     }
 }
