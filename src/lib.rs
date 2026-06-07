@@ -1,9 +1,14 @@
 pub mod bootstrap;
 pub mod cli;
-pub mod context;
-pub mod error;
-pub mod handlers;
-pub mod models;
-pub mod services;
-pub mod settings;
-pub mod storage;
+mod context;
+mod error;
+mod handlers;
+mod models;
+mod services;
+mod settings;
+mod storage;
+
+pub use error::ToolError;
+pub use models::AppConfig;
+pub use services::mongo::MongoService;
+pub use settings::TomlRawConfig;

@@ -1,12 +1,12 @@
 use crate::{
-    cli::{CancelScope, FilesScope, RetryScope, StatusScope},
+    cli::{CancelScope, FilesScope, OutputFormat, RetryScope, StatusScope},
     context::ContextFactory,
     error::ToolError,
     handlers::{
         jobs::{Batch, ChunkJobHandler, FileJob, FileJobHandler, JobStatus},
         scheduler::scheduler_loop,
     },
-    models::{AppConfig, Destination, IngestionConfig, Resource, ResourceLevelConfig},
+    models::{AppConfig, Destination, Resource, ResourceLevelConfig},
     services::{mongo::MongoService, redis::RedisService},
     storage::Provider,
 };
@@ -49,20 +49,17 @@ fn parent_values(mut res: Resource, config: &AppConfig) -> (Resource, i32) {
     (res, resource_priority)
 }
 
-pub async fn enqueue(
-    config: &AppConfig,
-    yaml_config: &IngestionConfig,
-) -> Result<String, ToolError> {
-    tracing::info!(resources = yaml_config.resources.len(), "Config loaded");
+pub async fn enqueue(config: &AppConfig, resources: &Vec<Resource>) -> Result<String, ToolError> {
+    tracing::info!(resources = resources.len(), "Config loaded");
 
-    if yaml_config.resources.is_empty() {
+    if resources.is_empty() {
         tracing::warn!("Empty YAML file - no jobs created");
         return Ok(String::new());
     }
 
     // Validate YAML - check for duplicate URLs
     let mut urls = std::collections::HashSet::new();
-    for resource in &yaml_config.resources {
+    for resource in resources {
         if !urls.insert(resource.url.as_str()) {
             tracing::error!("Duplicate URL found in YAML: {}", resource.url);
             return Err(ToolError::ValidationError(
@@ -73,7 +70,7 @@ pub async fn enqueue(
 
     // --dry-run: validate YAML and preflight URLs without downloading
     if config.dry_run {
-        validate_dry_run(yaml_config).await?;
+        validate_dry_run(resources).await?;
         return Ok(String::new());
     }
 
@@ -118,7 +115,7 @@ pub async fn enqueue(
         job_ids: vec![],
     };
 
-    for resource in &yaml_config.resources {
+    for resource in resources {
         let (res, resource_priority) = parent_values(resource.clone(), config);
 
         let file_job = FileJob {
@@ -237,15 +234,15 @@ pub async fn worker(config: AppConfig) -> Result<(), ToolError> {
     Ok(())
 }
 
-pub async fn run(config: AppConfig, yaml_config: IngestionConfig) -> Result<(), ToolError> {
-    let batch_id = enqueue(&config, &yaml_config).await?;
+pub async fn run(config: AppConfig, resources: Vec<Resource>) -> Result<(), ToolError> {
+    let batch_id = enqueue(&config, &resources).await?;
 
-    if config.dry_run || yaml_config.resources.is_empty() {
+    if config.dry_run || resources.is_empty() {
         return Ok(());
     }
 
     if config.follow && atty::is(atty::Stream::Stdout) {
-        let pb = ProgressBar::new(yaml_config.resources.len() as u64);
+        let pb = ProgressBar::new(resources.len() as u64);
         pb.set_style(
             ProgressStyle::default_bar()
                 .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} jobs ({eta})")
@@ -399,15 +396,15 @@ pub async fn files(scope: FilesScope, mongo_uri: String) -> Result<(), ToolError
                 .await?;
 
             match args.output {
-                crate::cli::OutputFormat::Table => {
-                    for file in files {
+                OutputFormat::Table => {
+                    for metadata in files {
                         println!(
                             "Hash: {} - MIME: {} - Size: {} bytes",
-                            file.file_hash, file.mime_type, file.original_file_size
+                            metadata.file_hash, metadata.mime_type, metadata.original_file_size
                         );
                     }
                 }
-                crate::cli::OutputFormat::Json => {
+                OutputFormat::Json => {
                     println!("{}", serde_json::to_string_pretty(&files)?);
                 }
             }
@@ -415,107 +412,100 @@ pub async fn files(scope: FilesScope, mongo_uri: String) -> Result<(), ToolError
         FilesScope::Get { hash } => {
             tracing::info!("Getting metadata for file {}", hash);
             if let Some(metadata) = mongo.get_file_metadata(&hash).await? {
-                println!("File Hash: {}", metadata.file_hash);
-                println!("Original URL: {}", metadata.original_url);
-                println!("Storage Provider: {:?}", metadata.storage_provider);
-                println!("MIME Type: {}", metadata.mime_type);
-                println!("Original Size: {} bytes", metadata.original_file_size);
-                if let Some(compressed) = metadata.compressed_file_size {
-                    println!("Compressed Size: {} bytes", compressed);
-                }
-                println!("Upload Date: {}", metadata.upload_date);
+                println!("File Metadata: {}", metadata);
             } else {
                 eprintln!("File with hash {} not found", hash);
             }
         }
         FilesScope::Download { hash, dest } => {
-            if let Some(ref des) = dest {
-                tracing::info!("Downloading file with hash {} to {}", hash, des.display());
-            } else {
-                tracing::info!("Downloading file with hash {} to stdout", hash);
-            }
+            todo!();
+            // if let Some(ref des) = dest {
+            //     tracing::info!("Downloading file with hash {} to {}", hash, des.display());
+            // } else {
+            //     tracing::info!("Downloading file with hash {} to stdout", hash);
+            // }
 
-            if let Some(metadata) = mongo.get_file_metadata(&hash).await? {
-                // Create storage provider once
-                let storage = metadata.storage_provider.into_storage();
+            // if let Some(metadata) = mongo.get_file_metadata(&hash).await? {
+            //     // Create storage provider once
+            //     return Ok(());
+            //     let storage = metadata.storage_provider.into_storage();
+            //     // Check if file is chunked
+            //     if let Some(manifest) = &metadata.chunk_manifest {
+            //         // Chunked file - reconstruct from chunks
+            //         tracing::info!(
+            //             "Reconstructing chunked file with {} chunks",
+            //             manifest.chunks.len()
+            //         );
+            //         eprintln!(
+            //             "{}",
+            //             "Downloading chunked file (reconstructing from chunks)...".yellow()
+            //         );
 
-                // Check if file is chunked
-                if let Some(manifest) = &metadata.chunk_manifest {
-                    // Chunked file - reconstruct from chunks
-                    tracing::info!(
-                        "Reconstructing chunked file with {} chunks",
-                        manifest.chunks.len()
-                    );
-                    eprintln!(
-                        "{}",
-                        "Downloading chunked file (reconstructing from chunks)...".yellow()
-                    );
-
-                    if let Some(ref dest_path) = dest {
-                        // Write to file
-                        let mut output_file = tokio::fs::File::create(dest_path).await?;
-                        for chunk_ref in &manifest.chunks {
-                            match storage.download(&chunk_ref.storage_path).await {
-                                Ok(mut reader) => {
-                                    tokio::io::copy(&mut reader, &mut output_file).await?;
-                                }
-                                Err(e) => {
-                                    eprintln!("Failed to download chunk {}: {}", chunk_ref.hash, e);
-                                    return Err(ToolError::JobExecutionError(format!(
-                                        "Failed to download chunk {}: {}",
-                                        chunk_ref.hash, e
-                                    )));
-                                }
-                            }
-                        }
-                        println!("File reconstructed and saved to {}", dest_path.display());
-                    } else {
-                        // Write to stdout
-                        let mut stdout = tokio::io::stdout();
-                        for chunk_ref in &manifest.chunks {
-                            match storage.download(&chunk_ref.storage_path).await {
-                                Ok(mut reader) => {
-                                    tokio::io::copy(&mut reader, &mut stdout).await?;
-                                }
-                                Err(e) => {
-                                    eprintln!("Failed to download chunk {}: {}", chunk_ref.hash, e);
-                                    return Err(ToolError::JobExecutionError(format!(
-                                        "Failed to download chunk {}: {}",
-                                        chunk_ref.hash, e
-                                    )));
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    // Non-chunked file - direct download
-                    match storage.download(&metadata.storage_path).await {
-                        Ok(mut reader) => {
-                            if let Some(ref dest_path) = dest {
-                                let mut output_file = tokio::fs::File::create(dest_path).await?;
-                                tokio::io::copy(&mut reader, &mut output_file).await?;
-                                println!("File saved to {}", dest_path.display());
-                            } else {
-                                let mut stdout = tokio::io::stdout();
-                                tokio::io::copy(&mut reader, &mut stdout).await?;
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("Download failed: {}", e);
-                            return Err(ToolError::JobExecutionError(format!(
-                                "Download failed: {}",
-                                e
-                            )));
-                        }
-                    }
-                }
-            } else {
-                eprintln!("File with hash {} not found", hash);
-                return Err(ToolError::ConfigError(format!(
-                    "File with hash {} not found",
-                    hash
-                )));
-            }
+            //         if let Some(ref dest_path) = dest {
+            //             // Write to file
+            //             let mut output_file = tokio::fs::File::create(dest_path).await?;
+            //             for chunk_ref in &manifest.chunks {
+            //                 match storage.download(&chunk_ref.storage_path).await {
+            //                     Ok(mut reader) => {
+            //                         tokio::io::copy(&mut reader, &mut output_file).await?;
+            //                     }
+            //                     Err(e) => {
+            //                         eprintln!("Failed to download chunk {}: {}", chunk_ref.hash, e);
+            //                         return Err(ToolError::JobExecutionError(format!(
+            //                             "Failed to download chunk {}: {}",
+            //                             chunk_ref.hash, e
+            //                         )));
+            //                     }
+            //                 }
+            //             }
+            //             println!("File reconstructed and saved to {}", dest_path.display());
+            //         } else {
+            //             // Write to stdout
+            //             let mut stdout = tokio::io::stdout();
+            //             for chunk_ref in &manifest.chunks {
+            //                 match storage.download(&chunk_ref.storage_path).await {
+            //                     Ok(mut reader) => {
+            //                         tokio::io::copy(&mut reader, &mut stdout).await?;
+            //                     }
+            //                     Err(e) => {
+            //                         eprintln!("Failed to download chunk {}: {}", chunk_ref.hash, e);
+            //                         return Err(ToolError::JobExecutionError(format!(
+            //                             "Failed to download chunk {}: {}",
+            //                             chunk_ref.hash, e
+            //                         )));
+            //                     }
+            //                 }
+            //             }
+            //         }
+            //     } else {
+            //         // Non-chunked file - direct download
+            //         match storage.download(&metadata.storage_path).await {
+            //             Ok(mut reader) => {
+            //                 if let Some(ref dest_path) = dest {
+            //                     let mut output_file = tokio::fs::File::create(dest_path).await?;
+            //                     tokio::io::copy(&mut reader, &mut output_file).await?;
+            //                     println!("File saved to {}", dest_path.display());
+            //                 } else {
+            //                     let mut stdout = tokio::io::stdout();
+            //                     tokio::io::copy(&mut reader, &mut stdout).await?;
+            //                 }
+            //             }
+            //             Err(e) => {
+            //                 eprintln!("Download failed: {}", e);
+            //                 return Err(ToolError::JobExecutionError(format!(
+            //                     "Download failed: {}",
+            //                     e
+            //                 )));
+            //             }
+            //         }
+            //     }
+            // } else {
+            //     eprintln!("File with hash {} not found", hash);
+            //     return Err(ToolError::ConfigError(format!(
+            //         "File with hash {} not found",
+            //         hash
+            //     )));
+            // }
         }
         FilesScope::Delete { hash, yes } => {
             if !yes {
@@ -539,18 +529,15 @@ pub async fn files(scope: FilesScope, mongo_uri: String) -> Result<(), ToolError
 }
 
 /// Validate YAML configuration and preflight URLs without downloading
-async fn validate_dry_run(yaml_config: &crate::models::IngestionConfig) -> Result<(), ToolError> {
+async fn validate_dry_run(resources: &Vec<Resource>) -> Result<(), ToolError> {
     use colored::*;
 
     println!("{}", "Dry-run mode: validating configuration...".bold());
-    println!(
-        "Found {} resources to validate\n",
-        yaml_config.resources.len()
-    );
+    println!("Found {} resources to validate\n", resources.len());
 
     let mut all_valid = true;
 
-    for resource in &yaml_config.resources {
+    for resource in resources {
         print!("  Checking {} ... ", resource.url);
         // Flush to ensure output appears in order
         use std::io::Write;
@@ -604,7 +591,7 @@ async fn preflight_url(url: &url::Url) -> Result<String, String> {
         Ok("FTP URL (basic validation)".to_string())
     } else if url.scheme() == "file" {
         // Check if local file exists
-        if let Some(path) = url.to_file_path().ok() {
+        if let Ok(path) = url.to_file_path() {
             if path.exists() {
                 Ok("local file exists".to_string())
             } else {

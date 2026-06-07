@@ -23,24 +23,29 @@ pub(crate) async fn handle_new_file(
 ) -> Result<JobOutcome, JobErrorOutcome> {
     let resource = &file_job.resource;
 
-    let dest_path = resource
-        .dest
-        .as_ref()
-        .and_then(|d| d.path.as_ref())
-        .ok_or(JobErrorOutcome::Fatal("Missing destination path".into()))?;
-
-    let provider = resource
-        .dest
-        .as_ref()
-        .and_then(|d| d.provider.as_ref())
-        .ok_or(JobErrorOutcome::Fatal(
-            "Missing destination provider".into(),
-        ))?;
+    let (dest_path, provider) = match &resource.dest {
+        Some(dest) => {
+            if let Some(path) = &dest.path
+                && let Some(provider) = &dest.provider
+            {
+                (path, provider)
+            } else {
+                return Err(JobErrorOutcome::Fatal(
+                    "Missing destination path or provider".to_string(),
+                ));
+            }
+        }
+        None => {
+            return Err(JobErrorOutcome::Fatal(
+                "Missing destination path or provider".to_string(),
+            ));
+        }
+    };
 
     let original_mime = download.mime_type.clone();
 
     let mut final_path = expand_path(
-        &dest_path,
+        dest_path,
         &format!("{}.{}", download.filename, download.extension),
     )
     .to_string_lossy()
@@ -152,12 +157,12 @@ pub(crate) async fn handle_new_file(
         None => (temp_path.clone(), Some(0), download.mime_type),
     };
 
-    if final_mime != original_mime {
-        if let Some(new_ext) = mime_to_extension(&final_mime) {
-            final_path = expand_path(&dest_path, &format!("{}.{}", download.filename, new_ext))
-                .to_string_lossy()
-                .to_string();
-        }
+    if final_mime != original_mime
+        && let Some(new_ext) = mime_to_extension(&final_mime)
+    {
+        final_path = expand_path(dest_path, &format!("{}.{}", download.filename, new_ext))
+            .to_string_lossy()
+            .to_string();
     }
 
     // Verify storage provider is healthy before attempting upload

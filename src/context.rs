@@ -36,12 +36,12 @@ impl ContextFactory {
     pub async fn build_file_context(&self, job_id: &str) -> Result<JobContext, ToolError> {
         if let Some(file_job) = self.mongo.get_file_job(job_id).await? {
             tracing::info!(job_id = %job_id, "Building file job context from Mongo");
-            return Ok(JobContext::from_file_job(
+            Ok(JobContext::from_file_job(
                 file_job,
                 self.mongo.clone(),
                 self.redis.clone(),
                 self.config.clone(),
-            ));
+            ))
         } else {
             Err(format!("File job {job_id} not found in Mongo").into())
         }
@@ -50,12 +50,12 @@ impl ContextFactory {
     pub async fn build_chunk_context(&self, job_id: &str) -> Result<JobContext, ToolError> {
         if let Some(chunk_job) = self.mongo.get_chunk_job(job_id).await? {
             tracing::info!(job_id = %job_id, "Building chunk job context from Mongo");
-            return Ok(JobContext::from_chunk_job(
+            Ok(JobContext::from_chunk_job(
                 chunk_job,
                 self.mongo.clone(),
                 self.redis.clone(),
                 self.config.clone(),
-            ));
+            ))
         } else {
             Err(format!("Chunk job {job_id} not found in Mongo").into())
         }

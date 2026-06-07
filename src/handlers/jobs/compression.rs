@@ -170,7 +170,7 @@ pub(crate) async fn compress_video_local(
         let global_header = octx.format().flags().contains(format::Flags::GLOBAL_HEADER);
 
         let encoder_codec = encoder::find(encoder_id)
-            .ok_or_else(|| JobError::OtherFatal(format!("Encoder not found on this system")))?;
+            .ok_or_else(|| JobError::OtherFatal("Encoder not found on this system".to_string()))?;
 
         let mut ost = octx
             .add_stream(encoder_codec)
@@ -233,7 +233,7 @@ pub(crate) async fn compress_video_local(
             }
 
             packet_count += 1;
-            if packet_count % log_interval == 0 {
+            if packet_count.is_multiple_of(log_interval) {
                 tracing::info!(
                     "Video compression progress: {} packets processed",
                     packet_count
@@ -305,15 +305,11 @@ pub(crate) async fn compress_video_local(
         octx.write_trailer()
             .map_err(|e| JobError::OtherFatal(format!("Failed to write trailer: {e}")))?;
 
-        let compressed_size = std::fs::metadata(&output_path_str)
-            .map_err(|e| JobError::IoError(e))?
-            .len();
+        let compressed_size = std::fs::metadata(&output_path_str)?.len();
 
         if original_size > 0 && compressed_size >= original_size {
             let _ = std::fs::remove_file(&output_path_str);
-            let meta = std::fs::metadata(&temp_path)
-                .map_err(|e| JobError::IoError(e))?
-                .len();
+            let meta = std::fs::metadata(&temp_path)?.len();
             return Ok((temp_path, meta, original_mime));
         }
 

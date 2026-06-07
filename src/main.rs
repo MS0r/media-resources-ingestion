@@ -11,7 +11,7 @@ pub mod storage;
 use crate::{
     cli::{Cli, Commands, Global, LogFormat, load_config, load_env_uris},
     error::ToolError,
-    models::AppConfig,
+    models::{AppConfig, extract_enqueue_config, extract_run_config},
     settings::load_toml,
 };
 use clap::Parser;
@@ -84,7 +84,7 @@ async fn main() -> Result<(), ToolError> {
     let cli = Cli::parse();
     let global = cli.global.clone();
 
-    setup_logging(global.clone());
+    setup_logging(global);
     init_ffmpeg();
 
     let (redis_uri, mongo_uri) = match load_env_uris() {
@@ -119,29 +119,17 @@ async fn main() -> Result<(), ToolError> {
                     tracing::info!("Running ingestion...");
                     let yaml_config = load_config(&run_args.yaml_path)?;
 
-                    let config = AppConfig::from_sources(
-                        &yaml_config,
-                        toml_config,
-                        run_args,
-                        redis_uri,
-                        mongo_uri,
-                    );
+                    let (config, resources) = extract_run_config(yaml_config,toml_config,run_args,redis_uri,mongo_uri)?;
 
-                    bootstrap::run(config, yaml_config).await
+                    bootstrap::run(config, resources).await
                 }
                 Commands::Enqueue(enqueue_args) => {
                     tracing::info!("Enqueuing jobs...");
                     let yaml_config = load_config(&enqueue_args.yaml_path)?;
 
-                    let config = AppConfig::from_enqueue_args(
-                        &yaml_config,
-                        toml_config,
-                        enqueue_args,
-                        redis_uri,
-                        mongo_uri,
-                    );
+                    let (config, resources) = extract_enqueue_config(yaml_config,toml_config,enqueue_args,redis_uri,mongo_uri)?;
 
-                    let batch_id = bootstrap::enqueue(&config, &yaml_config).await?;
+                    let batch_id = bootstrap::enqueue(&config, &resources).await?;
                     println!("Batch ID: {}", batch_id);
                     Ok(())
                 }
@@ -171,11 +159,7 @@ async fn main() -> Result<(), ToolError> {
         Ok(_) => Ok(()),
         Err(e) => {
             let code = e.exit_code();
-            if global.quiet {
-                eprintln!("Error: {}", e);
-            } else {
-                eprintln!("{} {}", "Error:".red(), e);
-            }
+            eprintln!("{} {}", "Error:".red(), e);
             std::process::exit(code);
         }
     }

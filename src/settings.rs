@@ -82,3 +82,97 @@ pub fn load_toml(path: &PathBuf) -> Result<TomlRawConfig, ToolError> {
     let config: TomlRawConfig = toml::from_str(&toml_fs)?;
     Ok(config)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TOML_FULL: &str = r#"
+[scheduler]
+file_workers = 5
+chunk_workers = 20
+max_pending_jobs = 10000
+max_per_host = 2
+
+[compression]
+threshold_mb = 512
+quality = 95
+
+[storage]
+default_provider = "local"
+default_path = "~/downloads"
+chunk_size = "128MB"
+temp_dir = "/tmp/ingest"
+"#;
+
+    const TOML_MINIMAL: &str = r#"
+[scheduler]
+file_workers = 1
+chunk_workers = 1
+max_pending_jobs = 0
+max_per_host = 1
+
+[compression]
+threshold_mb = 0
+quality = 0
+
+[storage]
+default_provider = "s3"
+default_path = "~"
+chunk_size = "64MB"
+temp_dir = "/tmp/ingest"
+"#;
+
+    const TOML_LARGE: &str = r#"
+[scheduler]
+file_workers = 100
+chunk_workers = 200
+max_pending_jobs = 1000000
+max_per_host = 10
+
+[compression]
+threshold_mb = 1024
+quality = 100
+
+[storage]
+default_provider = "s3"
+default_path = "/mnt/storage"
+chunk_size = "512MB"
+temp_dir = "/tmp/ingest"
+"#;
+
+    #[test]
+    fn test_toml_config_full_deserialization() {
+        let config: TomlRawConfig = toml::from_str(TOML_FULL).expect("Failed to parse TOML");
+
+        assert_eq!(config.scheduler.file_workers, 5);
+        assert_eq!(config.scheduler.chunk_workers, 20);
+        assert_eq!(config.scheduler.max_pending_jobs, 10000);
+        assert_eq!(config.scheduler.max_per_host, 2);
+        assert_eq!(config.compression.threshold_mb, 512);
+        assert_eq!(config.compression.quality, 95);
+        assert_eq!(config.storage.default_provider, "local");
+        assert_eq!(config.storage.default_path, "~/downloads");
+        assert_eq!(config.storage.chunk_size, "128MB");
+    }
+
+    #[test]
+    fn test_toml_config_minimal_values() {
+        let config: TomlRawConfig = toml::from_str(TOML_MINIMAL).expect("Failed to parse TOML");
+
+        assert_eq!(config.scheduler.file_workers, 1);
+        assert_eq!(config.scheduler.max_per_host, 1);
+        assert_eq!(config.compression.quality, 0);
+    }
+
+    #[test]
+    fn test_toml_config_large_values() {
+        let config: TomlRawConfig = toml::from_str(TOML_LARGE).expect("Failed to parse TOML");
+
+        assert_eq!(config.scheduler.file_workers, 100);
+        assert_eq!(config.scheduler.chunk_workers, 200);
+        assert_eq!(config.scheduler.max_pending_jobs, 1_000_000);
+        assert_eq!(config.compression.threshold_mb, 1024);
+        assert_eq!(config.compression.quality, 100);
+    }
+}

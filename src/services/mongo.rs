@@ -145,11 +145,11 @@ impl MongoService {
         let client = self.client().await?;
         let collection: Collection<FileJob> = client.collection("files_jobs");
         match collection.insert_one(&file_job).await {
-            Ok(_) => return Ok(()),
+            Ok(_) => Ok(()),
             Err(e) if e.to_string().contains("E11000 duplicate key error") => {
-                return Err(format!("File job with ID {} already exists", file_job._id).into());
+                Err(format!("File job with ID {} already exists", file_job._id).into())
             }
-            Err(e) => return Err(e.into()),
+            Err(e) => Err(e.into()),
         }
     }
 

@@ -12,7 +12,7 @@ use crate::handlers::jobs::types::DownloadInfo;
 pub(crate) fn filename_from_url(url: &Url) -> (Option<String>, Option<String>) {
     let path = url
         .path_segments()
-        .and_then(|segments| segments.filter(|s| !s.is_empty()).last())
+        .and_then(|segments| segments.filter(|s| !s.is_empty()).next_back())
         .map(|s| s.to_string());
 
     match path {
@@ -131,12 +131,12 @@ pub(crate) async fn initiate_download(
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|| "application/octet-stream".to_string());
 
-    if mime_type == "application/octet-stream" || mime_type == "text/plain" {
-        if let (Some(name), Some(ext)) = filename_from_url(&resource.url) {
-            let detection_name = format!("{}.{}", name, ext);
-            if let Some(mime) = mime_guess::from_path(&detection_name).first_raw() {
-                mime_type = mime.to_string();
-            }
+    if (mime_type == "application/octet-stream" || mime_type == "text/plain")
+        && let (Some(name), Some(ext)) = filename_from_url(&resource.url)
+    {
+        let detection_name = format!("{}.{}", name, ext);
+        if let Some(mime) = mime_guess::from_path(&detection_name).first_raw() {
+            mime_type = mime.to_string();
         }
     }
 
