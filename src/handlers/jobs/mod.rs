@@ -12,7 +12,7 @@ use std::{path::PathBuf, sync::Arc};
 
 use crate::{
     error::JobErrorOutcome,
-    models::AppConfig,
+    models::{AppConfig, ChunkRef, Metadata},
     services::{mongo::MongoService, redis::RedisService},
     storage::{Provider, StorageProvider},
 };
@@ -30,7 +30,6 @@ pub enum JobEnvelope {
 }
 
 pub struct JobContext {
-    pub job_id: JobId,
     pub storage: Arc<dyn StorageProvider>,
     pub db: Arc<MongoService>,
     pub redis: Arc<RedisService>,
@@ -50,7 +49,6 @@ impl JobContext {
         {
             let storage = provider.into_storage();
             return Self {
-                job_id: job._id.to_string(),
                 storage,
                 db,
                 redis,
@@ -60,7 +58,6 @@ impl JobContext {
         }
 
         Self {
-            job_id: job._id.to_string(),
             storage: Provider::Local.into_storage(),
             db,
             redis,
@@ -76,7 +73,6 @@ impl JobContext {
         config: Arc<AppConfig>,
     ) -> Self {
         Self {
-            job_id: job._id.clone(),
             storage: Provider::Local.into_storage(),
             db,
             redis,
@@ -101,8 +97,10 @@ impl JobContext {
 }
 
 pub enum JobOutcome {
-    Completed,
+    Completed(Metadata),
+    Duplicated,
     SpawnedChunks(Vec<ChunkJob>),
+    ChunkCompleted(ChunkRef),
 }
 
 pub enum JobKind {

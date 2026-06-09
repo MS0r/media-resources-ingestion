@@ -2,6 +2,7 @@ use crate::{
     cli::JobStatus,
     error::ToolError,
     handlers::jobs::{Batch, ChunkJob, FileJob, JobKind},
+    models::ChunkRef,
     services::mongo::MongoService,
 };
 use redis::{AsyncCommands, Client, aio::MultiplexedConnection};
@@ -344,29 +345,81 @@ impl RedisService {
         Ok(())
     }
 
-    /// Records a completed chunk hash in the crash-recovery set for its file.
-    pub async fn register_chunk(&self, file_hash: &str, chunk_hash: &str) -> Result<(), ToolError> {
+    /// Create a counter for the counter pattern following the given parent_id
+    pub async fn create_counter(&self, parent_id: &str) -> Result<(), ToolError> {
         let mut conn = self.get_connection().await?;
-        let key = format!("jobs:chunks:{file_hash}");
-        let _: () = conn.sadd(&key, chunk_hash).await?;
+        let key = format!("jobs:counter:{parent_id}");
+        let _: () = conn.set(&key, "0").await?;
+        Ok(())
+    }
+
+    /// Records a completed chunk hash in the crash-recovery set for its file.
+    pub async fn register_chunk(&self, parent_id: &str, chunk_id: &str) -> Result<(), ToolError> {
+        let mut conn = self.get_connection().await?;
+        let key = format!("jobs:chunks:{parent_id}");
+        let _: () = conn.sadd(&key, chunk_id).await?;
         Ok(())
     }
 
     /// Returns the set of already-completed chunk hashes for a given file.
     /// Used during crash recovery to skip re-uploading finished chunks.
-    pub async fn completed_chunks(&self, file_hash: &str) -> Result<Vec<String>, ToolError> {
+    pub async fn completed_chunks(&self, parent_id: &str) -> Result<Vec<String>, ToolError> {
         let mut conn = self.get_connection().await?;
-        let key = format!("jobs:chunks:{file_hash}");
+        let key = format!("jobs:chunks:{parent_id}");
         let members: Vec<String> = conn.smembers(&key).await?;
         Ok(members)
     }
 
-    /// Publishes a progress event string to the per-job pub/sub channel.
-    /// The `--follow` terminal renderer subscribes to this channel.
-    pub async fn publish_progress(&self, job_id: &str, event: &str) -> Result<(), ToolError> {
+    /// Store a chunk's metadata in a Redis hash for later manifest assembly.
+    /// Key: `jobs:chunk_results:<file_hash>`, field: chunk_index, value: JSON.
+    pub async fn complete_chunk(
+        &self,
+        chunk_id: &str,
+        chunk_ref: ChunkRef,
+        chunk_index: u32,
+        parent_id: &str
+    ) -> Result<u32, ToolError> {
         let mut conn = self.get_connection().await?;
-        let channel = format!("jobs:progress:{job_id}");
-        let _: () = conn.publish(&channel, event).await?;
+        let result_key = format!("jobs:chunk_results:{parent_id}");
+        let count_key = format!("jobs:counter:{parent_id}");
+        let json = serde_json::to_string(&chunk_ref)?;
+
+        let (count,): (u32,) = redis::pipe()
+            .atomic()
+            .hset(&result_key, chunk_index, json).ignore()
+            .incr(&count_key, 1)
+            .query_async(&mut conn)
+            .await?;
+
+        Ok(count)
+    }
+
+    /// Fetch all chunk results for a file. Returns `Vec<(chunk_index, ChunkRef)>`.
+    pub async fn get_all_chunk_results(
+        &self,
+        parent_id: &str,
+    ) -> Result<Vec<(u32, ChunkRef)>, ToolError> {
+        let mut conn = self.get_connection().await?;
+        let key = format!("jobs:chunk_results:{parent_id}");
+        let entries: Vec<(String, String)> = conn.hgetall(&key).await?;
+        let mut results = Vec::with_capacity(entries.len());
+        for (idx_str, json) in entries {
+            let index: u32 = idx_str
+                .parse()
+                .map_err(|e| ToolError::Message(format!("Invalid chunk index '{idx_str}': {e}")))?;
+            let chunk_ref: ChunkRef = serde_json::from_str(&json)?;
+            results.push((index, chunk_ref));
+        }
+        Ok(results)
+    }
+
+    /// Remove all chunk result data for a file. Called after finalization.
+    pub async fn cleanup_chunk_results(&self, parent_id: &str) -> Result<(), ToolError> {
+        let mut conn = self.get_connection().await?;
+        let key = format!("jobs:chunk_results:{parent_id}");
+        let _: () = conn.del(&key).await?;
+        let chunks_key = format!("jobs:chunks:{parent_id}");
+        let _: () = conn.del(&chunks_key).await?;
         Ok(())
     }
 

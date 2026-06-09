@@ -29,8 +29,8 @@ impl ContextFactory {
         self.mongo.clone()
     }
 
-    pub fn config(&self) -> &Arc<AppConfig> {
-        &self.config
+    pub fn config(&self) -> Arc<AppConfig> {
+        self.config.clone()
     }
 
     pub async fn build_file_context(&self, job_id: &str) -> Result<JobContext, ToolError> {

@@ -153,13 +153,6 @@ impl MongoService {
         }
     }
 
-    pub async fn save_chunk_job(&self, chunk_job: ChunkJob) -> Result<(), ToolError> {
-        let client = self.client().await?;
-        let collection: Collection<ChunkJob> = client.collection("chunks_jobs");
-        collection.insert_one(chunk_job).await?;
-        Ok(())
-    }
-
     pub async fn get_batch(&self, batch_id: &str) -> Result<Option<Batch>, ToolError> {
         let client = self.client().await?;
         let collection: Collection<Batch> = client.collection("batches");
@@ -172,6 +165,13 @@ impl MongoService {
         let collection: Collection<FileJob> = client.collection("files_jobs");
         let job = collection.find_one(doc! { "_id": job_id }).await?;
         Ok(job)
+    }
+
+    pub async fn save_chunk_job(&self, chunk_job: ChunkJob) -> Result<(), ToolError> {
+        let client = self.client().await?;
+        let collection: Collection<ChunkJob> = client.collection("chunks_jobs");
+        collection.insert_one(chunk_job).await?;
+        Ok(())
     }
 
     pub async fn get_chunk_job(&self, job_id: &str) -> Result<Option<ChunkJob>, ToolError> {
@@ -285,6 +285,22 @@ impl MongoService {
             )
             .await?;
         Ok(result.modified_count > 0)
+    }
+
+    /// Mark a job as completed without inserting metadata (e.g. for duplicates).
+    pub async fn mark_job_completed(&self, job_id: &str) -> Result<(), ToolError> {
+        let client = self.client().await?;
+        let complete_status = serialize_to_bson(&JobStatus::Completed {
+            finished_at: Utc::now(),
+        })?;
+        let jobs_collection: Collection<FileJob> = client.collection("files_jobs");
+        jobs_collection
+            .update_one(
+                doc! { "_id": job_id },
+                doc! { "$set": { "status": complete_status } },
+            )
+            .await?;
+        Ok(())
     }
 
     pub async fn fail_job(&self, job_id: &str, reason: &str) -> Result<(), ToolError> {

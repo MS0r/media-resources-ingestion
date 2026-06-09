@@ -27,7 +27,7 @@ pub struct Metadata {
     compressed_file_size: Option<u64>,
     compression_ratio: Option<f32>,
     pub mime_type: String,
-    chunk_manifest: Option<Manifest>, // List of chunk identifiers if applicable
+    pub chunk_manifest: Option<Manifest>, // List of chunk identifiers if applicable
     upload_date: MongoDateTime,
     duplicate_reference_count: u32,
     update_date: Option<MongoDateTime>,
@@ -79,20 +79,20 @@ impl Display for Metadata {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Manifest {
-    chunks: Vec<ChunkRef>,
-    compression: Option<String>, // e.g. "image/webp"
-    original_size: u64,
-    compressed_size: u64,
+    pub chunks: Vec<ChunkRef>,
+    pub compression: Option<String>, // e.g. "image/webp"
+    pub original_size: u64,
+    pub compressed_size: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChunkRef {
-    hash: String,
-    size_original: u64,
-    size_compressed: Option<u64>,
-    storage_path: String,
-    offset_start: u64,
-    offset_end: u64,
+    pub hash: String,
+    pub size_original: u64,
+    pub size_compressed: Option<u64>,
+    pub storage_path: String,
+    pub offset_start: u64,
+    pub offset_end: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -118,6 +118,7 @@ pub enum VideoCompressionStrategy {
 pub enum GenericCompressionStrategy {
     #[default]
     OriginalFormat,
+    Gzip,
     Zstd,
     Zip,
     SevenZ,
@@ -681,6 +682,7 @@ mod tests {
             "originalformat",
             "h265",
             "av1",
+            "gzip",
             "zstd",
             "zip",
             "sevenz",

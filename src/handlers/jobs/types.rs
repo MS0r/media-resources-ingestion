@@ -1,8 +1,9 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use url::Url;
 
-use crate::models::Resource;
+use crate::models::{GenericCompressionStrategy, Resource};
 
 type JobId = String;
 type BatchId = String;
@@ -34,7 +35,7 @@ pub struct FileJob {
 pub struct ChunkJob {
     pub _id: JobId,
     pub parent_job_id: JobId,
-    pub file_hash: String,
+    pub file_hash: Option<String>,
     pub chunk_index: u32,
     pub offset_start: u64,
     pub offset_end: u64,
@@ -45,6 +46,13 @@ pub struct ChunkJob {
     pub updated_at: DateTime<Utc>,
     pub chunk_hash: Option<String>,
     pub error: Option<String>,
+    pub url: Url,
+    pub authorization: Option<String>,
+    pub cookie: Option<String>,
+    pub dest_path: String,
+    pub total_chunks: u32,
+    pub total_file_size: u64,
+    pub compression_strategy: Option<GenericCompressionStrategy>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

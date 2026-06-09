@@ -4,15 +4,20 @@ use std::time::Duration;
 
 use crate::{
     error::{JobError, JobErrorOutcome},
-    models::{CompressionOverride, Metadata},
+    handlers::jobs::{
+        compression::{
+            compress_generic_local, compress_image_local, compress_video_local,
+            generic_compression_mime, mime_to_extension,
+        },
+        {ChunkJob, FileJob, JobContext, JobOutcome, types::DownloadInfo},
+    },
+    models::{ChunkRef, CompressionOverride, GenericCompressionStrategy, Manifest, Metadata},
+    storage::Provider,
 };
+use sha2::{Digest, Sha256};
+use tokio::time::timeout;
 
 use super::expand_path;
-use crate::handlers::jobs::compression::{
-    compress_image_local, compress_video_local, mime_to_extension,
-};
-use crate::handlers::jobs::types::DownloadInfo;
-use crate::handlers::jobs::{FileJob, JobContext, JobOutcome};
 
 pub(crate) async fn handle_new_file(
     ctx: &JobContext,
@@ -60,15 +65,14 @@ pub(crate) async fn handle_new_file(
     let (local_file, compressed_size, final_mime) = match override_strategy {
         Some(strategy) => match strategy {
             CompressionOverride::Image(image_s) => {
-                let is_image = original_mime.starts_with("image/");
-                if !is_image {
+                if !original_mime.starts_with("image/") {
                     tracing::warn!(
                         "Image compression requested but bytes indicate MIME is {} — skipping",
                         download.mime_type
                     );
                     (temp_path.clone(), Some(0), download.mime_type)
                 } else {
-                    match tokio::time::timeout(
+                    match timeout(
                         compression_timeout,
                         compress_image_local(
                             &download.filename,
@@ -104,8 +108,7 @@ pub(crate) async fn handle_new_file(
                 }
             }
             CompressionOverride::Video(video_s) => {
-                let is_video = original_mime.starts_with("video/");
-                if !is_video {
+                if !original_mime.starts_with("video/") {
                     tracing::warn!(
                         "Video compression requested but bytes indicate MIME is {} — skipping",
                         download.mime_type
@@ -114,7 +117,7 @@ pub(crate) async fn handle_new_file(
                 } else {
                     let cancel_video = Arc::new(AtomicBool::new(false));
                     let cancel_video_clone = cancel_video.clone();
-                    match tokio::time::timeout(
+                    match timeout(
                         compression_timeout,
                         compress_video_local(
                             &download.filename,
@@ -151,7 +154,34 @@ pub(crate) async fn handle_new_file(
                     }
                 }
             }
-            CompressionOverride::Generic(_) => (temp_path.clone(), Some(0), download.mime_type),
+            CompressionOverride::Generic(strategy) => {
+                match compress_generic_local(
+                    &temp_path,
+                    &download.filename,
+                    strategy,
+                    ctx.config.compression_quality,
+                )
+                .await
+                {
+                    Ok((path, size)) => {
+                        let mime = if path == temp_path {
+                            download.mime_type.clone()
+                        } else {
+                            generic_compression_mime(strategy).to_string()
+                        };
+                        tracing::info!(
+                            "Generic compressed: {} -> {} bytes",
+                            download.content_length,
+                            size
+                        );
+                        (path, Some(size), mime)
+                    }
+                    Err(e) => {
+                        tracing::warn!("Generic compression failed: {e}, keeping original");
+                        (temp_path.clone(), Some(0), download.mime_type)
+                    }
+                }
+            }
             CompressionOverride::Universal(_) => (temp_path.clone(), Some(0), download.mime_type),
         },
         None => (temp_path.clone(), Some(0), download.mime_type),
@@ -166,10 +196,10 @@ pub(crate) async fn handle_new_file(
     }
 
     // Verify storage provider is healthy before attempting upload
-    ctx.storage.health_check().await.map_err(|e| {
-        tracing::error!(error = %e, "Storage provider health check failed before upload");
-        JobErrorOutcome::Retryable(format!("Storage health check failed: {e}"))
-    })?;
+    let _ = ctx.storage.health_check().await.map_err(|e| {
+        tracing::error!("Storage provider health check failed before upload");
+        JobErrorOutcome::from(e)
+    });
 
     let mut file = tokio::fs::File::open(&local_file)
         .await
@@ -189,10 +219,8 @@ pub(crate) async fn handle_new_file(
         compressed_size,
         final_mime,
     );
-    ctx.db.complete_job(metadata, &file_job._id).await?;
-    tracing::info!("New file metadata inserted with hash: {}", hash_hex);
 
-    Ok(JobOutcome::Completed)
+    Ok(JobOutcome::Completed(metadata))
 }
 
 pub(crate) async fn handle_duplicate(
@@ -206,5 +234,5 @@ pub(crate) async fn handle_duplicate(
     tokio::fs::remove_file(temp_path)
         .await
         .map_err(|e| JobErrorOutcome::Retryable(e.to_string()))?;
-    Ok(JobOutcome::Completed)
+    Ok(JobOutcome::Duplicated)
 }

@@ -1,4 +1,5 @@
 use std::{
+    io,
     path::Path,
     sync::Arc,
     sync::atomic::{AtomicBool, Ordering},
@@ -6,7 +7,7 @@ use std::{
 
 use crate::{
     error::JobError,
-    models::{ImageCompressionStrategy, VideoCompressionStrategy},
+    models::{GenericCompressionStrategy, ImageCompressionStrategy, VideoCompressionStrategy},
 };
 
 pub(crate) fn mime_to_extension(mime: &str) -> Option<&'static str> {
@@ -14,7 +15,32 @@ pub(crate) fn mime_to_extension(mime: &str) -> Option<&'static str> {
         "image/webp" => Some("webp"),
         "image/avif" => Some("avif"),
         "video/mp4" => Some("mp4"),
+        "application/gzip" => Some("gz"),
+        "application/zstd" => Some("zst"),
+        "application/zip" => Some("zip"),
+        "application/x-7z-compressed" => Some("7z"),
+        "application/x-rar" => Some("rar"),
         _ => None,
+    }
+}
+
+pub(crate) fn generic_compression_extension(strategy: &GenericCompressionStrategy) -> &'static str {
+    match strategy {
+        GenericCompressionStrategy::Gzip => "gz",
+        GenericCompressionStrategy::Zstd => "zst",
+        GenericCompressionStrategy::Zip => "zip",
+        GenericCompressionStrategy::SevenZ => "7z",
+        GenericCompressionStrategy::OriginalFormat | GenericCompressionStrategy::None => "",
+    }
+}
+
+pub(crate) fn generic_compression_mime(strategy: &GenericCompressionStrategy) -> &'static str {
+    match strategy {
+        GenericCompressionStrategy::Gzip => "application/gzip",
+        GenericCompressionStrategy::Zstd => "application/zstd",
+        GenericCompressionStrategy::Zip => "application/zip",
+        GenericCompressionStrategy::SevenZ => "application/x-7z-compressed",
+        GenericCompressionStrategy::OriginalFormat | GenericCompressionStrategy::None => "",
     }
 }
 
@@ -320,4 +346,228 @@ pub(crate) async fn compress_video_local(
     .map_err(|e| JobError::OtherFatal(format!("Spawn blocking failed: {e}")))??;
 
     Ok(result)
+}
+
+pub(crate) async fn compress_generic_local(
+    temp_path: &str,
+    original_name: &str,
+    strategy: &GenericCompressionStrategy,
+    quality: u8,
+) -> Result<(String, u64), JobError> {
+    match strategy {
+        GenericCompressionStrategy::OriginalFormat | GenericCompressionStrategy::None => {
+            let meta = std::fs::metadata(temp_path)?;
+            return Ok((temp_path.to_string(), meta.len()));
+        }
+        GenericCompressionStrategy::Gzip
+        | GenericCompressionStrategy::Zstd
+        | GenericCompressionStrategy::Zip
+        | GenericCompressionStrategy::SevenZ => {}
+    }
+
+    let parent = Path::new(temp_path).parent().unwrap_or(Path::new("."));
+    let ext = generic_compression_extension(strategy);
+    let output_path = parent.join(original_name).with_extension(ext);
+    let output_path_str = output_path.to_string_lossy().to_string();
+
+    let input_path = temp_path.to_string();
+    let out_path = output_path_str.clone();
+    let strategy = strategy.clone();
+
+    let result = tokio::task::spawn_blocking(move || -> Result<(String, u64), JobError> {
+        match strategy {
+            GenericCompressionStrategy::Gzip => {
+                let mut input = std::fs::File::open(&input_path)?;
+                let output = std::fs::File::create(&out_path)?;
+                let mut encoder =
+                    flate2::write::GzEncoder::new(output, flate2::Compression::default());
+                io::copy(&mut input, &mut encoder)?;
+                encoder.finish()?;
+            }
+            GenericCompressionStrategy::Zstd => {
+                let mut input = std::fs::File::open(&input_path)?;
+                let output = std::fs::File::create(&out_path)?;
+                let level = (quality as i32).clamp(1, 22);
+                let mut encoder = zstd::stream::Encoder::new(output, level)?;
+                io::copy(&mut input, &mut encoder)?;
+                encoder.finish()?;
+            }
+            GenericCompressionStrategy::Zip => {
+                let output = std::fs::File::create(&out_path)?;
+                let mut zip = zip::ZipWriter::new(output);
+                let fname = Path::new(&input_path)
+                    .file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "file".to_string());
+                zip.start_file(fname, zip::write::SimpleFileOptions::default())
+                    .map_err(|e| JobError::OtherFatal(format!("zip start: {e}")))?;
+                let mut input = std::fs::File::open(&input_path)?;
+                io::copy(&mut input, &mut zip)?;
+                zip.finish()
+                    .map_err(|e| JobError::OtherFatal(format!("zip finish: {e}")))?;
+            }
+            GenericCompressionStrategy::SevenZ => {
+                let mut writer = sevenz_rust::SevenZWriter::create(&out_path)
+                    .map_err(|e| JobError::OtherFatal(format!("7z create: {e}")))?;
+                writer
+                    .push_source_path(Path::new(&input_path), |_| true)
+                    .map_err(|e| JobError::OtherFatal(format!("7z push: {e}")))?;
+                writer
+                    .finish()
+                    .map_err(|e| JobError::OtherFatal(format!("7z finish: {e}")))?;
+            }
+            GenericCompressionStrategy::OriginalFormat | GenericCompressionStrategy::None => {}
+        }
+
+        let compressed_size = std::fs::metadata(&out_path)?.len();
+        Ok((out_path, compressed_size))
+    })
+    .await
+    .map_err(|e| JobError::OtherFatal(format!("Spawn blocking failed: {e}")))??;
+
+    // Keep compressed only if it's actually smaller
+    let original_size = std::fs::metadata(temp_path)?.len();
+    if original_size > 0 && result.1 >= original_size {
+        std::fs::remove_file(&result.0).ok();
+        return Ok((temp_path.to_string(), original_size));
+    }
+
+    Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::GenericCompressionStrategy;
+
+    fn create_compressible_data(dir: &std::path::Path) -> std::path::PathBuf {
+        let input = dir.join("test.txt");
+        // ~100KB of repetitive text that compresses very well
+        let content =
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n".repeat(2000);
+        std::fs::write(&input, content).unwrap();
+        input
+    }
+
+    #[tokio::test]
+    async fn test_compress_generic_gzip() {
+        let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        let input = create_compressible_data(&dir);
+
+        let (path, size) = compress_generic_local(
+            input.to_str().unwrap(),
+            "test",
+            &GenericCompressionStrategy::Gzip,
+            5,
+        )
+        .await
+        .unwrap();
+
+        assert!(size > 0);
+        assert_eq!(
+            std::path::Path::new(&path)
+                .extension()
+                .map(|e| e.to_string_lossy()),
+            Some("gz".into())
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_compress_generic_zstd() {
+        let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        let input = create_compressible_data(&dir);
+
+        let (path, size) = compress_generic_local(
+            input.to_str().unwrap(),
+            "test",
+            &GenericCompressionStrategy::Zstd,
+            5,
+        )
+        .await
+        .unwrap();
+
+        assert!(size > 0);
+        assert_eq!(
+            std::path::Path::new(&path)
+                .extension()
+                .map(|e| e.to_string_lossy()),
+            Some("zst".into())
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_compress_generic_zip() {
+        let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        let input = create_compressible_data(&dir);
+
+        let (path, size) = compress_generic_local(
+            input.to_str().unwrap(),
+            "test",
+            &GenericCompressionStrategy::Zip,
+            5,
+        )
+        .await
+        .unwrap();
+
+        assert!(size > 0);
+        assert_eq!(
+            std::path::Path::new(&path)
+                .extension()
+                .map(|e| e.to_string_lossy()),
+            Some("zip".into())
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_compress_generic_sevenz() {
+        let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        let input = create_compressible_data(&dir);
+
+        let (path, size) = compress_generic_local(
+            input.to_str().unwrap(),
+            "test",
+            &GenericCompressionStrategy::SevenZ,
+            5,
+        )
+        .await
+        .unwrap();
+
+        assert!(size > 0);
+        assert_eq!(
+            std::path::Path::new(&path)
+                .extension()
+                .map(|e| e.to_string_lossy()),
+            Some("7z".into())
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_compress_generic_original_format() {
+        let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        let input = dir.join("test.txt");
+        std::fs::write(&input, "Hello, world!").unwrap();
+        let input_str = input.to_str().unwrap().to_string();
+
+        let (path, size) = compress_generic_local(
+            input_str.as_str(),
+            "test",
+            &GenericCompressionStrategy::OriginalFormat,
+            5,
+        )
+        .await
+        .unwrap();
+
+        assert!(size > 0);
+        assert_eq!(path, input_str);
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
