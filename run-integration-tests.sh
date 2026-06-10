@@ -45,7 +45,7 @@ export RUST_LOG="${RUST_LOG:-ERROR}"
 
 echo ""
 echo "=== Running integration tests ==="
-cargo test --test run_integration_test -- --nocapture
+cargo test -p ingest-core --test run_integration_test -- --nocapture
 
 echo ""
 echo "=== All integration tests passed ==="

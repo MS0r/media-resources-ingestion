@@ -224,7 +224,7 @@ async fn execute(
     let hb_done = Arc::new(AtomicBool::new(false));
     let hb_done_clone = hb_done.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(30));
+        let mut interval = tokio::time::interval(Duration::from_secs(10));
         loop {
             interval.tick().await;
             if hb_done_clone.load(Ordering::Relaxed) || hb_shutdown.load(Ordering::Relaxed) {
@@ -245,14 +245,11 @@ async fn enqueue_chunks(
     parent_id: &str,
     chunks: Vec<ChunkJob>,
 ) -> Result<(), JobErrorOutcome> {
-    redis
-        .create_counter(parent_id)
-        .await?;
+    redis.create_counter(parent_id).await?;
     let chunks_len = chunks.len();
     for chunk in chunks {
         redis.enqueue_chunk_job(&chunk).await?;
-        db.save_chunk_job(chunk)
-            .await?;
+        db.save_chunk_job(chunk).await?;
     }
     tracing::info!("Chunks enqueued {}", chunks_len);
     Ok(())
@@ -333,14 +330,13 @@ async fn complete_job_no_metadata(
     Ok(())
 }
 
-async fn retry_chunk(redis: &RedisService, db: &MongoService) {}
-
-async fn fail_chunk(redis: &RedisService, db: &MongoService) {}
-
 /// Called by the last `ChunkJob` when all chunks for a file are done.
 /// Builds the `Metadata` with a `Manifest`, saves it, and marks the parent
 /// `FileJob` as completed.
-async fn finalize_chunked_file(ctx: &JobContext, chunk_job: &ChunkJob) -> Result<(), JobErrorOutcome> {
+async fn finalize_chunked_file(
+    ctx: &JobContext,
+    chunk_job: &ChunkJob,
+) -> Result<(), JobErrorOutcome> {
     let results = ctx
         .redis
         .get_all_chunk_results(&chunk_job.parent_job_id)
@@ -382,7 +378,9 @@ async fn finalize_chunked_file(ctx: &JobContext, chunk_job: &ChunkJob) -> Result
 
     let storage_path = std::path::Path::new(&chunk_refs[0].storage_path)
         .parent()
-        .map_or(chunk_job.dest_path.clone(), |p| p.to_string_lossy().to_string());
+        .map_or(chunk_job.dest_path.clone(), |p| {
+            p.to_string_lossy().to_string()
+        });
 
     let compression_name = chunk_job.compression_strategy.as_ref().map(|s| {
         match s {

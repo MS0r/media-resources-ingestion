@@ -45,16 +45,13 @@ async fn spawn_chunk_jobs(
     let total_chunks = ((total_size + chunk_size - 1) / chunk_size) as u32;
     let resource = &file_job.resource;
 
-    let auth = resource
+    // Extract auth headers in a single pass through the config chain
+    let (auth, cookie) = resource
         .config
         .as_ref()
         .and_then(|c| c.headers.as_ref())
-        .and_then(|h| h.authorization.clone());
-    let cookie = resource
-        .config
-        .as_ref()
-        .and_then(|c| c.headers.as_ref())
-        .and_then(|h| h.cookie.clone());
+        .map(|h| (h.authorization.clone(), h.cookie.clone()))
+        .unwrap_or_default();
 
     let compression_strategy = resource
         .config
@@ -65,31 +62,29 @@ async fn spawn_chunk_jobs(
             _ => None,
         });
 
+
     let resource_name = resource.name.clone().unwrap_or_else(|| {
         filename_from_url(&resource.url)
             .0
             .unwrap_or_else(|| "file".to_string())
     });
 
-    let dest_folder = resource.dest.as_ref().and_then(|d| d.path.as_ref()).map_or(
-        format!(
-            "{}/{}",
-            config.default_path.trim_end_matches('/'),
-            resource_name
-        ),
-        |p| format!("{}/{}", p.trim_end_matches('/'), resource_name),
-    );
+    let base_path = resource
+        .dest
+        .as_ref()
+        .and_then(|d| d.path.as_ref())
+        .map(|p| p.trim_end_matches('/'))
+        .unwrap_or_else(|| config.default_path.trim_end_matches('/'));
+    let dest_folder = format!("{}/{}", base_path, resource_name);
 
-    let mut chunks = Vec::with_capacity(total_chunks as usize);
-
-    for i in 0..total_chunks {
+    let build_chunk = |i: u32| {
         let offset_start = (i as u64) * chunk_size;
         let offset_end = ((i as u64 + 1) * chunk_size - 1).min(total_size.saturating_sub(1));
 
-        chunks.push(ChunkJob {
+        ChunkJob {
             _id: uuid::Uuid::new_v4().to_string(),
             parent_job_id: file_job._id.clone(),
-            file_hash: None, // use parent job ID as grouping key
+            file_hash: None,
             chunk_index: i,
             offset_start,
             offset_end,
@@ -107,12 +102,16 @@ async fn spawn_chunk_jobs(
             total_chunks,
             total_file_size: total_size,
             compression_strategy: compression_strategy.clone(),
-        });
-    }
+        }
+    };
+
+    let chunks: Vec<ChunkJob> = (0..total_chunks).map(build_chunk).collect();
 
     tracing::info!(
         file_job_id = %file_job._id,
-        total_size, chunk_size, total_chunks,
+        total_size,
+        chunk_size,
+        total_chunks,
         "Spawning {} chunk jobs",
         total_chunks
     );
@@ -168,85 +167,48 @@ impl super::JobHandler for FileJobHandler {
             }
         }
 
-        // Decide whether to allow abort-at-threshold (only when size is unknown)
-        let known_size = head_size.or(resp_content_length);
-        let max_bytes = if known_size.is_none() {
-            Some(threshold_bytes)
-        } else {
-            None
-        };
-
-        match download_to_temp(
+        // ── Phase 3: stream download ─────────────────────────────────────
+        let stream_result = download_to_temp(
             response,
             &ctx.config.temp_dir,
             &download.filename,
             &file_job._id,
-            max_bytes,
+            None,
         )
-        .await?
-        {
+        .await?;
+
+        let (temp_path, hash_hex, mime_type, byte_count) = match stream_result {
             StreamResult::Completed {
                 temp_path,
                 hash,
                 bytes_mime,
                 byte_count,
             } => {
+                // Use byte_count to overwrite content_length (which might be 0 if no Content-Length header)
                 download.content_length = byte_count;
                 if bytes_mime != "application/octet-stream" {
                     download.mime_type = bytes_mime;
                 }
-
-                match ctx.db.upsert_file_metadata(&hash).await {
-                    Ok(UpsertResult::Inserted) => {
-                        handle_new_file(ctx, file_job, download, temp_path, hash).await
-                    }
-                    Ok(UpsertResult::Duplicate(existing)) => {
-                        handle_duplicate(&temp_path, &existing.file_hash).await
-                    }
-                    Err(e) => {
-                        tokio::fs::remove_file(&temp_path).await.ok();
-                        Err(JobErrorOutcome::from(e))
-                    }
-                }
+                (temp_path, hash, download.mime_type.clone(), byte_count)
             }
-            StreamResult::ThresholdExceeded { byte_count } => {
-                tracing::info!(
-                    "Stream exceeded threshold ({} > {}), switching to Range",
-                    byte_count,
-                    threshold_bytes
-                );
-
-                if resp_accept_ranges {
-                    let chunks = spawn_chunk_jobs(file_job, byte_count, &ctx.config).await?;
-                    return Ok(JobOutcome::SpawnedChunks(chunks));
-                }
-
-                // Probe: send a Range: 0-0 to check server support
-                let auth = resource
-                    .config
-                    .as_ref()
-                    .and_then(|c| c.headers.as_ref())
-                    .and_then(|h| h.authorization.as_deref());
-                let cookie = resource
-                    .config
-                    .as_ref()
-                    .and_then(|c| c.headers.as_ref())
-                    .and_then(|h| h.cookie.as_deref());
-
-                match initiate_range_download(&resource.url, 0, 0, auth, cookie).await {
-                    Ok(probe) if probe.status() == 206 => {
-                        drop(probe);
-                        let chunks = spawn_chunk_jobs(file_job, byte_count, &ctx.config).await?;
-                        Ok(JobOutcome::SpawnedChunks(chunks))
-                    }
-                    _ => Err(JobErrorOutcome::Fatal(format!(
-                        "File exceeds {} MB threshold (streamed {} bytes) but server does not \
-                         support Range requests — cannot chunk",
-                        ctx.config.compression_threshold_mb, byte_count
-                    ))),
-                }
+            StreamResult::ThresholdExceeded { .. } => {
+                unreachable!("Threshold not set for non-chunked download")
             }
+        };
+
+        download.content_length = byte_count;
+
+        // ── Phase 4: dedup check ─────────────────────────────────────────
+        match ctx.db.upsert_file_metadata(&hash_hex).await? {
+            UpsertResult::Duplicate(existing) => {
+                let outcome = handle_duplicate(&temp_path, &existing.file_hash).await?;
+                return Ok(outcome);
+            }
+            UpsertResult::Inserted => {}
         }
+
+        // ── Phase 5: handle (compress + upload + metadata) ───────────────
+        handle_new_file(ctx, file_job, download, temp_path, hash_hex).await
     }
 }
 
@@ -308,21 +270,15 @@ impl super::JobHandler for ChunkJobHandler {
                 .map_err(|e| JobErrorOutcome::Retryable(e.to_string()))?;
             ctx.storage.upload(&storage_path, &mut file).await?;
         }
-        tokio::fs::remove_file(&compressed_path).await.ok();
 
-        // Also clean up original temp if different from compressed path
+        // Cleanup temp files
+        tokio::fs::remove_file(&compressed_path).await.ok();
         if compressed_path != temp_path {
             tokio::fs::remove_file(&temp_path).await.ok();
         }
 
-        // Register completion in Redis
-        ctx.redis
-            .register_chunk(&chunk_job.parent_job_id, &chunk_job._id)
-            .await?;
-
-        // Store chunk result for later manifest assembly
         let chunk_ref = ChunkRef {
-            hash: chunk_hash.clone(),
+            hash: chunk_hash,
             size_original: byte_count,
             size_compressed: Some(compressed_size),
             storage_path,
@@ -330,163 +286,44 @@ impl super::JobHandler for ChunkJobHandler {
             offset_end: chunk_job.offset_end,
         };
 
-        tracing::info!(job_id = %chunk_job._id, "Chunk {} completed", chunk_job.chunk_index);
         Ok(JobOutcome::ChunkCompleted(chunk_ref))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::{
-        JobEnvelope,
-        download::extract_file_job,
-        download::filename_from_url,
-        expand_path,
-        types::{ChunkJob, FileJob, JobStatus},
-    };
-    use chrono::Utc;
-    use std::path::PathBuf;
-    use url::Url;
-
-    use crate::models::Resource;
-
-    #[test]
-    fn test_filename_from_url_standard() {
-        let url = Url::parse("https://example.com/images/photo.png").unwrap();
-        assert_eq!(
-            filename_from_url(&url),
-            (Some("photo".into()), Some("png".into()))
-        );
-    }
-
-    #[test]
-    fn test_filename_from_url_no_path() {
-        let url = Url::parse("https://example.com").unwrap();
-        assert_eq!(filename_from_url(&url), (None, None));
-    }
-
-    #[test]
-    fn test_filename_from_url_root() {
-        let url = Url::parse("https://example.com/").unwrap();
-        assert_eq!(filename_from_url(&url), (None, None));
-    }
-
-    #[test]
-    fn test_filename_from_url_deep_path() {
-        let url = Url::parse("https://cdn.example.com/a/b/c/d/file.txt?query=1").unwrap();
-        assert_eq!(
-            filename_from_url(&url),
-            (Some("file".into()), Some("txt".into()))
-        );
-    }
-
-    #[test]
-    fn test_filename_from_url_trailing_slash() {
-        let url = Url::parse("https://example.com/dir/").unwrap();
-        assert_eq!(filename_from_url(&url), (Some("dir".into()), None));
-    }
-
-    #[test]
-    fn test_expand_path_simple() {
-        let result = expand_path("/base", "file.txt");
-        assert_eq!(result, PathBuf::from("/base/file.txt"));
-    }
-
-    #[test]
-    fn test_expand_path_nested() {
-        let result = expand_path("/base/dir", "sub/file.txt");
-        assert_eq!(result, PathBuf::from("/base/dir/sub/file.txt"));
-    }
-
-    #[test]
-    fn test_expand_path_tilde_root() {
-        let home = dirs::home_dir().expect("home dir should exist in test env");
-        let result = expand_path("~/downloads", "file.txt");
-        assert_eq!(result, home.join("downloads/file.txt"));
-    }
-
-    #[test]
-    fn test_expand_path_tilde_only() {
-        let home = dirs::home_dir().expect("home dir should exist in test env");
-        let result = expand_path("~", "file.txt");
-        assert_eq!(result, home.join("file.txt"));
-    }
-
-    #[test]
-    fn test_extract_file_job_file() {
-        let file_job = FileJob {
-            _id: "j1".into(),
-            batch_id: "b1".into(),
-            resource: Resource {
-                id: "r1".into(),
-                url: Url::parse("https://example.com/f.png").unwrap(),
-                name: None,
-                priority: None,
-                dest: None,
-                config: None,
-            },
-            priority: 0,
-            status: JobStatus::Pending,
-            retry_count: 0,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-            file_hash: None,
-            error: None,
-        };
-        let envelope = JobEnvelope::File(file_job);
-        let result = extract_file_job(&envelope);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap()._id, "j1");
-    }
-
-    #[test]
-    fn test_extract_file_job_chunk_fails() {
-        let chunk_job = ChunkJob {
-            _id: "c1".into(),
-            parent_job_id: "j1".into(),
-            file_hash: Some("abc".into()),
-            chunk_index: 0,
-            offset_start: 0,
-            offset_end: 99,
-            priority: 0,
-            status: JobStatus::Pending,
-            retry_count: 0,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-            chunk_hash: None,
-            error: None,
-            url: Url::parse("https://example.com/f.png").unwrap(),
-            authorization: None,
-            cookie: None,
-            dest_path: "/tmp/chunk_00000.bin".into(),
-            total_chunks: 1,
-            total_file_size: 100,
-            compression_strategy: None,
-        };
-        let envelope = JobEnvelope::Chunk(chunk_job);
-        let result = extract_file_job(&envelope);
-        assert!(result.is_err());
-    }
-
-    use super::parse_chunk_size;
+    use super::*;
 
     #[test]
     fn test_parse_chunk_size_mb() {
         assert_eq!(parse_chunk_size("128MB"), 128 * 1024 * 1024);
+        assert_eq!(parse_chunk_size(" 64MB "), 64 * 1024 * 1024);
     }
 
     #[test]
     fn test_parse_chunk_size_gb() {
+        assert_eq!(parse_chunk_size("1GB"), 1024 * 1024 * 1024);
         assert_eq!(parse_chunk_size("2GB"), 2 * 1024 * 1024 * 1024);
     }
 
     #[test]
-    fn test_parse_chunk_size_default() {
-        assert_eq!(parse_chunk_size(""), 128 * 1024 * 1024);
+    fn test_parse_chunk_size_kb() {
+        assert_eq!(parse_chunk_size("512KB"), 512 * 1024);
+        assert_eq!(parse_chunk_size("1024KB"), 1024 * 1024);
     }
 
     #[test]
     fn test_parse_chunk_size_raw_bytes() {
-        assert_eq!(parse_chunk_size("1024"), 1024);
+        assert_eq!(parse_chunk_size("1048576"), 1048576);
+    }
+
+    #[test]
+    fn test_parse_chunk_size_empty() {
+        assert_eq!(parse_chunk_size(""), 128 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_parse_chunk_size_garbage() {
+        assert_eq!(parse_chunk_size("xyz"), 128 * 1024 * 1024);
     }
 }

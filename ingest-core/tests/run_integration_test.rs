@@ -2,9 +2,11 @@ use std::env;
 use std::io::Write;
 use std::path::PathBuf;
 
-use media_resources_ingestion::bootstrap;
-use media_resources_ingestion::cli::{OutputFormat, RunArgs, load_config};
-use media_resources_ingestion::{AppConfig, MongoService, TomlRawConfig, ToolError};
+use ingest_core::OutputFormat;
+use ingest_core::bootstrap;
+use ingest_core::config::RunConfig;
+use ingest_core::models::{self, Resource, load_config};
+use ingest_core::{AppConfig, MongoService, TomlRawConfig, ToolError};
 
 const TOML_TEST: &str = r#"
 [scheduler]
@@ -54,7 +56,7 @@ fn write_test_yaml(resources: &str) -> (PathBuf, PathBuf) {
 fn build_app_config(yaml_path: PathBuf, no_follow: bool, dry_run: bool) -> (AppConfig, PathBuf) {
     let toml = setup_toml();
     let yaml_config = load_config(&yaml_path).expect("load test YAML");
-    let args = RunArgs {
+    let args = RunConfig {
         yaml_path: yaml_path.clone(),
         dry_run,
         priority: None,
@@ -67,7 +69,7 @@ fn build_app_config(yaml_path: PathBuf, no_follow: bool, dry_run: bool) -> (AppC
     (cfg, yaml_path)
 }
 
-fn build_app_config_full(yaml_path: PathBuf, args: RunArgs) -> (AppConfig, PathBuf) {
+fn build_app_config_full(yaml_path: PathBuf, args: RunConfig) -> (AppConfig, PathBuf) {
     let toml = setup_toml();
     let yaml_config = load_config(&yaml_path).expect("load test YAML");
     let cfg = AppConfig::from_sources(&yaml_config, toml, args, redis_uri(), mongo_uri());
@@ -99,9 +101,10 @@ async fn run_no_follow_creates_batch_and_jobs() {
 
     let (config, yaml_path) = build_app_config(yaml_path, true, false);
     let yaml_config = load_config(&yaml_path).expect("load test YAML");
-    bootstrap::run(config, yaml_config.resources)
+    let resources = yaml_config.resources;
+    bootstrap::enqueue(&config, &resources)
         .await
-        .expect("run --no-follow should succeed");
+        .expect("enqueue should succeed");
 
     let after = count_jobs(&mongo).await;
     assert_eq!(after, before + 2, "expected 2 new file jobs in MongoDB");
@@ -113,7 +116,7 @@ async fn run_empty_yaml_is_accepted() {
 
     let (config, yaml_path) = build_app_config(yaml_path, true, false);
     let yaml_config = load_config(&yaml_path).expect("load test YAML");
-    bootstrap::run(config, yaml_config.resources)
+    bootstrap::enqueue(&config, &yaml_config.resources)
         .await
         .expect("empty yaml should succeed");
 }
@@ -134,7 +137,7 @@ async fn run_duplicate_urls_rejected() {
 
     let (config, yaml_path) = build_app_config(yaml_path, true, false);
     let yaml_config = load_config(&yaml_path).expect("load test YAML");
-    let err = bootstrap::run(config, yaml_config.resources)
+    let err = bootstrap::enqueue(&config, &yaml_config.resources)
         .await
         .unwrap_err();
 
@@ -149,7 +152,7 @@ async fn run_dry_run_local_file() {
 "#,
     );
 
-    let args = RunArgs {
+    let args = RunConfig {
         yaml_path: yaml_path.clone(),
         dry_run: true,
         priority: None,
@@ -160,7 +163,7 @@ async fn run_dry_run_local_file() {
     };
     let (config, yaml_path) = build_app_config_full(yaml_path, args);
     let yaml_config = load_config(&yaml_path).expect("load test YAML");
-    bootstrap::run(config, yaml_config.resources)
+    bootstrap::enqueue(&config, &yaml_config.resources)
         .await
         .expect("dry-run with existing file should succeed");
 }
@@ -173,7 +176,7 @@ async fn run_dry_run_missing_file_fails() {
 "#,
     );
 
-    let args = RunArgs {
+    let args = RunConfig {
         yaml_path: yaml_path.clone(),
         dry_run: true,
         priority: None,
@@ -184,7 +187,7 @@ async fn run_dry_run_missing_file_fails() {
     };
     let (config, yaml_path) = build_app_config_full(yaml_path, args);
     let yaml_config = load_config(&yaml_path).expect("load test YAML");
-    let err = bootstrap::run(config, yaml_config.resources)
+    let err = bootstrap::enqueue(&config, &yaml_config.resources)
         .await
         .unwrap_err();
     assert!(matches!(err, ToolError::ValidationError(_)));
@@ -198,7 +201,7 @@ async fn run_dry_run_invalid_scheme_fails() {
 "#,
     );
 
-    let args = RunArgs {
+    let args = RunConfig {
         yaml_path: yaml_path.clone(),
         dry_run: true,
         priority: None,
@@ -209,7 +212,7 @@ async fn run_dry_run_invalid_scheme_fails() {
     };
     let (config, yaml_path) = build_app_config_full(yaml_path, args);
     let yaml_config = load_config(&yaml_path).expect("load test YAML");
-    let err = bootstrap::run(config, yaml_config.resources)
+    let err = bootstrap::enqueue(&config, &yaml_config.resources)
         .await
         .unwrap_err();
     assert!(matches!(err, ToolError::ValidationError(_)));

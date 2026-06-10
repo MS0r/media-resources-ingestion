@@ -1,8 +1,7 @@
 use crate::{
-    cli::JobStatus,
     error::ToolError,
     handlers::jobs::{Batch, ChunkJob, FileJob, JobKind},
-    models::ChunkRef,
+    models::{ChunkRef, JobStatusFilter},
     services::mongo::MongoService,
 };
 use redis::{AsyncCommands, Client, aio::MultiplexedConnection};
@@ -42,9 +41,6 @@ impl RedisService {
         let mut conn = self.get_connection().await?;
 
         let key = format!("batches:state:{}", batch._id);
-
-        // Store the whole batch document as a single hash field so it can be
-        // fetched atomically with a single HGET.
         let _: () = conn.hset(&key, "status", "pending").await?;
 
         tracing::debug!(batch_id = %batch._id, "Batch state written to Redis");
@@ -97,7 +93,7 @@ impl RedisService {
 
     /// Fetch the full job state from Redis by ID.
     /// Returns the deserialized kind + payload so ContextFactory can build the context.
-    pub async fn get_job(&self, job_id: &str) -> Result<(JobKind, JobStatus, u8), ToolError> {
+    pub async fn get_job(&self, job_id: &str) -> Result<(JobKind, JobStatusFilter, u8), ToolError> {
         let mut conn = self.get_connection().await?;
         let state_key = format!("jobs:state:{job_id}");
 
@@ -116,11 +112,11 @@ impl RedisService {
         };
 
         let job_status = match status.as_str() {
-            "pending" => JobStatus::Pending,
-            "running" => JobStatus::Running,
-            "completed" => JobStatus::Completed,
-            "retrying" => JobStatus::Retrying,
-            "failed" => JobStatus::Failed,
+            "pending" => JobStatusFilter::Pending,
+            "running" => JobStatusFilter::Running,
+            "completed" => JobStatusFilter::Completed,
+            "retrying" => JobStatusFilter::Retrying,
+            "failed" => JobStatusFilter::Failed,
             other => return Err(format!("Unknown job status '{other}' for job {job_id}").into()),
         };
 
@@ -374,10 +370,10 @@ impl RedisService {
     /// Key: `jobs:chunk_results:<file_hash>`, field: chunk_index, value: JSON.
     pub async fn complete_chunk(
         &self,
-        chunk_id: &str,
+        _chunk_id: &str,
         chunk_ref: ChunkRef,
         chunk_index: u32,
-        parent_id: &str
+        parent_id: &str,
     ) -> Result<u32, ToolError> {
         let mut conn = self.get_connection().await?;
         let result_key = format!("jobs:chunk_results:{parent_id}");
@@ -386,7 +382,8 @@ impl RedisService {
 
         let (count,): (u32,) = redis::pipe()
             .atomic()
-            .hset(&result_key, chunk_index, json).ignore()
+            .hset(&result_key, chunk_index, json)
+            .ignore()
             .incr(&count_key, 1)
             .query_async(&mut conn)
             .await?;
@@ -451,14 +448,14 @@ impl RedisService {
         let mut cleaned = 0usize;
 
         for file_hash in &orphans {
-            match mongo.file_exists(file_hash).await {
-                Ok(false) => {
+            match mongo.get_file_job(file_hash).await {
+                Ok(Some(_)) => {}
+                Ok(None) => {
                     let key = format!("jobs:chunks:{file_hash}");
                     let _: () = conn.del(&key).await?;
                     cleaned += 1;
                     tracing::info!(file_hash = %file_hash, "Cleaned up orphaned chunk tracking key");
                 }
-                Ok(true) => {}
                 Err(e) => {
                     tracing::warn!(file_hash = %file_hash, error = %e, "Could not check file existence")
                 }

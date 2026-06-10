@@ -1,8 +1,7 @@
 use crate::{
-    cli::JobStatus as JobStatusCli,
     error::ToolError,
     handlers::jobs::{Batch, ChunkJob, FileJob, JobStatus},
-    models::Metadata,
+    models::{JobStatusFilter, Metadata},
 };
 use bb8::Pool;
 use bb8_mongodb::MongodbConnectionManager;
@@ -134,17 +133,17 @@ impl MongoService {
         }
     }
 
-    pub async fn save_batch(&self, batch: Batch) -> Result<(), ToolError> {
+    pub async fn save_batch(&self, batch: &Batch) -> Result<(), ToolError> {
         let client = self.client().await?;
         let collection: Collection<Batch> = client.collection("batches");
         collection.insert_one(batch).await?;
         Ok(())
     }
 
-    pub async fn save_file_job(&self, file_job: FileJob) -> Result<(), ToolError> {
+    pub async fn save_file_job(&self, file_job: &FileJob) -> Result<(), ToolError> {
         let client = self.client().await?;
         let collection: Collection<FileJob> = client.collection("files_jobs");
-        match collection.insert_one(&file_job).await {
+        match collection.insert_one(file_job).await {
             Ok(_) => Ok(()),
             Err(e) if e.to_string().contains("E11000 duplicate key error") => {
                 Err(format!("File job with ID {} already exists", file_job._id).into())
@@ -183,7 +182,7 @@ impl MongoService {
 
     pub async fn list_jobs(
         &self,
-        filter_status: Option<JobStatusCli>,
+        filter_status: Option<JobStatusFilter>,
         limit: usize,
     ) -> Result<Vec<FileJob>, ToolError> {
         let client = self.client().await?;
@@ -192,12 +191,12 @@ impl MongoService {
         let mut filter = doc! {};
         if let Some(status) = filter_status {
             let status_str = match status {
-                JobStatusCli::Pending => "status.pending",
-                JobStatusCli::Running => "status.running",
-                JobStatusCli::Completed => "status.completed",
-                JobStatusCli::Failed => "status.failed",
-                JobStatusCli::Retrying => "status.retrying",
-                JobStatusCli::Cancelled => "status.cancelled",
+                JobStatusFilter::Pending => "status.pending",
+                JobStatusFilter::Running => "status.running",
+                JobStatusFilter::Completed => "status.completed",
+                JobStatusFilter::Failed => "status.failed",
+                JobStatusFilter::Retrying => "status.retrying",
+                JobStatusFilter::Cancelled => "status.cancelled",
             };
             filter.insert(status_str, doc! {"$exists" : true});
         }

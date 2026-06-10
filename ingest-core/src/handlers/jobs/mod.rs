@@ -103,6 +103,7 @@ pub enum JobOutcome {
     ChunkCompleted(ChunkRef),
 }
 
+#[derive(Clone, Debug, PartialEq)]
 pub enum JobKind {
     File,
     Chunk,
