@@ -27,6 +27,7 @@ pub(crate) async fn handle_new_file(
     hash_hex: String,
 ) -> Result<JobOutcome, JobErrorOutcome> {
     let resource = &file_job.resource;
+    let pr = ctx.progress.as_ref();
 
     let (dest_path, provider) = match &resource.dest {
         Some(dest) => {
@@ -201,6 +202,9 @@ pub(crate) async fn handle_new_file(
         JobErrorOutcome::from(e)
     });
 
+    if let Some(pr) = pr {
+        pr.report("uploading", 6, Some(7), None).await;
+    }
     let mut file = tokio::fs::File::open(&local_file)
         .await
         .map_err(|e| JobErrorOutcome::from(JobError::from(e)))?;

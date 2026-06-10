@@ -13,7 +13,12 @@ pub struct Cli {
 
 #[derive(Args, Clone)]
 pub struct Global {
-    #[arg(long, value_name = "ADDR", default_value = "[::1]:50051", global = true)]
+    #[arg(
+        long,
+        value_name = "ADDR",
+        default_value = "[::1]:50051",
+        global = true
+    )]
     pub server: String,
     /// Log format
     #[arg(long, value_enum, default_value_t = LogFormat::Pretty)]
@@ -28,7 +33,12 @@ pub struct Global {
     #[arg(long)]
     pub no_color: bool,
     /// Path to TOML config file (for server/local mode)
-    #[arg(short, long, value_name = "FILE", default_value = ".ingest/config.toml")]
+    #[arg(
+        short,
+        long,
+        value_name = "FILE",
+        default_value = ".ingest/config.toml"
+    )]
     pub config: PathBuf,
 }
 

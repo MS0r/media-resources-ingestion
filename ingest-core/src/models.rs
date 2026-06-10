@@ -5,7 +5,7 @@ use crate::{
     settings::TomlRawConfig,
     storage::Provider,
 };
-use mongodb::bson::{DateTime as MongoDateTime};
+use mongodb::bson::DateTime as MongoDateTime;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
@@ -252,6 +252,33 @@ pub struct AppConfig {
 pub enum OutputFormat {
     Table,
     Json,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProgressJobType {
+    FileJob,
+    ChunkJob,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProgressStatus {
+    Running,
+    Done,
+    Failed,
+    Retrying,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProgressEvent {
+    pub job_id: String,
+    pub job_type: ProgressJobType,
+    pub stage: String,
+    pub current: u32,
+    pub total: Option<u32>,
+    pub status: ProgressStatus,
+    pub message: Option<String>,
 }
 
 /// Simple filter enum used for querying job lists by status.

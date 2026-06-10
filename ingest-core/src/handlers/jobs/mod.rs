@@ -13,6 +13,7 @@ use std::{path::PathBuf, sync::Arc};
 use crate::{
     error::JobErrorOutcome,
     models::{AppConfig, ChunkRef, Metadata},
+    services::redis::ProgressReporter,
     services::{mongo::MongoService, redis::RedisService},
     storage::{Provider, StorageProvider},
 };
@@ -35,6 +36,8 @@ pub struct JobContext {
     pub redis: Arc<RedisService>,
     pub config: Arc<AppConfig>,
     pub job: JobEnvelope,
+    pub progress: Option<ProgressReporter>,
+    pub http_client: Arc<wreq::Client>,
 }
 
 impl JobContext {
@@ -43,7 +46,9 @@ impl JobContext {
         db: Arc<MongoService>,
         redis: Arc<RedisService>,
         config: Arc<AppConfig>,
+        http_client: Arc<wreq::Client>,
     ) -> Self {
+        let progress = Some(ProgressReporter::new(job._id.clone(), (*redis).clone()));
         if let Some(dest) = &job.resource.dest
             && let Some(provider) = &dest.provider
         {
@@ -54,6 +59,8 @@ impl JobContext {
                 redis,
                 config,
                 job: JobEnvelope::File(job),
+                progress,
+                http_client,
             };
         }
 
@@ -63,6 +70,8 @@ impl JobContext {
             redis,
             config,
             job: JobEnvelope::File(job),
+            progress,
+            http_client,
         }
     }
 
@@ -71,6 +80,7 @@ impl JobContext {
         db: Arc<MongoService>,
         redis: Arc<RedisService>,
         config: Arc<AppConfig>,
+        http_client: Arc<wreq::Client>,
     ) -> Self {
         Self {
             storage: Provider::Local.into_storage(),
@@ -78,6 +88,8 @@ impl JobContext {
             redis,
             config,
             job: JobEnvelope::Chunk(job),
+            progress: None,
+            http_client,
         }
     }
 
@@ -100,7 +112,7 @@ pub enum JobOutcome {
     Completed(Metadata),
     Duplicated,
     SpawnedChunks(Vec<ChunkJob>),
-    ChunkCompleted(ChunkRef),
+    ChunkCompleted(ChunkRef, String),
 }
 
 #[derive(Clone, Debug, PartialEq)]

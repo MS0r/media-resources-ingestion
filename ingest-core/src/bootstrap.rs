@@ -13,6 +13,8 @@ use crate::{
 use chrono::Utc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::sync::Semaphore;
+use url::Url;
 use uuid::Uuid;
 
 fn parent_values(mut res: Resource, config: &AppConfig) -> (Resource, i32) {
@@ -40,7 +42,7 @@ fn parent_values(mut res: Resource, config: &AppConfig) -> (Resource, i32) {
     if dest.path.is_none() {
         dest.path = Some(config.default_path.clone());
     }
-    
+
     (res, resource_priority)
 }
 
@@ -119,13 +121,11 @@ pub async fn enqueue(config: &AppConfig, resources: &[Resource]) -> Result<Strin
         tracing::debug!(job_id=%file_job._id,"Inserted file job from the batch id: {}", batch._id);
         mongo_service.save_file_job(&file_job).await?;
         redis_service.enqueue_file_job(&file_job).await?;
-        
     }
 
     tracing::info!(batch_id = %batch._id, "Batch created");
     mongo_service.save_batch(&batch).await?;
     redis_service.enqueue_batch(&batch).await?;
-    
 
     Ok(batch_id)
 }
@@ -135,7 +135,7 @@ pub async fn enqueue(config: &AppConfig, resources: &[Resource]) -> Result<Strin
 pub async fn worker_with_services(
     mongo_service: MongoService,
     redis_service: RedisService,
-    config: Arc<AppConfig>,
+    config: AppConfig,
     shutdown: Arc<AtomicBool>,
 ) -> Result<(), ToolError> {
     match redis_service.recover_orphaned_jobs().await {
@@ -159,31 +159,27 @@ pub async fn worker_with_services(
     let temp_dir = &config.temp_dir;
     tokio::fs::create_dir_all(temp_dir).await?;
 
-    let ctx_factory = Arc::new(ContextFactory::new(
-        mongo_service,
-        redis_service,
-        (*config).clone(),
-    ));
-
     let file_handler = Arc::new(FileJobHandler);
     let chunk_handler = Arc::new(ChunkJobHandler);
 
     tracing::info!("Starting worker mode");
     tracing::info!(
-        file_workers = ctx_factory.config().file_workers,
-        chunk_workers = ctx_factory.config().chunk_workers,
+        file_workers = config.file_workers,
+        chunk_workers = config.chunk_workers,
         "Worker pool sizes"
     );
 
-    let file_workers = ctx_factory.config().file_workers;
-    let chunk_workers = ctx_factory.config().chunk_workers;
+    let file_semaphore = Arc::new(Semaphore::new(config.file_workers));
+    let chunk_semaphore = Arc::new(Semaphore::new(config.chunk_workers));
+
+    let ctx_factory = Arc::new(ContextFactory::new(mongo_service, redis_service, config));
 
     scheduler_loop(
         file_handler,
         chunk_handler,
         ctx_factory,
-        file_workers,
-        chunk_workers,
+        file_semaphore,
+        chunk_semaphore,
         shutdown,
     )
     .await;
@@ -223,12 +219,11 @@ pub async fn worker(config: AppConfig) -> Result<(), ToolError> {
         shutdown_clone.store(true, Ordering::Relaxed);
     });
 
-    let config = Arc::new(config);
     worker_with_services(mongo_service, redis_service, config, shutdown).await
 }
 
 /// Perform a preflight check on a URL (HEAD request for HTTP/HTTPS)
-pub async fn preflight_url(url: &url::Url) -> Result<String, String> {
+pub async fn preflight_url(url: &Url) -> Result<String, String> {
     if url.scheme() == "http" || url.scheme() == "https" {
         let response = wreq::Client::new()
             .head(url.as_str())

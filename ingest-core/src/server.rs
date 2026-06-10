@@ -5,12 +5,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::{
     AppConfig, JobStatusFilter, MongoService, ToolError, bootstrap,
-    models,
+    models::{self, ProgressEvent, ProgressJobType, ProgressStatus},
     services::redis::RedisService,
     settings::load_toml,
 };
-use tonic::{Request, Response, Status};
 use tonic::transport::Server;
+use tonic::{Request, Response, Status};
 
 pub mod proto {
     tonic::include_proto!("ingest");
@@ -229,6 +229,7 @@ impl IngestService for IngestServer {
                 .cancel_job(&job_id)
                 .await
                 .map_err(|e| Status::internal(e.to_string()))?;
+            publish_cancelled(&self.redis, &job_id, ProgressJobType::FileJob).await;
         }
 
         Ok(Response::new(ActionResponse {
@@ -263,6 +264,9 @@ impl IngestService for IngestServer {
                 .cancel_jobs(&batch.job_ids)
                 .await
                 .map_err(|e| Status::internal(e.to_string()))?;
+            for job_id in &batch.job_ids {
+                publish_cancelled(&self.redis, job_id, ProgressJobType::FileJob).await;
+            }
         }
 
         Ok(Response::new(ActionResponse {
@@ -281,6 +285,23 @@ impl IngestService for IngestServer {
             .retry_failed_job(&job_id)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
+
+        if retried {
+            let _ = self
+                .redis
+                .retry_job(&job_id, crate::handlers::jobs::JobKind::File)
+                .await;
+            let event = ProgressEvent {
+                job_id: job_id.clone(),
+                job_type: ProgressJobType::FileJob,
+                stage: "retrying".to_string(),
+                current: 0,
+                total: None,
+                status: ProgressStatus::Retrying,
+                message: Some("Manually retried via API".to_string()),
+            };
+            let _ = self.redis.publish_progress(&job_id, &event).await;
+        }
 
         Ok(Response::new(ActionResponse {
             success: retried,
@@ -386,24 +407,19 @@ pub async fn serve(addr: SocketAddr, toml_path: &Path) -> Result<(), ToolError> 
 
     tracing::info!("Ingest gRPC server listening on {addr}");
 
-    let worker_config = AppConfig::from_worker_args(
-        toml_config.clone(),
-        redis_uri,
-        mongo_uri,
-        None,
-    );
+    let worker_config =
+        AppConfig::from_worker_args(toml_config.clone(), redis_uri, mongo_uri, None);
 
     let worker_shutdown = shutdown.clone();
     let worker_mongo = mongo.clone();
     let worker_redis = redis.clone();
-    let worker_config_arc = Arc::new(worker_config);
 
     tokio::spawn(async move {
         tracing::info!("Worker auto-started with gRPC server");
         if let Err(e) = bootstrap::worker_with_services(
             worker_mongo,
             worker_redis,
-            worker_config_arc,
+            worker_config,
             worker_shutdown,
         )
         .await
@@ -432,9 +448,25 @@ pub async fn serve(addr: SocketAddr, toml_path: &Path) -> Result<(), ToolError> 
 
     Server::builder()
         .add_service(IngestServiceServer::new(ingest_server))
-        .serve_with_shutdown(addr, async { signal_rx.await.ok(); })
+        .serve_with_shutdown(addr, async {
+            signal_rx.await.ok();
+        })
         .await
         .map_err(|e| ToolError::Message(format!("server error: {e}")))?;
 
     Ok(())
+}
+
+/// Publish a Cancelled/Failed progress event so CLI subscribers unblock.
+async fn publish_cancelled(redis: &RedisService, job_id: &str, job_type: ProgressJobType) {
+    let event = ProgressEvent {
+        job_id: job_id.to_string(),
+        job_type,
+        stage: "cancelled".to_string(),
+        current: 0,
+        total: None,
+        status: ProgressStatus::Failed,
+        message: Some("Job was cancelled".to_string()),
+    };
+    let _ = redis.publish_progress(job_id, &event).await;
 }

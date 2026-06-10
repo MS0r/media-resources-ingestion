@@ -111,8 +111,7 @@ async fn main() -> Result<(), ToolError> {
             if err_msg.contains("connect") || err_msg.contains("transport") {
                 eprintln!(
                     "{}",
-                    "Is the ingest server running? Try `ingest server` or `ingest-server`"
-                        .yellow()
+                    "Is the ingest server running? Try `ingest server` or `ingest-server`".yellow()
                 );
             }
 

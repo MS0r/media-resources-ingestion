@@ -1,7 +1,7 @@
 use crate::{
     error::ToolError,
     handlers::jobs::{Batch, ChunkJob, FileJob, JobKind},
-    models::{ChunkRef, JobStatusFilter},
+    models::{ChunkRef, JobStatusFilter, ProgressEvent, ProgressJobType, ProgressStatus},
     services::mongo::MongoService,
 };
 use redis::{AsyncCommands, Client, aio::MultiplexedConnection};
@@ -16,12 +16,12 @@ pub struct RedisService {
 
 impl RedisService {
     pub fn new(
-        redis_url: &str,
+        redis_uri: &str,
         running_job_ttl_secs: u64,
         max_retries: u8,
         backoff_secs: Vec<u64>,
     ) -> Result<Self, redis::RedisError> {
-        let client = Client::open(redis_url)?;
+        let client = Client::open(redis_uri)?;
         Ok(Self {
             client,
             running_job_ttl_secs,
@@ -463,6 +463,77 @@ impl RedisService {
         }
 
         Ok(cleaned)
+    }
+
+    /// Publish a progress event to the job's progress channel.
+    /// Idempotent: if no subscriber is listening, the PUBLISH is a no-op.
+    pub async fn publish_progress(
+        &self,
+        job_id: &str,
+        event: &ProgressEvent,
+    ) -> Result<(), ToolError> {
+        let mut conn = self.get_connection().await?;
+        let channel = format!("jobs:progress:{job_id}");
+        let payload = serde_json::to_string(event)?;
+        let _: () = conn.publish(channel, payload).await?;
+        Ok(())
+    }
+}
+
+/// Lightweight handle for publishing progress events from a job handler.
+/// Clonable and cheap — holds only a job_id and a clone of `Arc<RedisService>`.
+#[derive(Clone)]
+pub struct ProgressReporter {
+    job_id: String,
+    redis: RedisService,
+}
+
+impl ProgressReporter {
+    pub fn new(job_id: String, redis: RedisService) -> Self {
+        Self { job_id, redis }
+    }
+
+    pub async fn report(
+        &self,
+        stage: &str,
+        current: u32,
+        total: Option<u32>,
+        message: Option<&str>,
+    ) {
+        self.publish(ProgressStatus::Running, stage, current, total, message)
+            .await;
+    }
+
+    pub async fn done(&self, message: Option<&str>) {
+        self.publish(ProgressStatus::Done, "done", 1, Some(1), message)
+            .await;
+    }
+
+    pub async fn fail(&self, reason: &str) {
+        self.publish(ProgressStatus::Failed, "failed", 0, None, Some(reason))
+            .await;
+    }
+
+    async fn publish(
+        &self,
+        status: ProgressStatus,
+        stage: &str,
+        current: u32,
+        total: Option<u32>,
+        message: Option<&str>,
+    ) {
+        let event = ProgressEvent {
+            job_id: self.job_id.clone(),
+            job_type: ProgressJobType::FileJob,
+            stage: stage.to_string(),
+            current,
+            total,
+            status,
+            message: message.map(|s| s.to_string()),
+        };
+        if let Err(e) = self.redis.publish_progress(&self.job_id, &event).await {
+            tracing::warn!(job_id = %self.job_id, error = %e, "Failed to publish progress");
+        }
     }
 }
 

@@ -180,6 +180,23 @@ impl MongoService {
         Ok(job)
     }
 
+    pub async fn complete_chunk_job(&self, job_id: &str) -> Result<(), ToolError> {
+        let client = self.client().await?;
+        let collection: Collection<ChunkJob> = client.collection("chunks_jobs");
+
+        let complete_job = serialize_to_bson(&JobStatus::Completed {
+            finished_at: Utc::now(),
+        })?;
+        collection
+            .update_one(
+                doc! { "_id": job_id },
+                doc! { "$set": { "status": complete_job } },
+            )
+            .await?;
+
+        Ok(())
+    }
+
     pub async fn list_jobs(
         &self,
         filter_status: Option<JobStatusFilter>,

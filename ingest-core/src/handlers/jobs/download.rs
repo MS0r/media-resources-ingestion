@@ -1,13 +1,18 @@
-use crate::{error::JobError, models::Resource};
+use crate::{
+    error::JobError,
+    handlers::jobs::{JobEnvelope, types::DownloadInfo},
+    models::Resource,
+};
 use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 use url::Url;
-use wreq::Response;
+use wreq::{
+    Client, RequestBuilder, Response,
+    header::{ACCEPT_RANGES, AUTHORIZATION, CONTENT_TYPE, COOKIE, HeaderValue, RANGE, REFERER},
+};
 
 use super::{FileJob, expand_path};
-use crate::handlers::jobs::JobEnvelope;
-use crate::handlers::jobs::types::DownloadInfo;
 
 pub(crate) struct HeadInfo {
     pub content_length: Option<u64>,
@@ -55,43 +60,27 @@ pub(crate) fn extract_file_job(job: &JobEnvelope) -> Result<&FileJob, JobError> 
     }
 }
 
-fn build_wreq_client() -> Result<wreq::Client, wreq::Error> {
-    let mut default_headers = wreq::header::HeaderMap::new();
-    default_headers.insert(
-        wreq::header::ACCEPT,
-        wreq::header::HeaderValue::from_static(
-            "video/webm,video/mp4,application/octet-stream,image/*,*/*;q=0.8",
-        ),
-    );
-
-    wreq::Client::builder()
-        .emulation(wreq_util::Emulation::Chrome124)
-        .default_headers(default_headers)
-        .build()
-}
-
-fn apply_auth_headers(
-    mut request: wreq::RequestBuilder,
-    resource: &Resource,
-) -> wreq::RequestBuilder {
+fn apply_auth_headers(mut request: RequestBuilder, resource: &Resource) -> RequestBuilder {
     let origin = resource.url.origin();
-    if let Ok(val) = wreq::header::HeaderValue::from_str(&origin.ascii_serialization()) {
-        request = request.header(wreq::header::REFERER, val);
+    if let Ok(val) = HeaderValue::from_str(&origin.ascii_serialization()) {
+        request = request.header(REFERER, val);
     }
     if let Some(headers) = &resource.config.as_ref().and_then(|c| c.headers.as_ref()) {
         if let Some(auth) = &headers.authorization {
-            request = request.header(wreq::header::AUTHORIZATION, auth);
+            request = request.header(AUTHORIZATION, auth);
         }
         if let Some(cookie) = &headers.cookie {
-            request = request.header(wreq::header::COOKIE, cookie);
+            request = request.header(COOKIE, cookie);
         }
     }
     request
 }
 
 /// HEAD preflight — get Content-Length and Accept-Ranges without downloading.
-pub(crate) async fn initiate_head(resource: &Resource) -> Result<HeadInfo, JobError> {
-    let client = build_wreq_client()?;
+pub(crate) async fn initiate_head(
+    resource: &Resource,
+    client: &Client,
+) -> Result<HeadInfo, JobError> {
     let request = apply_auth_headers(client.head(resource.url.as_str()), resource);
     let response = request.send().await?;
 
@@ -105,13 +94,13 @@ pub(crate) async fn initiate_head(resource: &Resource) -> Result<HeadInfo, JobEr
     let content_length = response.content_length();
     let accept_ranges = response
         .headers()
-        .get(wreq::header::ACCEPT_RANGES)
+        .get(ACCEPT_RANGES)
         .and_then(|v| v.to_str().ok())
         .map_or(false, |v| v.contains("bytes"));
 
     let mime_type = response
         .headers()
-        .get(wreq::header::CONTENT_TYPE)
+        .get(CONTENT_TYPE)
         .and_then(|ct| ct.to_str().ok())
         .and_then(|ct| ct.split(';').next())
         .map_or("application/octet-stream".to_string(), |s| {
@@ -132,22 +121,20 @@ pub(crate) async fn initiate_range_download(
     offset_end: u64,
     authorization: Option<&str>,
     cookie: Option<&str>,
-) -> Result<Response, JobError> {
-    let client = build_wreq_client()?;
+    client: &Client,
+) -> Result<(Response, String), JobError> {
     let range_val = format!("bytes={}-{}", offset_start, offset_end);
-    let mut request = client
-        .get(url.as_str())
-        .header(wreq::header::RANGE, &range_val);
+    let mut request = client.get(url.as_str()).header(RANGE, &range_val);
 
     let origin = url.origin();
-    if let Ok(val) = wreq::header::HeaderValue::from_str(&origin.ascii_serialization()) {
-        request = request.header(wreq::header::REFERER, val);
+    if let Ok(val) = HeaderValue::from_str(&origin.ascii_serialization()) {
+        request = request.header(REFERER, val);
     }
     if let Some(auth) = authorization {
-        request = request.header(wreq::header::AUTHORIZATION, auth);
+        request = request.header(AUTHORIZATION, auth);
     }
     if let Some(cookie) = cookie {
-        request = request.header(wreq::header::COOKIE, cookie);
+        request = request.header(COOKIE, cookie);
     }
 
     let response = request.send().await?;
@@ -159,7 +146,16 @@ pub(crate) async fn initiate_range_download(
         )));
     }
 
-    Ok(response)
+    let mime_type = response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|ct| ct.to_str().ok())
+        .and_then(|ct| ct.split(';').next())
+        .map_or("application/octet-stream".to_string(), |s| {
+            s.trim().to_string()
+        });
+
+    Ok((response, mime_type))
 }
 
 /// Stream response body to a temp file, hashing as we go.
@@ -255,8 +251,8 @@ pub(crate) async fn download_range_chunk(
 
 pub(crate) async fn initiate_download(
     resource: &Resource,
+    client: &Client,
 ) -> Result<(Response, DownloadInfo), JobError> {
-    let client = build_wreq_client()?;
     let request = apply_auth_headers(client.get(resource.url.as_str()), resource);
     let response = request.send().await?;
 
@@ -278,7 +274,7 @@ pub(crate) async fn initiate_download(
 
     let mut mime_type = response
         .headers()
-        .get(wreq::header::CONTENT_TYPE)
+        .get(CONTENT_TYPE)
         .and_then(|ct| ct.to_str().ok())
         .and_then(|ct| ct.split(';').next())
         .map_or("application/octet-stream".to_string(), |s| {

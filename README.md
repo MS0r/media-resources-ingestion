@@ -1,55 +1,62 @@
 # ingest
 
-A Rust CLI for ingesting remote media resources into local storage, with deduplication, compression, job queuing, and metadata tracking.
+A distributed media ingestion pipeline: download remote resources over HTTP, deduplicate by SHA-256 hash, apply compression (image, video, generic archive), and store to local filesystem — all through a Redis-backed priority queue and gRPC API.
 
-## What It Does
+## Architecture
 
-- Reads an ingestion batch from a YAML file
-- Creates a batch document and one file job per resource in MongoDB
-- Queues jobs in Redis using priority scores (higher = higher priority)
-- Downloads each resource over HTTP with Chrome UA emulation
-- Streams downloads to local storage while computing a SHA-256 hash
-- Detects duplicate content by hash — skips storing if match exists
-- Applies image (WebP/AVIF) or video (H264/H265/AV1) compression
-- Tracks batch, job, and file metadata throughout the lifecycle
-- Supports `files list|get|download|delete`, `status`, `cancel`, `retry` commands
+```
+┌──────────────┐    gRPC     ┌──────────────────────────────────┐
+│  ingest-cli  │ ──────────> │        ingest-server             │
+│ (gRPC client)│             │  ┌────────────────────────────┐  │
+└──────────────┘             │  │   gRPC API (IngestService) │  │
+                             │  └────────────┬───────────────┘  │
+                             │  ┌────────────┴───────────────┐  │
+                             │  │   Auto-started Worker      │  │
+                             │  │   (scheduler_loop)         │  │
+                             │  └────────────┬───────────────┘  │
+                             └────────────────┼─────────────────┘
+                                              │
+                        ┌─────────────────────┼─────────────────┐
+                        │                     │                 │
+            ┌───────────▼────────────┐ ┌──────▼──────┐     ┌────▼────┐
+            |          Redis         │ |   MongoDB   │     │  Local  │
+            |                        │ |             |     │ Storage │
+            │ jobs:pending (zset)    │ | batches     │     │ (disk)  │
+            | jobs:state:*   (hash)  │ | files_jobs  │     └─────────┘
+            │ jobs:running:* (string)│ | files_meta  │
+            │ jobs:progress:* (pub)  │ | chunks_jobs │
+            | jobs:chunk_results:*   | └─────────────┘
+            └────────────────────────┘
+```
+
+All commands proxy through a gRPC server. The server auto-starts a background worker on boot. The CLI never talks to Redis or MongoDB directly.
 
 ## Requirements
 
 - Rust 2024 edition toolchain
-- Redis
-- MongoDB
-- Docker Compose (optional, for running Redis and MongoDB locally)
+- Redis + MongoDB (or `docker compose up -d`)
+- `ffmpeg` + `ffprobe` on PATH (for video compression)
+- `protoc` on PATH (proto compilation)
 
-## Local Services
+## Quick Start
 
 ```bash
-docker compose up -d    # Redis :6379, MongoDB :27017
+docker compose up -d                    # Redis :6379, MongoDB :27017
+cargo build -p ingest-cli               # or `cargo build` for full workspace
+ingest server                           # start gRPC server + worker
+ingest run config-test.yaml             # enqueue and follow progress
 ```
-
-## Environment Variables
-
-**Required** — no fallback. Set in `.env` at project root:
-
-```
-MONGODB_URI="mongodb://root:example@localhost:27017/ingestion?authSource=admin"
-REDIS_URI="redis://localhost:6379"
-RUST_BACKTRACE=full
-```
-
-Optional auth (set any env var to opt in):
-`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_S3_BUCKET`, `AWS_REGION`
-`GDRIVE_CLIENT_ID`, `GDRIVE_CLIENT_SECRET`, `GDRIVE_REFRESH_TOKEN`
-`DROPBOX_APP_KEY`, `DROPBOX_APP_SECRET`, `DROPBOX_REFRESH_TOKEN`
 
 ## Configuration
 
-Default TOML path: `.ingest/config.toml` (overridable via `--config`).
+Three layers merged per-field (**CLI > YAML > TOML**):
+
+### TOML (`.ingest/config.toml`)
 
 ```toml
 [scheduler]
 file_workers = 5
-chunk_workers = 20
+chunk_workers = 8
 max_pending_jobs = 10_000
 max_per_host = 2
 job_timeout_secs = 7200
@@ -62,7 +69,7 @@ max_compression_seconds = 300
 [storage]
 default_provider = "local"
 default_path = "~/downloads"
-chunk_size = "16MB"
+chunk_size = "128MB"
 temp_dir = "/tmp/ingest"
 
 [retry]
@@ -71,12 +78,10 @@ max_attempts = 3
 backoff_secs = [5, 30, 120]
 ```
 
-Logging: `-v` (INFO), `-vv` (DEBUG), `-vvv` (TRACE). `LOG_FORMAT=json` overrides CLI format. `INGEST_VERBOSE=n` env var overrides `-v` flags. `RUST_LOG` works normally via `tracing-subscriber`.
-
-## Ingestion YAML
+### YAML ingestion request
 
 ```yaml
-path: ~/downloads        # default dest path (flattened into default_dest)
+path: ~/downloads
 priority: 0
 chunk_size: 128MB
 compression_override: avif
@@ -88,6 +93,7 @@ resources:
     priority: 10
     config:
       quality: 90
+      compression_override: webp
   - url: https://example.com/video.mp4
     name: video
     config:
@@ -95,110 +101,154 @@ resources:
       quality: 25
 ```
 
-Top-level `provider`/`path` are `#[serde(flatten)]` into `IngestionConfig.default_dest`. Each resource inherits parent values (dest, compression, headers, priority) on a per-field basis — partial resource configs merge rather than being replaced.
+Per-resource configs inherit from parent on a per-field basis. `dest.path` is required per-resource after inheritance. Duplicate URLs are rejected at enqueue time.
 
-`dest.path` is **required per-resource** (after inheritance) — job fails with `"Missing destination path"` if absent.
+### Environment
 
-Duplicate URLs in YAML are rejected at bootstrap (exit code 2).
-
-## Usage
-
-```bash
-cargo build
-cargo run -- run config-test.yaml          # enqueue + execute
-cargo run -- enqueue config-test.yaml      # enqueue only, print Batch ID
-cargo run -- worker                        # standalone worker
-cargo run -- run config-test.yaml --dry-run # validate + preflight HEAD
-cargo run -- status batch <id>
-cargo run -- cancel batch <id>
-cargo run -- files list
-cargo run -- files get <hash>
-cargo run -- files download <hash> <dest>
-cargo run -- --config path/to/config.toml run path/to/resources.yaml
-cargo run -- --help
-```
-
-## CLI Commands
-
-| Command | Behavior |
-|---|---|
-| `ingest run <yaml>` | Phase 1 (enqueue) + Phase 2 (follow mode) |
-| `ingest run <yaml> --no-follow` | Phase 1 only, print Batch ID |
-| `ingest enqueue <yaml>` | Same as `run --no-follow` |
-| `ingest worker` | Phase 2 only, standalone worker (Ctrl+C to stop) |
-| `ingest run <yaml> --dry-run` | Validate YAML + preflight HEAD, no download |
-| `ingest status batch\|job\|jobs` | Inspect batches and jobs |
-| `ingest cancel batch\|job` | Cancel pending jobs |
-| `ingest retry job <id>` | Retry a failed job |
-| `ingest files list\|get\|download\|delete` | Browse and manage stored files |
-
-`--follow` / `--no-follow` are mutual CLI overrides. Piped stdout auto-disables follow.
-
-## Architecture
-
-Two-phase separation via Redis:
-
-- **Phase 1 (enqueue)**: Parse YAML, validate, create batch + FileJobs in MongoDB, push to Redis `jobs:pending` sorted set
-- **Phase 2 (worker)**: `scheduler_loop` — `BZPOPMAX` from Redis, acquire semaphore, download, hash, dedup, compress, store
-
-`ingest run <yaml>` calls both phases sequentially. Multiple workers can dequeue independently. `jobs:running:<id>` TTL handles crash detection.
-
-## Data Model
-
-MongoDB database `ingestion`:
-
-| Collection | Purpose |
-|---|---|
-| `batches` | One document per ingestion run |
-| `files_jobs` | One document per resource, tracks job lifecycle |
-| `files_metadata` | File hash, storage path, size, MIME type, dedup counter |
-| `chunks_jobs` | Reserved for chunk-level jobs |
-
-### Redis keys
+Set in `.env` at project root (no fallback):
 
 ```
-jobs:pending         sorted set  (score=priority, member="file:<id>"|"chunk:<id>")
-jobs:running:<id>    string      worker_id (per-job key with TTL)
-jobs:state:<id>      hash        kind, status, retry_count, error
-jobs:chunks:<hash>   set         completed chunk hashes (crash recovery)
-batches:state:<id>   hash        status
+MONGODB_URI="mongodb://root:example@localhost:27017/ingestion?authSource=admin"
+REDIS_URI="redis://localhost:6379"
+RUST_BACKTRACE=full
 ```
 
-## Runtime Flow
+Optional storage auth: `AWS_*`, `GDRIVE_*`, `DROPBOX_*` env vars.
 
-1. CLI loads `.env`, initialises tracing, parses args
-2. `run` loads TOML config and YAML ingestion request
-3. Redis and MongoDB clients are initialised
-4. Batch is created with a generated UUID
-5. Each YAML resource becomes a pending file job
-6. File jobs written to MongoDB and enqueued in Redis
-7. Scheduler dequeues highest-priority pending job
-8. Worker downloads resource, streams to temp, SHA-256 hashes, detects MIME by bytes
-9. If file hash exists in MongoDB → duplicate, temp file deleted, counter incremented
-10. If new → image/video compression (if configured), upload to storage, metadata recorded
+### Logging
+
+`-v` (INFO), `-vv` (DEBUG), `-vvv` (TRACE). `--quiet` sets `ingest-cli=error`.
+`LOG_FORMAT=json` for structured output. `INGEST_VERBOSE=n` env overrides `-v`.
+Piped stdout auto-switches to JSON format.
+
+## Pipeline
+
+### Phase 1 — Enqueue
+
+1. Parse YAML → `IngestionConfig`, merge with TOML config + CLI args
+2. Generate batch UUID
+3. For each resource: merge parent values (priority, compression, headers, dest), create `FileJob` in MongoDB, push `"file:<uuid>"` to Redis `jobs:pending` sorted set (score = priority)
+4. Save batch document in MongoDB
+
+### Phase 2 — Worker (scheduler_loop)
+
+The `scheduler_loop` runs in a single task, dispatching jobs to a concurrent pool:
+
+1. **Dequeue**: `BZPOPMAX` from `jobs:pending` with 2s timeout — highest priority first (higher score = higher priority)
+2. **File job execution**: acquires file semaphore permit → HEAD preflight → if size > threshold (512MB) and server supports Range → split into `ChunkJob`s and enqueue them → otherwise GET full file → stream to temp with SHA-256 hashing → dedup check via MongoDB upsert → compress (if applicable) → upload → save metadata
+3. **Chunk job execution**: acquires chunk semaphore permit → Range download → compress (gzip default) → upload → register `ChunkRef` in Redis → on last chunk: build `Manifest`, compute Merkle root hash, finalize parent `FileJob`
+4. **Heartbeat**: 10s lease renewal on `jobs:running:<id>` (TTL 3600s)
+5. **Retry**: exponential backoff [5s, 30s, 120s], max 3 attempts, score = 0 on retry
+6. **Crash recovery**: worker startup scans `jobs:running:*` keys, re-enqueues orphans as pending
+
+### Deduplication
+
+- SHA-256 hash computed during streaming download
+- MongoDB `files_metadata` has unique index on `file_hash`
+- `find_one_and_update` with upsert: returns `Inserted` or `Duplicate`
+- On duplicate: temp file deleted, `duplicate_reference_count` incremented, job completed without new metadata
+
+## Compression
+
+| Category | Strategies | Library | Execution |
+|---|---|---|---|
+| **Image** | AVIF, WebP, Lossless WebP | `image` crate (async) | Converts JPEG/PNG/GIF; keeps original if compressed is larger |
+| **Video** | H.264 (libx264), H.265 (libx265), AV1 (libaom-av1) | `ffmpeg-next` | `spawn_blocking`, CRF from quality, timeout via cancelled flag |
+| **Generic** | gzip, zstd, zip, 7z, original format, none | `flate2`, `zstd`, `zip`, `sevenz-rust` | `spawn_blocking`; keeps original if not smaller |
+
+`compression_override` per resource: `avif`, `webp`, `losslesswebp` (image); `h264`, `h265`, `av1` (video); `gzip`, `zstd`, `zip`, `sevenz`, `none`, `originalformat` (generic).
 
 ## MIME Detection
 
-Three-tier: HTTP `Content-Type` header → URL extension via `mime_guess` → bytes-based via `mimetype_detector` (first 3072 bytes, ~550 formats via magic numbers). Tier 3 overrides earlier detections when unambiguous.
+Three-tier: HTTP `Content-Type` header → URL extension (`mime_guess`) → bytes magic numbers (`mimetype-detector`, first 3072 bytes, ~550 formats). Tier 3 overrides earlier when unambiguous.
+
+## Data Model
+
+### MongoDB (`ingestion` database)
+
+| Collection | Document | Key fields |
+|---|---|---|
+| `batches` | `Batch` | `_id`, `created_at`, `yaml_path`, `status`, `job_ids` |
+| `files_jobs` | `FileJob` | `_id`, `batch_id`, `resource`, `priority`, `status`, `retry_count`, `file_hash`, `error` |
+| `files_metadata` | `Metadata` | `file_hash` (unique index), `original_url`, `storage_provider`, `storage_path`, `original_file_size`, `compressed_file_size`, `compression_ratio`, `mime_type`, `chunk_manifest`, `duplicate_reference_count` |
+| `chunks_jobs` | `ChunkJob` | `_id`, `parent_job_id`, `chunk_index`, `offset_start`, `offset_end`, `url`, `auth`, `dest_path`, `total_chunks`, `compression_strategy` |
+
+### Redis keys
+
+| Key pattern | Type | Purpose |
+|---|---|---|
+| `jobs:pending` | ZSET | Priority queue (score = priority, member = `"file:\|<id>"` / `"chunk:\|<id>"`) |
+| `jobs:running:<id>` | String | Worker lease (TTL = 3600s, heartbeat every 10s) |
+| `jobs:state:<id>` | Hash | `kind`, `status`, `retry_count`, `error`, `retry_after` |
+| `jobs:progress:<id>` | Pub/Sub | Progress events (JSON `ProgressEvent`) |
+| `jobs:chunks:<hash>` | Set | Completed chunk hashes (crash recovery) |
+| `jobs:chunk_results:<parent_id>` | Hash | `chunk_index` → JSON `ChunkRef` |
+| `jobs:counter:<parent_id>` | String | Atomic chunk completion counter |
+| `batches:state:<id>` | Hash | Batch status |
+
+## CLI (gRPC client)
+
+```
+ingest run <yaml>                  # enqueue + follow progress
+ingest run <yaml> --dry-run        # validate + preflight HEAD only
+ingest run <yaml> --no-follow      # enqueue only, print Batch ID
+ingest server                      # start gRPC server + auto-worker
+ingest status batch <id>           # batch status from MongoDB
+ingest status job <id>             # single job detail
+ingest status jobs [--filter] [--limit]  # list jobs
+ingest cancel batch <id>           # cancel all pending jobs in batch
+ingest cancel job <id>             # cancel single pending job
+ingest retry job <id>              # re-enqueue a failed job
+ingest files list [--mime] [--limit]     # list stored file metadata
+ingest files get <hash>            # get file metadata by hash
+ingest files delete <hash>         # delete file metadata
+```
+
+`--server` / `INGEST_SERVER_ADDR` (default `[::1]:50051`) sets gRPC endpoint.
+
+## Chunked Downloads
+
+Files larger than `compression.threshold_mb` (512 MB default) are automatically split into chunk jobs if the server supports HTTP Range requests:
+
+1. HEAD preflight checks `Accept-Ranges: bytes` and `Content-Length`
+2. Chunk size from `storage.chunk_size` (e.g. `128MB`)
+3. Each `ChunkJob` carries its own URL, auth headers, dest path — no parent lookup at download time
+4. Chunks are compressed individually (gzip by default), uploaded, and tracked in Redis
+5. On last chunk: all `ChunkRef`s sorted by index → Merkle root (SHA-256 of concatenated chunk hashes) → `Metadata` with `Manifest` → parent `FileJob` finalized
+6. Finalization race: two chunks may simultaneously finalize → second gets Mongo duplicate-key error (logged and ignored)
+
+## Storage Providers
+
+| Provider | Status |
+|---|---|
+| **Local** | Fully implemented — upload, download, health check |
+| GDrive | Upload partially implemented |
+| Dropbox | Stub (`todo!()`) |
+| S3 | Stub (`Err("Not implemented")`) |
+
+## Test commands
+
+```bash
+cargo test -p ingest-core --lib              # unit tests (no deps)
+./run_test.sh                                # docker compose + cargo run config-test.yaml
+./run-integration-tests.sh                   # docker compose + integration tests
+cargo fmt && cargo check
+```
+
+## Exit codes
+
+| Code | Meaning |
+|---|---|
+| 0 | Success |
+| 1 | Job failure |
+| 2 | Config/validation error |
+| 3 | Backend connectivity error |
+| 4 | Auth error |
+| 130 | SIGINT (Ctrl+C) |
 
 ## Current Limitations
 
-- Only `LocalProvider` fully works; GDrive upload partially implemented, Dropbox/S3 stubs
-- Chunk job execution is not wired (range download/upload)
-- Image (WebP/AVIF) and video (H264/H265/AV1) compression work; PDF/zstd not implemented
-- FTP URL scheme accepted for preflight, no actual download
-
-## Tests
-
-```bash
-cargo test --lib                        # unit tests only (no external deps)
-cargo test                              # all tests (~100, integration fails without services)
-./run-integration-tests.sh              # docker compose up → wait → run integration tests
-cargo test --test run_integration -- --nocapture  # manual, requires MongoDB + Redis
-```
-
-## Development
-
-```bash
-cargo fmt && cargo check
-```
+- Only `LocalProvider` works; GDrive partial, Dropbox/S3 stubs
+- Video compression runs synchronously in `spawn_blocking` (ffmpeg bindings)
+- FTP URL accepted for preflight, no actual download
+- PDF compression not implemented

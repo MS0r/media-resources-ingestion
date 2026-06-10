@@ -5,7 +5,7 @@ compression_override: avif
 headers:
   Authorization: Bearer Token
 resources:
-  - url: https://download946.mediafire.com/jxc8s5wyjvsgLecVSB0oSnsI-ky1vD494XKHyNITOUfhpdrfegPfoMNQRNKqF2C-MfgnQ4dpDdL6S7tXzyomRSGt4OMXHXoMU9NLanxTIseGGoYbyNGoJY97xpHQwHzUexrfuj9f4crmgXnxe118_sFXLCLtFDbSIzOxr66Lq6Y/toqgel4eqp4fq7u/LEG1OBat1manLotD5arkKn8ight-elamigos.part1.rar
+  - url: https://download946.mediafire.com/zad6gg9933dg6zBW9WHzouSaAPJN2iV6X6YfjFoWNT9LTCbzbIurCVRYIdcIcz2I3dCwHrqs5LbyqGrkaMY1HfxlwtgVlrm6nijchuIUIKY0XlFaCYAWCOD_2AAQGIJrV9R4OghVqKpRmbZBsK_zYPMQQVhGUU9xjV_Y-1bWoKA/toqgel4eqp4fq7u/LEG1OBat1manLotD5arkKn8ight-elamigos.part1.rar
     name: batman
     priority: 10
     dest:

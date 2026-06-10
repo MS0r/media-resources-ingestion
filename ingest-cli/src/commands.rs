@@ -1,13 +1,16 @@
 use std::path::Path;
 
 use colored::*;
+use futures_util::StreamExt;
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use ingest_core::models::{ProgressEvent, ProgressStatus};
 use ingest_core::server::proto::ingest_service_client::IngestServiceClient;
 use ingest_core::server::proto::*;
 use tonic::transport::Endpoint;
 
 use crate::cli;
 
-type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 async fn connect(server_addr: &str) -> Result<IngestServiceClient<tonic::transport::Channel>> {
     let endpoint = Endpoint::from_shared(format!("http://{server_addr}"))?;
@@ -35,16 +38,168 @@ pub async fn handle_run(args: cli::RunArgs, server_addr: &str) -> Result<()> {
         return Ok(());
     }
 
-    println!("Batch ID: {}", resp.batch_id);
+    println!("{} {}", "Batch ID:".cyan(), resp.batch_id);
 
-    if args.follow {
+    let follow = args.follow || !args.no_follow;
+    if !follow {
         println!(
             "{}",
-            "Follow mode: use `ingest status batch <id>` to track progress"
-                .yellow()
+            "Use `ingest status batch <id>` to track progress".yellow()
         );
+        return Ok(());
     }
 
+    follow_batch(&resp.batch_id, server_addr).await
+}
+
+async fn follow_batch(batch_id: &str, server_addr: &str) -> Result<()> {
+    let redis_uri = std::env::var("REDIS_URI").map_err(|_| {
+        "REDIS_URI not set (required for follow mode)"
+            .red()
+            .to_string()
+    })?;
+    let redis_client = redis::Client::open(redis_uri.as_str())
+        .map_err(|e| format!("Redis connection failed: {e}"))?;
+
+    // Fetch job IDs from the batch
+    let mut client = connect(server_addr).await?;
+    let batch = client
+        .get_batch_status(GetBatchStatusRequest {
+            batch_id: batch_id.to_string(),
+        })
+        .await?
+        .into_inner();
+
+    let total_jobs = batch.job_ids.len();
+    if total_jobs == 0 {
+        println!("{}", "No jobs in batch".yellow());
+        return Ok(());
+    }
+
+    let mp = MultiProgress::new();
+    let mut handles = Vec::with_capacity(total_jobs);
+
+    for (i, job_id) in batch.job_ids.iter().enumerate() {
+        let pb = mp.add(ProgressBar::new_spinner());
+        pb.set_style(
+            ProgressStyle::default_spinner()
+                .template("{spinner:.green} [{elapsed}] {msg}")?
+                .tick_chars("⠁⠁⠉⠙⠚⠒⠂⠂⠒⠲⠴⠤⠄⠄⠤⠴⠲⠒⠂⠂⠒⠚⠙⠉⠈⠈"),
+        );
+        pb.enable_steady_tick(std::time::Duration::from_millis(80));
+        pb.set_message(format!("[{}/{}] Queued...", i + 1, total_jobs));
+
+        let rc = redis_client.clone();
+        let jid = job_id.clone();
+        handles.push(tokio::spawn(async move {
+            follow_job(&pb, &rc, &jid, i + 1, total_jobs).await
+        }));
+    }
+
+    let mut failed = false;
+    for h in handles {
+        if h.await.unwrap().is_err() {
+            failed = true;
+        }
+    }
+    mp.clear().ok();
+
+    if failed {
+        eprintln!("{}", "One or more jobs failed".red());
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// Subscribe to progress events for a single job and drive its indicatif bar.
+async fn follow_job(
+    pb: &ProgressBar,
+    redis_client: &redis::Client,
+    job_id: &str,
+    idx: usize,
+    total: usize,
+) -> Result<()> {
+    // Fallback poll: check if job already finished before we subscribed
+    let mut state_conn = redis_client
+        .get_multiplexed_async_connection()
+        .await
+        .map_err(|e| format!("Redis state check failed: {e}"))?;
+    let state_key = format!("jobs:state:{job_id}");
+    let status: Option<String> = redis::Cmd::hget(&state_key, "status")
+        .query_async(&mut state_conn)
+        .await?;
+    if let Some(ref s) = status {
+        match s.as_str() {
+            "completed" => {
+                pb.finish_with_message(format!("[{}/{}] ✓ Completed", idx, total));
+                return Ok(());
+            }
+            "failed" => {
+                let err: Option<String> = redis::Cmd::hget(&state_key, "error")
+                    .query_async(&mut state_conn)
+                    .await?;
+                pb.finish_with_message(format!(
+                    "[{}/{}] ✗ Failed: {}",
+                    idx,
+                    total,
+                    err.unwrap_or_default()
+                ));
+                return Err("Job failed".into());
+            }
+            _ => {}
+        }
+    }
+    drop(state_conn);
+
+    // Subscribe to progress channel
+    let mut pubsub = redis_client
+        .get_async_pubsub()
+        .await
+        .map_err(|e| format!("Redis subscribe failed: {e}"))?;
+    let channel = format!("jobs:progress:{job_id}");
+    pubsub.subscribe(&channel).await?;
+
+    let mut stream = pubsub.on_message();
+    let label = format!("[{}/{}]", idx, total);
+
+    while let Some(msg) = stream.next().await {
+        let payload: String = msg.get_payload().unwrap_or_else(|_| String::new());
+        let Ok(event) = serde_json::from_str::<ProgressEvent>(&payload) else {
+            continue;
+        };
+
+        match event.status {
+            ProgressStatus::Done => {
+                pb.finish_with_message(format!(
+                    "{} ✓ {}",
+                    label,
+                    event.message.unwrap_or_else(|| "Done".into())
+                ));
+                return Ok(());
+            }
+            ProgressStatus::Failed => {
+                pb.finish_with_message(format!(
+                    "{} ✗ {}",
+                    label,
+                    event.message.unwrap_or_else(|| "Failed".into())
+                ));
+                return Err("Job failed".into());
+            }
+            ProgressStatus::Retrying => {
+                pb.set_message(format!(
+                    "{} ↻ {}",
+                    label,
+                    event.message.unwrap_or(event.stage)
+                ));
+            }
+            ProgressStatus::Running => {
+                let msg = event.message.clone().unwrap_or_else(|| event.stage.clone());
+                pb.set_message(format!("{} {}", label, msg));
+            }
+        }
+    }
+
+    pb.finish_with_message(format!("{} Disconnected", label));
     Ok(())
 }
 
@@ -213,7 +368,10 @@ pub async fn handle_files(scope: cli::FilesScope, server_addr: &str) -> Result<(
         }
         cli::FilesScope::Delete { hash: _, yes } => {
             if !yes {
-                print!("{}", "Are you sure you want to delete this file? (y/N) ".yellow());
+                print!(
+                    "{}",
+                    "Are you sure you want to delete this file? (y/N) ".yellow()
+                );
                 std::io::Write::flush(&mut std::io::stdout()).ok();
                 let mut input = String::new();
                 std::io::stdin().read_line(&mut input)?;

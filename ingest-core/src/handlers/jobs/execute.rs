@@ -62,7 +62,6 @@ async fn spawn_chunk_jobs(
             _ => None,
         });
 
-
     let resource_name = resource.name.clone().unwrap_or_else(|| {
         filename_from_url(&resource.url)
             .0
@@ -125,9 +124,13 @@ impl super::JobHandler for FileJobHandler {
         let file_job = extract_file_job(&ctx.job)?;
         let resource = &file_job.resource;
         let threshold_bytes = ctx.config.compression_threshold_mb * 1024 * 1024;
+        let pr = ctx.progress.as_ref();
 
         // ── Phase 1: HEAD preflight ──────────────────────────────────────
-        let (head_size, head_ranges) = match initiate_head(resource).await {
+        if let Some(pr) = pr {
+            pr.report("preflight", 1, Some(7), None).await;
+        }
+        let (head_size, head_ranges) = match initiate_head(resource, &ctx.http_client).await {
             Ok(info) => (info.content_length, info.accept_ranges),
             Err(e) => {
                 tracing::warn!(error = %e, "HEAD preflight failed, falling back to GET");
@@ -138,6 +141,10 @@ impl super::JobHandler for FileJobHandler {
         if let Some(size) = head_size {
             if size > threshold_bytes {
                 if head_ranges {
+                    if let Some(pr) = pr {
+                        pr.report("splitting", 2, Some(7), Some("Spawning chunk jobs"))
+                            .await;
+                    }
                     let chunks = spawn_chunk_jobs(file_job, size, &ctx.config).await?;
                     return Ok(JobOutcome::SpawnedChunks(chunks));
                 }
@@ -149,7 +156,10 @@ impl super::JobHandler for FileJobHandler {
         }
 
         // ── Phase 2: GET + stream ────────────────────────────────────────
-        let (response, mut download) = initiate_download(resource).await?;
+        if let Some(pr) = pr {
+            pr.report("download", 2, Some(7), None).await;
+        }
+        let (response, mut download) = initiate_download(resource, &ctx.http_client).await?;
 
         let resp_content_length = response.content_length();
         let resp_accept_ranges = response
@@ -162,6 +172,10 @@ impl super::JobHandler for FileJobHandler {
         if let Some(resp_size) = resp_content_length {
             if resp_size > threshold_bytes && resp_accept_ranges {
                 drop(response);
+                if let Some(pr) = pr {
+                    pr.report("splitting", 2, Some(7), Some("Spawning chunk jobs"))
+                        .await;
+                }
                 let chunks = spawn_chunk_jobs(file_job, resp_size, &ctx.config).await?;
                 return Ok(JobOutcome::SpawnedChunks(chunks));
             }
@@ -177,7 +191,7 @@ impl super::JobHandler for FileJobHandler {
         )
         .await?;
 
-        let (temp_path, hash_hex, mime_type, byte_count) = match stream_result {
+        let (temp_path, hash_hex, _mime_type, byte_count) = match stream_result {
             StreamResult::Completed {
                 temp_path,
                 hash,
@@ -191,14 +205,53 @@ impl super::JobHandler for FileJobHandler {
                 }
                 (temp_path, hash, download.mime_type.clone(), byte_count)
             }
-            StreamResult::ThresholdExceeded { .. } => {
-                unreachable!("Threshold not set for non-chunked download")
+            StreamResult::ThresholdExceeded { byte_count } => {
+                tracing::info!(
+                    "Stream exceeded threshold ({} > {}), switching to Range",
+                    byte_count,
+                    threshold_bytes
+                );
+
+                if resp_accept_ranges {
+                    let chunks = spawn_chunk_jobs(file_job, byte_count, &ctx.config).await?;
+                    return Ok(JobOutcome::SpawnedChunks(chunks));
+                }
+
+                // Probe: send a Range: 0-0 to check server support
+                let auth = resource
+                    .config
+                    .as_ref()
+                    .and_then(|c| c.headers.as_ref())
+                    .and_then(|h| h.authorization.as_deref());
+                let cookie = resource
+                    .config
+                    .as_ref()
+                    .and_then(|c| c.headers.as_ref())
+                    .and_then(|h| h.cookie.as_deref());
+
+                match initiate_range_download(&resource.url, 0, 0, auth, cookie, &ctx.http_client).await {
+                    Ok((probe,_)) if probe.status() == 206 => {
+                        drop(probe);
+                        let chunks = spawn_chunk_jobs(file_job, byte_count, &ctx.config).await?;
+                        return Ok(JobOutcome::SpawnedChunks(chunks));
+                    }
+                    _ => {
+                        return Err(JobErrorOutcome::Fatal(format!(
+                            "File exceeds {} MB threshold (streamed {} bytes) but server does not \
+                         support Range requests — cannot chunk",
+                            ctx.config.compression_threshold_mb, byte_count
+                        )));
+                    }
+                }
             }
         };
 
         download.content_length = byte_count;
 
         // ── Phase 4: dedup check ─────────────────────────────────────────
+        if let Some(pr) = pr {
+            pr.report("dedup", 3, Some(7), None).await;
+        }
         match ctx.db.upsert_file_metadata(&hash_hex).await? {
             UpsertResult::Duplicate(existing) => {
                 let outcome = handle_duplicate(&temp_path, &existing.file_hash).await?;
@@ -208,6 +261,9 @@ impl super::JobHandler for FileJobHandler {
         }
 
         // ── Phase 5: handle (compress + upload + metadata) ───────────────
+        if let Some(pr) = pr {
+            pr.report("compressing", 5, Some(7), None).await;
+        }
         handle_new_file(ctx, file_job, download, temp_path, hash_hex).await
     }
 }
@@ -228,12 +284,13 @@ impl super::JobHandler for ChunkJobHandler {
         let auth = chunk_job.authorization.as_deref();
         let cookie = chunk_job.cookie.as_deref();
 
-        let response = initiate_range_download(
+        let (response, mime) = initiate_range_download(
             &chunk_job.url,
             chunk_job.offset_start,
             chunk_job.offset_end,
             auth,
             cookie,
+            &ctx.http_client,
         )
         .await?;
 
@@ -286,7 +343,7 @@ impl super::JobHandler for ChunkJobHandler {
             offset_end: chunk_job.offset_end,
         };
 
-        Ok(JobOutcome::ChunkCompleted(chunk_ref))
+        Ok(JobOutcome::ChunkCompleted(chunk_ref, mime))
     }
 }
 
