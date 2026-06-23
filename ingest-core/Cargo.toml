@@ -44,6 +44,10 @@ zstd = "0.13.3"
 sevenz-rust = "0.6.1"
 tonic = "0.12"
 prost = "0.13"
+aws-sdk-s3 = { version = "1", default-features = false, features = ["behavior-version-latest", "rustls"] }
+aws-config = { version = "1", default-features = false, features = ["rustls", "behavior-version-latest"] }
+aws-credential-types = "1"
+aws-sigv4 = "1"
 
 [build-dependencies]
 tonic-build = "0.12"

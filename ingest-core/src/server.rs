@@ -12,6 +12,12 @@ use crate::{
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 
+/// Helper to convert an arbitrary Display error into `Status::internal`.
+/// Used instead of orphan-rule-violating `From` impls for foreign error types.
+fn internal_err<E: std::fmt::Display>(e: E) -> Status {
+    Status::internal(e.to_string())
+}
+
 pub mod proto {
     tonic::include_proto!("ingest");
 
@@ -36,8 +42,7 @@ impl IngestServer {
         let toml_config = load_toml(&toml_path.to_path_buf())?;
 
         let mongo = MongoService::new(&mongo_uri).await?;
-        let redis =
-            RedisService::new(&redis_uri, 3600, 3, vec![5, 30, 120]).map_err(ToolError::from)?;
+        let redis = RedisService::new(&redis_uri, 3600, 3, vec![5, 30, 120])?;
 
         Ok(Self {
             mongo,
@@ -86,8 +91,7 @@ impl IngestServer {
 }
 
 fn load_yaml_from_str(yaml_content: &str) -> Result<models::IngestionConfig, ToolError> {
-    let request: models::IngestionConfig = serde_yaml::from_str(yaml_content)
-        .map_err(|e| ToolError::ConfigError(format!("YAML parse error: {e}")))?;
+    let request: models::IngestionConfig = serde_yaml::from_str(yaml_content)?;
     Ok(request)
 }
 
@@ -98,19 +102,15 @@ impl IngestService for IngestServer {
         request: Request<EnqueueRequest>,
     ) -> Result<Response<EnqueueResponse>, Status> {
         let req = request.into_inner();
-        let (config, resources) = self
-            .build_app_config(
-                &req.yaml_content,
-                req.priority,
-                req.file_workers,
-                req.dry_run,
-            )
-            .map_err(|e| Status::invalid_argument(format!("config error: {e}")))?;
+        let (config, resources) = self.build_app_config(
+            &req.yaml_content,
+            req.priority,
+            req.file_workers,
+            req.dry_run,
+        )?;
 
         let job_count = resources.len() as i32;
-        let batch_id = bootstrap::enqueue(&config, &resources)
-            .await
-            .map_err(|e| Status::internal(format!("enqueue failed: {e}")))?;
+        let batch_id = bootstrap::enqueue(&config, &resources).await?;
 
         Ok(Response::new(EnqueueResponse {
             batch_id,
@@ -127,7 +127,7 @@ impl IngestService for IngestServer {
             .mongo
             .get_batch(&batch_id)
             .await
-            .map_err(|e| Status::internal(e.to_string()))?
+            .map_err(internal_err)?
             .ok_or_else(|| Status::not_found(format!("batch {batch_id} not found")))?;
 
         Ok(Response::new(BatchStatus {
@@ -148,7 +148,7 @@ impl IngestService for IngestServer {
             .mongo
             .get_file_job(&job_id)
             .await
-            .map_err(|e| Status::internal(e.to_string()))?
+            .map_err(internal_err)?
             .ok_or_else(|| Status::not_found(format!("job {job_id} not found")))?;
 
         Ok(Response::new(JobDetail {
@@ -195,7 +195,7 @@ impl IngestService for IngestServer {
             .mongo
             .list_jobs(filter, limit)
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(internal_err)?;
 
         let job_details = jobs
             .into_iter()
@@ -218,17 +218,10 @@ impl IngestService for IngestServer {
         request: Request<CancelJobRequest>,
     ) -> Result<Response<ActionResponse>, Status> {
         let job_id = request.into_inner().job_id;
-        let cancelled = self
-            .mongo
-            .cancel_job(&job_id)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+        let cancelled = self.mongo.cancel_job(&job_id).await.map_err(internal_err)?;
 
         if cancelled {
-            self.redis
-                .cancel_job(&job_id)
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?;
+            self.redis.cancel_job(&job_id).await.map_err(internal_err)?;
             publish_cancelled(&self.redis, &job_id, ProgressJobType::FileJob).await;
         }
 
@@ -252,18 +245,18 @@ impl IngestService for IngestServer {
             .mongo
             .cancel_batch_jobs(&batch_id)
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(internal_err)?;
 
         if let Some(batch) = self
             .mongo
             .get_batch(&batch_id)
             .await
-            .map_err(|e| Status::internal(e.to_string()))?
+            .map_err(internal_err)?
         {
             self.redis
                 .cancel_jobs(&batch.job_ids)
                 .await
-                .map_err(|e| Status::internal(e.to_string()))?;
+                .map_err(internal_err)?;
             for job_id in &batch.job_ids {
                 publish_cancelled(&self.redis, job_id, ProgressJobType::FileJob).await;
             }
@@ -284,7 +277,7 @@ impl IngestService for IngestServer {
             .mongo
             .retry_failed_job(&job_id)
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(internal_err)?;
 
         if retried {
             let _ = self
@@ -338,7 +331,7 @@ impl IngestService for IngestServer {
             .mongo
             .list_files(mime, provider, limit)
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(internal_err)?;
 
         let file_metadatas: Vec<FileMetadata> = files
             .into_iter()
@@ -369,7 +362,7 @@ impl IngestService for IngestServer {
             .mongo
             .get_file_metadata(&hash)
             .await
-            .map_err(|e| Status::internal(e.to_string()))?
+            .map_err(internal_err)?
             .ok_or_else(|| Status::not_found(format!("file with hash {hash} not found")))?;
 
         Ok(Response::new(FileMetadata {
@@ -393,6 +386,37 @@ impl IngestService for IngestServer {
     }
 }
 
+impl From<ToolError> for Status {
+    fn from(e: ToolError) -> Self {
+        match e {
+            ToolError::RedisError(_)
+            | ToolError::MongoError(_)
+            | ToolError::MongoPoolError(_)
+            | ToolError::MongoConnectionError(_)
+            | ToolError::BsonError(_)
+            | ToolError::IoError(_)
+            | ToolError::JsonError(_)
+            | ToolError::WreqError(_)
+            | ToolError::JobExecutionError(_)
+            | ToolError::Message(_)
+            | ToolError::ServerError(_) => Status::internal(e.to_string()),
+
+            ToolError::ConfigError(_)
+            | ToolError::ConfigParseError(_)
+            | ToolError::YamlError(_)
+            | ToolError::ValidationError(_)
+            | ToolError::EnvError(_)
+            | ToolError::UrlParseError(_) => Status::invalid_argument(e.to_string()),
+
+            ToolError::AuthError(_) => Status::unauthenticated(e.to_string()),
+
+            ToolError::SemaphoreError(_) => Status::unavailable(e.to_string()),
+
+            ToolError::Interrupted => Status::cancelled("operation interrupted"),
+        }
+    }
+}
+
 /// Start the gRPC server with an auto-started worker in background.
 pub async fn serve(addr: SocketAddr, toml_path: &Path) -> Result<(), ToolError> {
     ffmpeg_next::init().ok();
@@ -402,8 +426,7 @@ pub async fn serve(addr: SocketAddr, toml_path: &Path) -> Result<(), ToolError> 
     let redis_uri = std::env::var("REDIS_URI")?;
     let mongo_uri = std::env::var("MONGODB_URI")?;
     let mongo = MongoService::new(&mongo_uri).await?;
-    let redis =
-        RedisService::new(&redis_uri, 3600, 3, vec![5, 30, 120]).map_err(ToolError::from)?;
+    let redis = RedisService::new(&redis_uri, 3600, 3, vec![5, 30, 120])?;
 
     tracing::info!("Ingest gRPC server listening on {addr}");
 
@@ -451,8 +474,7 @@ pub async fn serve(addr: SocketAddr, toml_path: &Path) -> Result<(), ToolError> 
         .serve_with_shutdown(addr, async {
             signal_rx.await.ok();
         })
-        .await
-        .map_err(|e| ToolError::Message(format!("server error: {e}")))?;
+        .await?;
 
     Ok(())
 }

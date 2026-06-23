@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use url::Url;
 
 use crate::models::{GenericCompressionStrategy, Resource};
+use crate::storage::Provider;
 
 type JobId = String;
 type BatchId = String;
@@ -29,6 +30,10 @@ pub struct FileJob {
     pub updated_at: DateTime<Utc>,
     pub file_hash: Option<String>,
     pub error: Option<String>,
+    /// Per-job chunk size from the ingestion YAML (e.g. "64MB").
+    /// Falls back to the server TOML config when absent (upgraded jobs).
+    #[serde(default)]
+    pub chunk_size: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -50,6 +55,8 @@ pub struct ChunkJob {
     pub authorization: Option<String>,
     pub cookie: Option<String>,
     pub dest_path: String,
+    #[serde(default)]
+    pub storage: Provider,
     pub total_chunks: u32,
     pub total_file_size: u64,
     pub compression_strategy: Option<GenericCompressionStrategy>,

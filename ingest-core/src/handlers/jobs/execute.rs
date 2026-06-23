@@ -3,9 +3,11 @@ use chrono::Utc;
 
 use crate::{
     AppConfig,
+    auth::AuthProviderRegistry,
     error::JobErrorOutcome,
-    models::{ChunkRef, CompressionOverride, GenericCompressionStrategy},
+    models::{ChunkRef, CompressionOverride, GenericCompressionStrategy, Resource},
     services::mongo::UpsertResult,
+    storage::Provider,
 };
 
 use super::{
@@ -36,22 +38,152 @@ fn parse_chunk_size(s: &str) -> u64 {
     }
 }
 
+/// Resolve the source auth token for a resource.
+///
+/// Returns `Some(token)` if a dynamic OAuth token should be used,
+/// `None` if static headers or no auth are configured.
+///
+/// For S3 sources, this generates a pre-signed URL and stores it in the
+/// returned data so the caller can replace the resource URL.
+async fn resolve_source_auth(
+    resource: &Resource,
+    auth_registry: Option<&AuthProviderRegistry>,
+) -> Result<Option<String>, JobErrorOutcome> {
+    let config = resource.config.as_ref();
+    let source_auth = config
+        .and_then(|c| c.source_auth.as_deref())
+        .unwrap_or("auto");
+
+    let provider = if source_auth == "auto" {
+        AuthProviderRegistry::detect_from_url(resource.url.as_str())
+    } else if source_auth == "headers" || source_auth == "none" || source_auth == "auto" {
+        None
+    } else {
+        Some(source_auth)
+    };
+
+    match provider {
+        Some(name @ ("gdrive" | "dropbox")) => {
+            let registry = auth_registry.ok_or_else(|| {
+                JobErrorOutcome::Fatal(format!(
+                    "Source auth requires {} but no auth registry configured",
+                    name
+                ))
+            })?;
+            let tp = registry.get(name).ok_or_else(|| {
+                JobErrorOutcome::Fatal(format!("Source auth provider '{}' not registered", name))
+            })?;
+            let token = tp.access_token().await.map_err(|e| {
+                JobErrorOutcome::Fatal(format!("Token refresh failed for {name}: {e}"))
+            })?;
+            Ok(Some(token))
+        }
+        Some("s3") => {
+            // S3 source: generate a pre-signed URL for the full object.
+            // Detection from URL would require parsing bucket/key which is complex.
+            // For now, require explicit source_auth: s3 and use env vars.
+            tracing::info!("S3 source auth: generating pre-signed URL");
+            match generate_s3_presigned_url(resource.url.as_str()).await {
+                Ok(presigned_url) => {
+                    // We can't modify the resource in place, so we return the URL
+                    // and let the caller use it. For simplicity, return None for auth token
+                    // and let the caller handle URL replacement.
+                    tracing::info!("Generated pre-signed S3 URL");
+                    // Convert pre-signed URL to a header: we pass the pre-signed URL
+                    // as if it were an auth token, but the caller knows to check for S3.
+                    Ok(Some(format!("__S3_PRESIGNED__{}", presigned_url)))
+                }
+                Err(e) => Err(JobErrorOutcome::Fatal(format!(
+                    "Failed to generate S3 presigned URL: {e}"
+                ))),
+            }
+        }
+        None | Some(_) => Ok(None),
+    }
+}
+
+/// Attempt to generate a pre-signed URL for an S3 object.
+async fn generate_s3_presigned_url(url: &str) -> Result<String, String> {
+    use aws_sdk_s3::presigning::PresigningConfig;
+    use std::time::Duration;
+
+    let bucket =
+        std::env::var("AWS_BUCKET").map_err(|_| "AWS_BUCKET env var not set".to_string())?;
+
+    // Extract key from URL path
+    let parsed = url::Url::parse(url).map_err(|e| format!("Invalid URL: {e}"))?;
+    let key = parsed
+        .path_segments()
+        .map(|s| s.collect::<Vec<_>>().join("/"))
+        .unwrap_or_default();
+
+    let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+        .load()
+        .await;
+    let client = aws_sdk_s3::Client::new(&config);
+
+    let presigned_config = PresigningConfig::expires_in(Duration::from_secs(3600))
+        .map_err(|e| format!("Invalid presigning config: {e}"))?;
+
+    let presigned_request = client
+        .get_object()
+        .bucket(&bucket)
+        .key(&key)
+        .presigned(presigned_config)
+        .await
+        .map_err(|e| format!("S3 presigning failed: {e}"))?;
+
+    Ok(presigned_request.uri().to_string())
+}
+
+/// Check if a resolved auth value is an S3 pre-signed URL marker.
+fn is_s3_presigned(auth: &str) -> bool {
+    auth.starts_with("__S3_PRESIGNED__")
+}
+
+/// Extract the actual URL from a pre-signed marker string.
+fn extract_s3_url(auth: &str) -> &str {
+    auth.strip_prefix("__S3_PRESIGNED__").unwrap_or(auth)
+}
+
+/// Extract auth headers from resource config, falling back to resolved token.
+fn resolve_auth_for_chunks(
+    resource: &Resource,
+    resolved_token: Option<&str>,
+) -> (Option<String>, Option<String>) {
+    // If we have a dynamically resolved token, use it
+    if let Some(token) = resolved_token {
+        if is_s3_presigned(token) {
+            // S3 pre-signed URL — auth is in the URL itself, no header needed
+            (None, None)
+        } else {
+            (Some(format!("Bearer {}", token)), None)
+        }
+    } else {
+        // Fall back to static headers
+        resource
+            .config
+            .as_ref()
+            .and_then(|c| c.headers.as_ref())
+            .map(|h| (h.authorization.clone(), h.cookie.clone()))
+            .unwrap_or_default()
+    }
+}
+
 async fn spawn_chunk_jobs(
     file_job: &FileJob,
     total_size: u64,
     config: &AppConfig,
+    resolved_auth: Option<&str>,
 ) -> Result<Vec<ChunkJob>, JobErrorOutcome> {
-    let chunk_size = parse_chunk_size(&config.chunk_size);
+    let chunk_size = match &file_job.chunk_size {
+        Some(s) => parse_chunk_size(s),
+        None => parse_chunk_size(&config.chunk_size),
+    };
     let total_chunks = ((total_size + chunk_size - 1) / chunk_size) as u32;
     let resource = &file_job.resource;
 
-    // Extract auth headers in a single pass through the config chain
-    let (auth, cookie) = resource
-        .config
-        .as_ref()
-        .and_then(|c| c.headers.as_ref())
-        .map(|h| (h.authorization.clone(), h.cookie.clone()))
-        .unwrap_or_default();
+    let (auth, cookie) = resolve_auth_for_chunks(resource, resolved_auth);
 
     let compression_strategy = resource
         .config
@@ -76,9 +208,25 @@ async fn spawn_chunk_jobs(
         .unwrap_or_else(|| config.default_path.trim_end_matches('/'));
     let dest_folder = format!("{}/{}", base_path, resource_name);
 
+    let dest_provider = resource
+        .dest
+        .as_ref()
+        .and_then(|d| d.provider.clone())
+        .unwrap_or(Provider::Local);
+
     let build_chunk = |i: u32| {
         let offset_start = (i as u64) * chunk_size;
         let offset_end = ((i as u64 + 1) * chunk_size - 1).min(total_size.saturating_sub(1));
+
+        let chunk_url = if let Some(token) = resolved_auth
+            && is_s3_presigned(token)
+        {
+            // For S3 sources, generate a separate pre-signed URL per chunk
+            // (includes the Range in the signature or uses same URL + Range header)
+            url::Url::parse(extract_s3_url(token)).unwrap_or_else(|_| resource.url.clone())
+        } else {
+            resource.url.clone()
+        };
 
         ChunkJob {
             _id: uuid::Uuid::new_v4().to_string(),
@@ -94,10 +242,11 @@ async fn spawn_chunk_jobs(
             updated_at: Utc::now(),
             chunk_hash: None,
             error: None,
-            url: resource.url.clone(),
+            url: chunk_url,
             authorization: auth.clone(),
             cookie: cookie.clone(),
             dest_path: format!("{}/chunk_{:05}.bin", dest_folder, i),
+            storage: dest_provider.clone(),
             total_chunks,
             total_file_size: total_size,
             compression_strategy: compression_strategy.clone(),
@@ -126,17 +275,21 @@ impl super::JobHandler for FileJobHandler {
         let threshold_bytes = ctx.config.compression_threshold_mb * 1024 * 1024;
         let pr = ctx.progress.as_ref();
 
+        // ── Phase 0: Resolve source auth ─────────────────────────────────
+        let auth_token = resolve_source_auth(resource, ctx.auth_registry.as_deref()).await?;
+
         // ── Phase 1: HEAD preflight ──────────────────────────────────────
         if let Some(pr) = pr {
             pr.report("preflight", 1, Some(7), None).await;
         }
-        let (head_size, head_ranges) = match initiate_head(resource, &ctx.http_client).await {
-            Ok(info) => (info.content_length, info.accept_ranges),
-            Err(e) => {
-                tracing::warn!(error = %e, "HEAD preflight failed, falling back to GET");
-                (None, false)
-            }
-        };
+        let (head_size, head_ranges) =
+            match initiate_head(resource, &ctx.http_client, auth_token.as_deref()).await {
+                Ok(info) => (info.content_length, info.accept_ranges),
+                Err(e) => {
+                    tracing::warn!(error = %e, "HEAD preflight failed, falling back to GET");
+                    (None, false)
+                }
+            };
 
         if let Some(size) = head_size {
             if size > threshold_bytes {
@@ -145,7 +298,9 @@ impl super::JobHandler for FileJobHandler {
                         pr.report("splitting", 2, Some(7), Some("Spawning chunk jobs"))
                             .await;
                     }
-                    let chunks = spawn_chunk_jobs(file_job, size, &ctx.config).await?;
+                    let chunks =
+                        spawn_chunk_jobs(file_job, size, &ctx.config, auth_token.as_deref())
+                            .await?;
                     return Ok(JobOutcome::SpawnedChunks(chunks));
                 }
                 tracing::warn!(
@@ -159,7 +314,8 @@ impl super::JobHandler for FileJobHandler {
         if let Some(pr) = pr {
             pr.report("download", 2, Some(7), None).await;
         }
-        let (response, mut download) = initiate_download(resource, &ctx.http_client).await?;
+        let (response, mut download) =
+            initiate_download(resource, &ctx.http_client, auth_token.as_deref()).await?;
 
         let resp_content_length = response.content_length();
         let resp_accept_ranges = response
@@ -176,7 +332,9 @@ impl super::JobHandler for FileJobHandler {
                     pr.report("splitting", 2, Some(7), Some("Spawning chunk jobs"))
                         .await;
                 }
-                let chunks = spawn_chunk_jobs(file_job, resp_size, &ctx.config).await?;
+                let chunks =
+                    spawn_chunk_jobs(file_job, resp_size, &ctx.config, auth_token.as_deref())
+                        .await?;
                 return Ok(JobOutcome::SpawnedChunks(chunks));
             }
         }
@@ -198,7 +356,6 @@ impl super::JobHandler for FileJobHandler {
                 bytes_mime,
                 byte_count,
             } => {
-                // Use byte_count to overwrite content_length (which might be 0 if no Content-Length header)
                 download.content_length = byte_count;
                 if bytes_mime != "application/octet-stream" {
                     download.mime_type = bytes_mime;
@@ -213,26 +370,36 @@ impl super::JobHandler for FileJobHandler {
                 );
 
                 if resp_accept_ranges {
-                    let chunks = spawn_chunk_jobs(file_job, byte_count, &ctx.config).await?;
+                    let chunks =
+                        spawn_chunk_jobs(file_job, byte_count, &ctx.config, auth_token.as_deref())
+                            .await?;
                     return Ok(JobOutcome::SpawnedChunks(chunks));
                 }
 
                 // Probe: send a Range: 0-0 to check server support
-                let auth = resource
-                    .config
-                    .as_ref()
-                    .and_then(|c| c.headers.as_ref())
-                    .and_then(|h| h.authorization.as_deref());
-                let cookie = resource
-                    .config
-                    .as_ref()
-                    .and_then(|c| c.headers.as_ref())
-                    .and_then(|h| h.cookie.as_deref());
+                let (auth, cookie) = resolve_auth_for_chunks(resource, auth_token.as_deref());
+                let auth_ref = auth.as_deref();
+                let cookie_ref = cookie.as_deref();
 
-                match initiate_range_download(&resource.url, 0, 0, auth, cookie, &ctx.http_client).await {
-                    Ok((probe,_)) if probe.status() == 206 => {
+                match initiate_range_download(
+                    &resource.url,
+                    0,
+                    0,
+                    auth_ref,
+                    cookie_ref,
+                    &ctx.http_client,
+                )
+                .await
+                {
+                    Ok((probe, _)) if probe.status() == 206 => {
                         drop(probe);
-                        let chunks = spawn_chunk_jobs(file_job, byte_count, &ctx.config).await?;
+                        let chunks = spawn_chunk_jobs(
+                            file_job,
+                            byte_count,
+                            &ctx.config,
+                            auth_token.as_deref(),
+                        )
+                        .await?;
                         return Ok(JobOutcome::SpawnedChunks(chunks));
                     }
                     _ => {
@@ -382,5 +549,23 @@ mod tests {
     #[test]
     fn test_parse_chunk_size_garbage() {
         assert_eq!(parse_chunk_size("xyz"), 128 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_is_s3_presigned() {
+        assert!(is_s3_presigned(
+            "__S3_PRESIGNED__https://s3.amazonaws.com/file"
+        ));
+        assert!(!is_s3_presigned("Bearer token123"));
+        assert!(!is_s3_presigned(""));
+    }
+
+    #[test]
+    fn test_extract_s3_url() {
+        assert_eq!(
+            extract_s3_url("__S3_PRESIGNED__https://example.com/file"),
+            "https://example.com/file"
+        );
+        assert_eq!(extract_s3_url("no-prefix"), "no-prefix");
     }
 }

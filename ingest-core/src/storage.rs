@@ -4,8 +4,8 @@ use std::error::Error;
 use std::sync::Arc;
 use tokio::fs::File;
 use tokio::io::AsyncRead;
-use tokio_stream::StreamExt;
-use tokio_util::io::ReaderStream;
+
+use crate::providers::{DropboxProvider, GDriveProvider, S3Provider};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(rename_all = "lowercase")]
@@ -39,32 +39,6 @@ impl From<String> for Provider {
     }
 }
 
-pub struct LocalProvider;
-pub struct GDriveProvider;
-
-async fn start_drive_session(token: &str, filename: &str) -> Result<String, DynError> {
-    let client = wreq::Client::new();
-
-    let res = client
-        .post("https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable")
-        .bearer_auth(token)
-        .header("X-Upload-Content-Type", "application/octet-stream")
-        .header("Content-Length", "0")
-        .header(
-            "X-Upload-Content-Length",
-            &std::fs::metadata(filename)?.len().to_string(),
-        )
-        .send()
-        .await?;
-
-    Ok(res
-        .headers()
-        .get("Location")
-        .ok_or("Missing Location header")?
-        .to_str()?
-        .to_string())
-}
-
 #[async_trait]
 pub trait StorageProvider: Send + Sync {
     async fn upload(&self, path: &str, file: &mut File)
@@ -77,6 +51,10 @@ pub trait StorageProvider: Send + Sync {
 }
 
 pub type DynError = Box<dyn Error + Send + Sync>;
+
+// ── LocalProvider ────────────────────────────────────────────────────────────
+
+pub struct LocalProvider;
 
 #[async_trait]
 impl StorageProvider for LocalProvider {
@@ -102,62 +80,131 @@ impl StorageProvider for LocalProvider {
     }
 }
 
-#[async_trait]
-impl StorageProvider for GDriveProvider {
-    async fn upload(&self, _path: &str, _file: &mut File) -> Result<(), DynError> {
-        todo!()
-    }
+// ── ProviderCache (singleton per provider type) ─────────────────────────────
 
-    async fn download(&self, _path: &str) -> Result<Box<dyn AsyncRead + Unpin + Send>, DynError> {
-        todo!()
-    }
-
-    async fn health_check(&self) -> Result<(), DynError> {
-        Err("Google Drive not implemented".into())
-    }
+/// Pre-created cache of all storage providers, created once and shared via `Arc`.
+///
+/// Each provider is created at construction time with its default configuration.
+/// `get()` returns an `Arc::clone` — a cheap ref-count bump.
+pub struct ProviderCache {
+    local: Arc<dyn StorageProvider>,
+    gdrive: Arc<dyn StorageProvider>,
+    dropbox: Arc<dyn StorageProvider>,
+    s3: Arc<dyn StorageProvider>,
 }
 
-pub struct DropboxProvider;
-
-#[async_trait]
-impl StorageProvider for DropboxProvider {
-    async fn upload(&self, _path: &str, _file: &mut File) -> Result<(), DynError> {
-        todo!()
-    }
-
-    async fn download(&self, _path: &str) -> Result<Box<dyn AsyncRead + Unpin + Send>, DynError> {
-        todo!()
-    }
-
-    async fn health_check(&self) -> Result<(), DynError> {
-        Err("Dropbox not implemented".into())
-    }
-}
-
-pub struct S3Provider;
-
-#[async_trait]
-impl StorageProvider for S3Provider {
-    async fn upload(&self, _path: &str, _file: &mut File) -> Result<(), DynError> {
-        Err("S3Provider is a stub, not implemented".into())
-    }
-
-    async fn download(&self, _path: &str) -> Result<Box<dyn AsyncRead + Unpin + Send>, DynError> {
-        Err("S3Provider is a stub, not implemented".into())
-    }
-
-    async fn health_check(&self) -> Result<(), DynError> {
-        Err("S3 not implemented".into())
-    }
-}
-
-impl Provider {
-    pub fn into_storage(&self) -> Arc<dyn StorageProvider> {
-        match self {
-            Provider::Local => Arc::new(LocalProvider),
-            Provider::Gdrive => Arc::new(GDriveProvider),
-            Provider::Dropbox => Arc::new(DropboxProvider),
-            Provider::S3 => Arc::new(S3Provider),
+impl ProviderCache {
+    pub fn new() -> Self {
+        Self {
+            local: Arc::new(LocalProvider),
+            gdrive: Arc::new({
+                let gdrive_root =
+                    std::env::var("GDRIVE_FOLDER_ID").unwrap_or_else(|_| "root".into());
+                GDriveProvider::from_env(gdrive_root)
+                    .unwrap_or_else(|_| GDriveProvider::new("root".into()))
+            }),
+            dropbox: Arc::new(
+                DropboxProvider::from_env().unwrap_or_else(|_| DropboxProvider::new()),
+            ),
+            s3: Arc::new({
+                let bucket = std::env::var("AWS_BUCKET").unwrap_or_else(|_| "default".into());
+                S3Provider::new(bucket)
+            }),
         }
+    }
+
+    pub fn get(&self, provider: &Provider) -> Arc<dyn StorageProvider> {
+        match provider {
+            Provider::Local => self.local.clone(),
+            Provider::Gdrive => self.gdrive.clone(),
+            Provider::Dropbox => self.dropbox.clone(),
+            Provider::S3 => self.s3.clone(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncReadExt;
+
+    #[test]
+    fn test_provider_default_is_local() {
+        assert_eq!(Provider::default(), Provider::Local);
+    }
+
+    #[test]
+    fn test_provider_display() {
+        assert_eq!(Provider::Local.to_string(), "local");
+        assert_eq!(Provider::Gdrive.to_string(), "gdrive");
+        assert_eq!(Provider::Dropbox.to_string(), "dropbox");
+        assert_eq!(Provider::S3.to_string(), "s3");
+    }
+
+    #[test]
+    fn test_provider_from_string() {
+        assert_eq!(Provider::from("local".to_string()), Provider::Local);
+        assert_eq!(Provider::from("LOCAL".to_string()), Provider::Local);
+        assert_eq!(Provider::from("gdrive".to_string()), Provider::Gdrive);
+        assert_eq!(Provider::from("GDRIVE".to_string()), Provider::Gdrive);
+        assert_eq!(Provider::from("dropbox".to_string()), Provider::Dropbox);
+        assert_eq!(Provider::from("s3".to_string()), Provider::S3);
+        assert_eq!(Provider::from("unknown".to_string()), Provider::Local);
+        assert_eq!(Provider::from("".to_string()), Provider::Local);
+    }
+
+    #[test]
+    fn test_provider_serde_roundtrip() {
+        for p in [
+            Provider::Local,
+            Provider::Gdrive,
+            Provider::Dropbox,
+            Provider::S3,
+        ] {
+            let json = serde_json::to_string(&p).unwrap();
+            let deserialized: Provider = serde_json::from_str(&json).unwrap();
+            assert_eq!(deserialized, p);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_local_provider_health_check() {
+        let provider = LocalProvider;
+        let result = provider.health_check();
+        assert!(result.await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_local_provider_upload_download_roundtrip() {
+        let tmp = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        tokio::fs::create_dir_all(&tmp).await.unwrap();
+        let dest = tmp.join("test_file.bin");
+        let dest_str = dest.to_string_lossy().to_string();
+
+        // Create source data
+        let src = tmp.join("source.bin");
+        let content = b"hello world this is a test file for local provider";
+        tokio::fs::write(&src, content).await.unwrap();
+
+        let provider = LocalProvider;
+        let mut src_file = tokio::fs::File::open(&src).await.unwrap();
+        provider.upload(&dest_str, &mut src_file).await.unwrap();
+
+        // Verify destination file exists and has correct content
+        assert!(dest.exists());
+        let mut downloaded = provider.download(&dest_str).await.unwrap();
+        let mut buf = Vec::new();
+        downloaded.read_to_end(&mut buf).await.unwrap();
+        assert_eq!(buf, content);
+
+        tokio::fs::remove_dir_all(&tmp).await.ok();
+    }
+
+    #[tokio::test]
+    async fn test_provider_cache_get_local() {
+        let cache = ProviderCache::new();
+        let local = cache.get(&Provider::Local);
+        // verify it returns a valid provider (health_check passes)
+        assert!(local.health_check().await.is_ok());
     }
 }

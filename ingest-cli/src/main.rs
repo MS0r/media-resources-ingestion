@@ -1,3 +1,4 @@
+mod auth_commands;
 mod cli;
 mod commands;
 
@@ -8,7 +9,7 @@ use tracing_subscriber::{
     EnvFilter, filter::LevelFilter, layer::SubscriberExt, util::SubscriberInitExt,
 };
 
-use crate::cli::{Cli, Commands, LogFormat};
+use crate::cli::{AuthProvider, Cli, Commands, LogFormat};
 
 fn is_pipe() -> bool {
     !atty::is(atty::Stream::Stdout)
@@ -94,11 +95,15 @@ async fn main() -> Result<(), ToolError> {
                 Commands::Cancel { scope } => commands::handle_cancel(scope, &server_addr).await,
                 Commands::Retry { scope } => commands::handle_retry(scope, &server_addr).await,
                 Commands::Files { scope } => commands::handle_files(scope, &server_addr).await,
+                Commands::Auth { provider } => match provider {
+                    AuthProvider::Dropbox => auth_commands::handle_auth_dropbox().await,
+                    AuthProvider::Gdrive => auth_commands::handle_auth_gdrive().await,
+                },
             }
         } => result,
         _ = tokio::signal::ctrl_c() => {
             eprintln!("{}", "Interrupted by SIGINT (Ctrl+C)".red());
-            return Err(ToolError::Interrupted);
+            std::process::exit(130);
         }
     };
 

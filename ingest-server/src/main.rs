@@ -9,11 +9,19 @@ fn init_ffmpeg() {
 
 fn setup_logging() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let use_json = std::env::var("LOG_FORMAT").map_or(false, |v| v.to_lowercase() == "json");
 
-    tracing_subscriber::registry()
-        .with(filter)
-        .with(tracing_subscriber::fmt::layer())
-        .init();
+    if use_json {
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(tracing_subscriber::fmt::layer().json())
+            .init();
+    } else {
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(tracing_subscriber::fmt::layer().pretty())
+            .init();
+    }
 }
 
 #[tokio::main]

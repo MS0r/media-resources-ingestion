@@ -14,6 +14,76 @@ use wreq::{
 
 use super::{FileJob, expand_path};
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_filename_from_url_with_extension() {
+        let url = Url::parse("https://example.com/path/to/video.mp4").unwrap();
+        let (name, ext) = filename_from_url(&url);
+        assert_eq!(name, Some("video".to_string()));
+        assert_eq!(ext, Some("mp4".to_string()));
+    }
+
+    #[test]
+    fn test_filename_from_url_no_extension() {
+        let url = Url::parse("https://example.com/path/to/README").unwrap();
+        let (name, ext) = filename_from_url(&url);
+        assert_eq!(name, Some("README".to_string()));
+        assert_eq!(ext, None);
+    }
+
+    #[test]
+    fn test_filename_from_url_trailing_slash() {
+        let url = Url::parse("https://example.com/path/to/").unwrap();
+        let (name, ext) = filename_from_url(&url);
+        assert_eq!(name, Some("to".to_string()));
+        assert_eq!(ext, None);
+    }
+
+    #[test]
+    fn test_filename_from_url_root_path() {
+        let url = Url::parse("https://example.com/").unwrap();
+        let (name, ext) = filename_from_url(&url);
+        assert_eq!(name, None);
+        assert_eq!(ext, None);
+    }
+
+    #[test]
+    fn test_filename_from_url_no_path() {
+        let url = Url::parse("https://example.com").unwrap();
+        let (name, ext) = filename_from_url(&url);
+        assert_eq!(name, None);
+        assert_eq!(ext, None);
+    }
+
+    #[test]
+    fn test_filename_from_url_dotted_filename() {
+        let url = Url::parse("https://example.com/.hidden").unwrap();
+        let (name, ext) = filename_from_url(&url);
+        assert_eq!(name, Some("".to_string()));
+        assert_eq!(ext, Some("hidden".to_string()));
+    }
+
+    #[test]
+    fn test_filename_from_url_multiple_extensions() {
+        let url = Url::parse("https://example.com/archive.tar.gz").unwrap();
+        let (name, ext) = filename_from_url(&url);
+        // last dot is the split point
+        assert_eq!(name, Some("archive.tar".to_string()));
+        assert_eq!(ext, Some("gz".to_string()));
+    }
+
+    #[test]
+    fn test_filename_from_url_root_file() {
+        let url = Url::parse("https://example.com/file.txt").unwrap();
+        let (name, ext) = filename_from_url(&url);
+        assert_eq!(name, Some("file".to_string()));
+        assert_eq!(ext, Some("txt".to_string()));
+    }
+}
+
 pub(crate) struct HeadInfo {
     pub content_length: Option<u64>,
     pub accept_ranges: bool,
@@ -60,12 +130,23 @@ pub(crate) fn extract_file_job(job: &JobEnvelope) -> Result<&FileJob, JobError> 
     }
 }
 
-fn apply_auth_headers(mut request: RequestBuilder, resource: &Resource) -> RequestBuilder {
+/// Apply auth headers to a request builder.
+///
+/// If `auth_token` is provided (from dynamic source auth resolution), it is
+/// used as `Authorization: Bearer <token>`. Otherwise, falls back to the
+/// static `authorization` / `cookie` headers from the resource config.
+fn apply_auth_headers(
+    mut request: RequestBuilder,
+    resource: &Resource,
+    auth_token: Option<&str>,
+) -> RequestBuilder {
     let origin = resource.url.origin();
     if let Ok(val) = HeaderValue::from_str(&origin.ascii_serialization()) {
         request = request.header(REFERER, val);
     }
-    if let Some(headers) = &resource.config.as_ref().and_then(|c| c.headers.as_ref()) {
+    if let Some(token) = auth_token {
+        request = request.header(AUTHORIZATION, format!("Bearer {}", token));
+    } else if let Some(headers) = &resource.config.as_ref().and_then(|c| c.headers.as_ref()) {
         if let Some(auth) = &headers.authorization {
             request = request.header(AUTHORIZATION, auth);
         }
@@ -80,8 +161,9 @@ fn apply_auth_headers(mut request: RequestBuilder, resource: &Resource) -> Reque
 pub(crate) async fn initiate_head(
     resource: &Resource,
     client: &Client,
+    auth_token: Option<&str>,
 ) -> Result<HeadInfo, JobError> {
-    let request = apply_auth_headers(client.head(resource.url.as_str()), resource);
+    let request = apply_auth_headers(client.head(resource.url.as_str()), resource, auth_token);
     let response = request.send().await?;
 
     if !response.status().is_success() {
@@ -252,8 +334,9 @@ pub(crate) async fn download_range_chunk(
 pub(crate) async fn initiate_download(
     resource: &Resource,
     client: &Client,
+    auth_token: Option<&str>,
 ) -> Result<(Response, DownloadInfo), JobError> {
-    let request = apply_auth_headers(client.get(resource.url.as_str()), resource);
+    let request = apply_auth_headers(client.get(resource.url.as_str()), resource, auth_token);
     let response = request.send().await?;
 
     if !response.status().is_success() {

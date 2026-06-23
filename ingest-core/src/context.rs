@@ -1,10 +1,13 @@
+use std::sync::Arc;
+
 use crate::{
+    auth::AuthProviderRegistry,
     error::ToolError,
     handlers::jobs::JobContext,
     models::AppConfig,
     services::{mongo::MongoService, redis::RedisService},
+    storage::ProviderCache,
 };
-use std::sync::Arc;
 use wreq::{
     Client,
     header::{ACCEPT, HeaderMap, HeaderValue},
@@ -15,10 +18,17 @@ pub struct ContextFactory {
     redis: Arc<RedisService>,
     config: Arc<AppConfig>,
     http_client: Arc<Client>,
+    auth_registry: Option<Arc<AuthProviderRegistry>>,
+    provider_cache: Arc<ProviderCache>,
 }
 
 impl ContextFactory {
-    pub fn new(mongo: MongoService, redis: RedisService, config: AppConfig) -> Self {
+    pub fn new(
+        mongo: MongoService,
+        redis: RedisService,
+        config: AppConfig,
+        auth_registry: Option<Arc<AuthProviderRegistry>>,
+    ) -> Result<Self, ToolError> {
         let mut default_headers = HeaderMap::new();
         default_headers.insert(
             ACCEPT,
@@ -32,15 +42,17 @@ impl ContextFactory {
                 .emulation(wreq_util::Emulation::Chrome124)
                 .default_headers(default_headers)
                 .build()
-                .expect("Failed to build wreq HTTP client"),
+                .map_err(|e| ToolError::Message(format!("Failed to build HTTP client: {e}")))?,
         );
 
-        Self {
+        Ok(Self {
             mongo: Arc::new(mongo),
             redis: Arc::new(redis),
             config: Arc::new(config),
             http_client,
-        }
+            auth_registry,
+            provider_cache: Arc::new(ProviderCache::new()),
+        })
     }
 
     pub fn redis_service(&self) -> Arc<RedisService> {
@@ -59,6 +71,14 @@ impl ContextFactory {
         self.http_client.clone()
     }
 
+    pub fn auth_registry(&self) -> Option<Arc<AuthProviderRegistry>> {
+        self.auth_registry.clone()
+    }
+
+    pub fn provider_cache(&self) -> Arc<ProviderCache> {
+        self.provider_cache.clone()
+    }
+
     pub async fn build_file_context(&self, job_id: &str) -> Result<JobContext, ToolError> {
         if let Some(file_job) = self.mongo.get_file_job(job_id).await? {
             tracing::info!(job_id = %job_id, "Building file job context from Mongo");
@@ -68,6 +88,8 @@ impl ContextFactory {
                 self.redis.clone(),
                 self.config.clone(),
                 self.http_client.clone(),
+                self.auth_registry.clone(),
+                &self.provider_cache,
             ))
         } else {
             Err(format!("File job {job_id} not found in Mongo").into())
@@ -83,6 +105,8 @@ impl ContextFactory {
                 self.redis.clone(),
                 self.config.clone(),
                 self.http_client.clone(),
+                self.auth_registry.clone(),
+                &self.provider_cache,
             ))
         } else {
             Err(format!("Chunk job {job_id} not found in Mongo").into())

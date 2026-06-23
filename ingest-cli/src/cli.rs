@@ -68,6 +68,19 @@ pub enum Commands {
         #[command(subcommand)]
         scope: FilesScope,
     },
+    /// Perform authentication flows (e.g. Dropbox device auth)
+    Auth {
+        #[command(subcommand)]
+        provider: AuthProvider,
+    },
+}
+
+#[derive(Subcommand, Clone)]
+pub enum AuthProvider {
+    /// Run the Dropbox device authorization flow to obtain a refresh token
+    Dropbox,
+    /// Run the Google Drive OAuth authorization code flow to obtain a refresh token
+    Gdrive,
 }
 
 #[derive(Args, Clone)]

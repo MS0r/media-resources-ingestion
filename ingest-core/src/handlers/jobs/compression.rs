@@ -150,8 +150,7 @@ pub(crate) async fn compress_video_local(
     let strategy = strategy.clone();
 
     let result = tokio::task::spawn_blocking(move || -> Result<(String, u64, String), JobError> {
-        let mut ictx = format::input(&temp_path)
-            .map_err(|e| JobError::OtherFatal(format!("Failed to open input video: {e}")))?;
+        let mut ictx = format::input(&temp_path)?;
 
         let input = ictx
             .streams()
@@ -159,12 +158,8 @@ pub(crate) async fn compress_video_local(
             .ok_or_else(|| JobError::OtherFatal("No video stream found in input".into()))?;
         let video_stream_index = input.index();
 
-        let decoder_ctx = codec::context::Context::from_parameters(input.parameters())
-            .map_err(|e| JobError::OtherFatal(format!("Failed to create decoder context: {e}")))?;
-        let mut decoder = decoder_ctx
-            .decoder()
-            .video()
-            .map_err(|e| JobError::OtherFatal(format!("Failed to open video decoder: {e}")))?;
+        let decoder_ctx = codec::context::Context::from_parameters(input.parameters())?;
+        let mut decoder = decoder_ctx.decoder().video()?;
 
         let (encoder_id, _codec_name, crf_val) = match strategy {
             VideoCompressionStrategy::H264 => {
@@ -190,22 +185,18 @@ pub(crate) async fn compress_video_local(
             output_path_str,
             strategy
         );
-        let mut octx = format::output(&output_path_str)
-            .map_err(|e| JobError::OtherFatal(format!("Failed to create output context: {e}")))?;
+        let mut octx = format::output(&output_path_str)?;
 
         let global_header = octx.format().flags().contains(format::Flags::GLOBAL_HEADER);
 
         let encoder_codec = encoder::find(encoder_id)
             .ok_or_else(|| JobError::OtherFatal("Encoder not found on this system".to_string()))?;
 
-        let mut ost = octx
-            .add_stream(encoder_codec)
-            .map_err(|e| JobError::OtherFatal(format!("Failed to add output stream: {e}")))?;
+        let mut ost = octx.add_stream(encoder_codec)?;
 
         let mut encoder = codec::context::Context::new_with_codec(encoder_codec)
             .encoder()
-            .video()
-            .map_err(|e| JobError::OtherFatal(format!("Failed to get video encoder: {e}")))?;
+            .video()?;
 
         ost.set_parameters(&encoder);
 
@@ -231,17 +222,17 @@ pub(crate) async fn compress_video_local(
             }
         }
 
-        let mut encoder = encoder
-            .open_with(opts)
-            .map_err(|e| JobError::OtherFatal(format!("Failed to open encoder: {e}")))?;
+        let mut encoder = encoder.open_with(opts)?;
         ost.set_parameters(&encoder);
 
         octx.set_metadata(ictx.metadata().to_owned());
-        octx.write_header()
-            .map_err(|e| JobError::OtherFatal(format!("Failed to write header: {e}")))?;
+        octx.write_header()?;
 
         let ist_time_base = input.time_base();
-        let ost_time_base = octx.stream(0).unwrap().time_base();
+        let ost_time_base = octx
+            .stream(0)
+            .ok_or_else(|| JobError::OtherFatal("No output stream 0".to_string()))?
+            .time_base();
 
         let mut packet_count = 0u64;
         let log_interval = 500u64;
@@ -266,9 +257,7 @@ pub(crate) async fn compress_video_local(
                 );
             }
 
-            decoder
-                .send_packet(&packet)
-                .map_err(|e| JobError::OtherFatal(format!("Decoder send_packet: {e}")))?;
+            decoder.send_packet(&packet)?;
 
             let mut frame = frame::Video::empty();
             while decoder.receive_frame(&mut frame).is_ok() {
@@ -276,60 +265,45 @@ pub(crate) async fn compress_video_local(
                 frame.set_pts(pts);
                 frame.set_kind(picture::Type::None);
 
-                encoder
-                    .send_frame(&frame)
-                    .map_err(|e| JobError::OtherFatal(format!("Encoder send_frame: {e}")))?;
+                encoder.send_frame(&frame)?;
 
                 let mut encoded = Packet::empty();
                 while encoder.receive_packet(&mut encoded).is_ok() {
                     encoded.set_stream(0);
                     encoded.rescale_ts(ist_time_base, ost_time_base);
-                    encoded
-                        .write_interleaved(&mut octx)
-                        .map_err(|e| JobError::OtherFatal(format!("Write packet: {e}")))?;
+                    encoded.write_interleaved(&mut octx)?;
                 }
             }
         }
 
         tracing::info!("Video compression finished: {} total packets", packet_count);
 
-        decoder
-            .send_eof()
-            .map_err(|e| JobError::OtherFatal(format!("Decoder send_eof: {e}")))?;
+        decoder.send_eof()?;
         let mut frame = frame::Video::empty();
         while decoder.receive_frame(&mut frame).is_ok() {
             let pts = frame.timestamp();
             frame.set_pts(pts);
             frame.set_kind(picture::Type::None);
 
-            encoder
-                .send_frame(&frame)
-                .map_err(|e| JobError::OtherFatal(format!("Encoder send_frame: {e}")))?;
+            encoder.send_frame(&frame)?;
 
             let mut encoded = Packet::empty();
             while encoder.receive_packet(&mut encoded).is_ok() {
                 encoded.set_stream(0);
                 encoded.rescale_ts(ist_time_base, ost_time_base);
-                encoded
-                    .write_interleaved(&mut octx)
-                    .map_err(|e| JobError::OtherFatal(format!("Write packet: {e}")))?;
+                encoded.write_interleaved(&mut octx)?;
             }
         }
 
-        encoder
-            .send_eof()
-            .map_err(|e| JobError::OtherFatal(format!("Encoder send_eof: {e}")))?;
+        encoder.send_eof()?;
         let mut encoded = Packet::empty();
         while encoder.receive_packet(&mut encoded).is_ok() {
             encoded.set_stream(0);
             encoded.rescale_ts(ist_time_base, ost_time_base);
-            encoded
-                .write_interleaved(&mut octx)
-                .map_err(|e| JobError::OtherFatal(format!("Write packet: {e}")))?;
+            encoded.write_interleaved(&mut octx)?;
         }
 
-        octx.write_trailer()
-            .map_err(|e| JobError::OtherFatal(format!("Failed to write trailer: {e}")))?;
+        octx.write_trailer()?;
 
         let compressed_size = std::fs::metadata(&output_path_str)?.len();
 
@@ -342,8 +316,7 @@ pub(crate) async fn compress_video_local(
         let _ = std::fs::remove_file(&temp_path);
         Ok((output_path_str, compressed_size, "video/mp4".to_string()))
     })
-    .await
-    .map_err(|e| JobError::OtherFatal(format!("Spawn blocking failed: {e}")))??;
+    .await??;
 
     Ok(result)
 }
@@ -399,22 +372,15 @@ pub(crate) async fn compress_generic_local(
                     .file_name()
                     .map(|s| s.to_string_lossy().to_string())
                     .unwrap_or_else(|| "file".to_string());
-                zip.start_file(fname, zip::write::SimpleFileOptions::default())
-                    .map_err(|e| JobError::OtherFatal(format!("zip start: {e}")))?;
+                zip.start_file(fname, zip::write::SimpleFileOptions::default())?;
                 let mut input = std::fs::File::open(&input_path)?;
                 io::copy(&mut input, &mut zip)?;
-                zip.finish()
-                    .map_err(|e| JobError::OtherFatal(format!("zip finish: {e}")))?;
+                zip.finish()?;
             }
             GenericCompressionStrategy::SevenZ => {
-                let mut writer = sevenz_rust::SevenZWriter::create(&out_path)
-                    .map_err(|e| JobError::OtherFatal(format!("7z create: {e}")))?;
-                writer
-                    .push_source_path(Path::new(&input_path), |_| true)
-                    .map_err(|e| JobError::OtherFatal(format!("7z push: {e}")))?;
-                writer
-                    .finish()
-                    .map_err(|e| JobError::OtherFatal(format!("7z finish: {e}")))?;
+                let mut writer = sevenz_rust::SevenZWriter::create(&out_path)?;
+                writer.push_source_path(Path::new(&input_path), |_| true)?;
+                writer.finish()?;
             }
             GenericCompressionStrategy::OriginalFormat | GenericCompressionStrategy::None => {}
         }
@@ -422,8 +388,7 @@ pub(crate) async fn compress_generic_local(
         let compressed_size = std::fs::metadata(&out_path)?.len();
         Ok((out_path, compressed_size))
     })
-    .await
-    .map_err(|e| JobError::OtherFatal(format!("Spawn blocking failed: {e}")))??;
+    .await??;
 
     // Keep compressed only if it's actually smaller
     let original_size = std::fs::metadata(temp_path)?.len();
@@ -439,6 +404,80 @@ pub(crate) async fn compress_generic_local(
 mod tests {
     use super::*;
     use crate::models::GenericCompressionStrategy;
+
+    // ── Helper function tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_generic_compression_extension() {
+        assert_eq!(
+            generic_compression_extension(&GenericCompressionStrategy::Gzip),
+            "gz"
+        );
+        assert_eq!(
+            generic_compression_extension(&GenericCompressionStrategy::Zstd),
+            "zst"
+        );
+        assert_eq!(
+            generic_compression_extension(&GenericCompressionStrategy::Zip),
+            "zip"
+        );
+        assert_eq!(
+            generic_compression_extension(&GenericCompressionStrategy::SevenZ),
+            "7z"
+        );
+        assert_eq!(
+            generic_compression_extension(&GenericCompressionStrategy::OriginalFormat),
+            ""
+        );
+        assert_eq!(
+            generic_compression_extension(&GenericCompressionStrategy::None),
+            ""
+        );
+    }
+
+    #[test]
+    fn test_generic_compression_mime() {
+        assert_eq!(
+            generic_compression_mime(&GenericCompressionStrategy::Gzip),
+            "application/gzip"
+        );
+        assert_eq!(
+            generic_compression_mime(&GenericCompressionStrategy::Zstd),
+            "application/zstd"
+        );
+        assert_eq!(
+            generic_compression_mime(&GenericCompressionStrategy::Zip),
+            "application/zip"
+        );
+        assert_eq!(
+            generic_compression_mime(&GenericCompressionStrategy::SevenZ),
+            "application/x-7z-compressed"
+        );
+        assert_eq!(
+            generic_compression_mime(&GenericCompressionStrategy::OriginalFormat),
+            ""
+        );
+        assert_eq!(
+            generic_compression_mime(&GenericCompressionStrategy::None),
+            ""
+        );
+    }
+
+    #[test]
+    fn test_mime_to_extension() {
+        assert_eq!(mime_to_extension("image/webp"), Some("webp"));
+        assert_eq!(mime_to_extension("image/avif"), Some("avif"));
+        assert_eq!(mime_to_extension("video/mp4"), Some("mp4"));
+        assert_eq!(mime_to_extension("application/gzip"), Some("gz"));
+        assert_eq!(mime_to_extension("application/zstd"), Some("zst"));
+        assert_eq!(mime_to_extension("application/zip"), Some("zip"));
+        assert_eq!(mime_to_extension("application/x-7z-compressed"), Some("7z"));
+        assert_eq!(mime_to_extension("application/x-rar"), Some("rar"));
+        assert_eq!(mime_to_extension("unknown/type"), None);
+        assert_eq!(mime_to_extension(""), None);
+    }
+
+    // ── Generic compression tests ──────────────────────────────────────────────
 
     fn create_compressible_data(dir: &std::path::Path) -> std::path::PathBuf {
         let input = dir.join("test.txt");
@@ -561,6 +600,28 @@ mod tests {
             input_str.as_str(),
             "test",
             &GenericCompressionStrategy::OriginalFormat,
+            5,
+        )
+        .await
+        .unwrap();
+
+        assert!(size > 0);
+        assert_eq!(path, input_str);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_compress_generic_none() {
+        let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        let input = dir.join("test.txt");
+        std::fs::write(&input, "Hello, world!").unwrap();
+        let input_str = input.to_str().unwrap().to_string();
+
+        let (path, size) = compress_generic_local(
+            input_str.as_str(),
+            "test",
+            &GenericCompressionStrategy::None,
             5,
         )
         .await

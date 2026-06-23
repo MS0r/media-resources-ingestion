@@ -9,12 +9,10 @@ use crate::{
             compress_generic_local, compress_image_local, compress_video_local,
             generic_compression_mime, mime_to_extension,
         },
-        {ChunkJob, FileJob, JobContext, JobOutcome, types::DownloadInfo},
+        {FileJob, JobContext, JobOutcome, types::DownloadInfo},
     },
-    models::{ChunkRef, CompressionOverride, GenericCompressionStrategy, Manifest, Metadata},
-    storage::Provider,
+    models::{CompressionOverride, Metadata},
 };
-use sha2::{Digest, Sha256};
 use tokio::time::timeout;
 
 use super::expand_path;

@@ -1,6 +1,6 @@
 use crate::{
     context::ContextFactory,
-    error::JobErrorOutcome,
+    error::{JobErrorOutcome, ToolError},
     handlers::jobs::{
         ChunkJob, ChunkJobHandler, FileJobHandler, JobContext, JobHandler, JobKind, JobOutcome,
     },
@@ -31,7 +31,7 @@ pub async fn scheduler_loop(
     file_semaphore: Arc<Semaphore>,
     chunk_semaphore: Arc<Semaphore>,
     shutdown: Arc<AtomicBool>,
-) {
+) -> Result<(), ToolError> {
     let redis = ctx_factory.redis_service();
     let job_timeout_secs = ctx_factory.config().job_timeout_secs;
     let timeout_duration = Duration::from_secs(job_timeout_secs);
@@ -48,7 +48,7 @@ pub async fn scheduler_loop(
         if let Ok(Some((kind, job_id))) = redis.dequeue_job(worker).await {
             match kind {
                 JobKind::File => {
-                    let permit = file_semaphore.clone().acquire_owned().await.unwrap();
+                    let permit = file_semaphore.clone().acquire_owned().await?;
                     let ctx = match ctx_factory.build_file_context(&job_id).await {
                         Ok(ctx) => ctx,
                         Err(e) => {
@@ -172,7 +172,7 @@ pub async fn scheduler_loop(
                     });
                 }
                 JobKind::Chunk => {
-                    let permit = chunk_semaphore.clone().acquire_owned().await.unwrap();
+                    let permit = chunk_semaphore.clone().acquire_owned().await?;
                     let ctx = match ctx_factory.build_chunk_context(&job_id).await {
                         Ok(ctx) => ctx,
                         Err(e) => {
@@ -305,6 +305,7 @@ pub async fn scheduler_loop(
 
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    Ok(())
 }
 
 async fn execute(

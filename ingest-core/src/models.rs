@@ -162,6 +162,10 @@ pub struct ResourceLevelConfig {
     pub quality: Option<u8>,
     #[serde(default)]
     pub headers: Option<Headers>,
+    /// Source authentication provider: "auto" | "gdrive" | "dropbox" | "s3" | "headers" | "none"
+    /// "auto" = detect from URL (default). "headers" / "none" = use static headers only.
+    #[serde(default)]
+    pub source_auth: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -198,6 +202,9 @@ pub struct IngestionConfig {
     quality: Option<u8>,
     #[serde(default)]
     headers: Option<Headers>,
+    /// Default source_auth for all resources (overridable per-resource).
+    #[serde(default)]
+    source_auth: Option<String>,
     pub resources: Vec<Resource>,
 }
 
@@ -234,10 +241,11 @@ pub struct AppConfig {
     pub max_retries: u8,
     pub backoff_secs: Vec<u64>,
 
-    // Compression + headers + quality (YAML, merged in from_sources)
+    // Compression + headers + quality + source_auth (YAML, merged in from_sources)
     pub compression_override: Option<CompressionOverride>,
     pub headers: Option<Headers>,
     pub quality: Option<u8>,
+    pub source_auth: Option<String>,
 
     // Run behavior (CLI, YAML fallback)
     pub yaml_path: PathBuf,
@@ -296,10 +304,13 @@ pub enum JobStatusFilter {
 
 pub fn load_config(path: &PathBuf) -> Result<IngestionConfig, crate::error::ToolError> {
     let content = std::fs::read_to_string(path)?;
-    let request: IngestionConfig = serde_yaml::from_str(&content).map_err(|e| {
-        tracing::error!("YAML parse error: {}", e);
-        crate::error::ToolError::ConfigError(format!("YAML parse error: {}", e))
-    })?;
+    let request: IngestionConfig = match serde_yaml::from_str(&content) {
+        Ok(config) => config,
+        Err(e) => {
+            tracing::error!("YAML parse error: {}", e);
+            return Err(e.into());
+        }
+    };
 
     Ok(request)
 }
@@ -383,6 +394,7 @@ impl AppConfig {
             compression_override: yaml.compression_override.clone(),
             headers: yaml.headers.clone(),
             quality,
+            source_auth: yaml.source_auth.clone(),
             yaml_path: args.yaml_path.clone(),
             priority,
             dry_run: args.dry_run,
@@ -419,6 +431,7 @@ impl AppConfig {
             compression_override: None,
             headers: None,
             quality: None,
+            source_auth: None,
             yaml_path: PathBuf::new(),
             priority: 0,
             dry_run: false,
@@ -474,6 +487,7 @@ impl AppConfig {
             compression_override: yaml.compression_override.clone(),
             headers: yaml.headers.clone(),
             quality,
+            source_auth: yaml.source_auth.clone(),
             yaml_path: args.yaml_path.clone(),
             priority,
             dry_run: args.dry_run,
@@ -641,7 +655,6 @@ mod tests {
     // --- config_test.rs AppConfig tests ---
 
     use crate::config::RunConfig;
-    use std::str::FromStr;
 
     const TOML_DEFAULTS: &str = r#"
 [scheduler]
@@ -931,7 +944,7 @@ resources:
 
     #[test]
     fn test_parse_chunk_size_mb() {
-        let s = "128MB".to_string();
+        let _s = "128MB".to_string();
         // parse_chunk_size is not exported from models, but we can test via config
         // This is covered in execute.rs tests
     }

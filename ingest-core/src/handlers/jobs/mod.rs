@@ -11,14 +11,13 @@ use async_trait::async_trait;
 use std::{path::PathBuf, sync::Arc};
 
 use crate::{
+    auth::AuthProviderRegistry,
     error::JobErrorOutcome,
     models::{AppConfig, ChunkRef, Metadata},
     services::redis::ProgressReporter,
     services::{mongo::MongoService, redis::RedisService},
-    storage::{Provider, StorageProvider},
+    storage::{Provider, ProviderCache, StorageProvider},
 };
-
-type JobId = String;
 
 #[async_trait]
 pub trait JobHandler: Send + Sync {
@@ -38,6 +37,7 @@ pub struct JobContext {
     pub job: JobEnvelope,
     pub progress: Option<ProgressReporter>,
     pub http_client: Arc<wreq::Client>,
+    pub auth_registry: Option<Arc<AuthProviderRegistry>>,
 }
 
 impl JobContext {
@@ -47,31 +47,27 @@ impl JobContext {
         redis: Arc<RedisService>,
         config: Arc<AppConfig>,
         http_client: Arc<wreq::Client>,
+        auth_registry: Option<Arc<AuthProviderRegistry>>,
+        provider_cache: &ProviderCache,
     ) -> Self {
         let progress = Some(ProgressReporter::new(job._id.clone(), (*redis).clone()));
-        if let Some(dest) = &job.resource.dest
+        let storage = if let Some(dest) = &job.resource.dest
             && let Some(provider) = &dest.provider
         {
-            let storage = provider.into_storage();
-            return Self {
-                storage,
-                db,
-                redis,
-                config,
-                job: JobEnvelope::File(job),
-                progress,
-                http_client,
-            };
-        }
+            provider_cache.get(provider)
+        } else {
+            provider_cache.get(&Provider::Local)
+        };
 
         Self {
-            storage: Provider::Local.into_storage(),
+            storage,
             db,
             redis,
             config,
             job: JobEnvelope::File(job),
             progress,
             http_client,
+            auth_registry,
         }
     }
 
@@ -81,15 +77,18 @@ impl JobContext {
         redis: Arc<RedisService>,
         config: Arc<AppConfig>,
         http_client: Arc<wreq::Client>,
+        auth_registry: Option<Arc<AuthProviderRegistry>>,
+        provider_cache: &ProviderCache,
     ) -> Self {
         Self {
-            storage: Provider::Local.into_storage(),
+            storage: provider_cache.get(&job.storage),
             db,
             redis,
             config,
             job: JobEnvelope::Chunk(job),
             progress: None,
             http_client,
+            auth_registry,
         }
     }
 
@@ -124,4 +123,55 @@ pub enum JobKind {
 pub(crate) fn expand_path(path: &str, filename: &str) -> PathBuf {
     let expanded_path = shellexpand::tilde(path).to_string();
     PathBuf::from(expanded_path).join(filename)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_expand_path_simple() {
+        let result = expand_path("/tmp/ingest", "file.bin");
+        assert_eq!(result, PathBuf::from("/tmp/ingest/file.bin"));
+    }
+
+    #[test]
+    fn test_expand_path_trailing_slash() {
+        let result = expand_path("/tmp/ingest/", "file.bin");
+        assert_eq!(result, PathBuf::from("/tmp/ingest/file.bin"));
+    }
+
+    #[test]
+    fn test_expand_path_tilde() {
+        let home = std::env::var("HOME").unwrap();
+        let result = expand_path("~/ingest", "file.bin");
+        assert_eq!(result, PathBuf::from(format!("{}/ingest/file.bin", home)));
+    }
+
+    #[test]
+    fn test_expand_path_nested_filename() {
+        let result = expand_path("/base", "subdir/file.bin");
+        assert_eq!(result, PathBuf::from("/base/subdir/file.bin"));
+    }
+
+    #[test]
+    fn test_expand_path_root() {
+        let result = expand_path("/", "file.bin");
+        assert_eq!(result, PathBuf::from("/file.bin"));
+    }
+
+    #[test]
+    fn test_expand_path_empty_path() {
+        let result = expand_path("", "file.bin");
+        assert_eq!(result, PathBuf::from("file.bin"));
+    }
+
+    #[test]
+    fn test_expand_path_chunk_label() {
+        let result = expand_path("/data/output/resource", "chunk_00000.bin");
+        assert_eq!(
+            result,
+            PathBuf::from("/data/output/resource/chunk_00000.bin")
+        );
+    }
 }

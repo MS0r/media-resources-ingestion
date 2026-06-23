@@ -215,7 +215,7 @@ impl RedisService {
         // Store retry_after timestamp
         let retry_after = chrono::Utc::now()
             .checked_add_signed(chrono::Duration::seconds(backoff_secs as i64))
-            .unwrap();
+            .ok_or_else(|| ToolError::Message("Timestamp overflow in retry_after".into()))?;
         let _: () = conn
             .hset(&state_key, "retry_after", retry_after.to_rfc3339())
             .await?;

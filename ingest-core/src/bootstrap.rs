@@ -1,4 +1,11 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::sync::Semaphore;
+use url::Url;
+use uuid::Uuid;
+
 use crate::{
+    auth::{AuthProviderRegistry, OAuthTokenProvider},
     context::ContextFactory,
     error::ToolError,
     handlers::{
@@ -10,12 +17,43 @@ use crate::{
     storage::Provider,
 };
 
-use chrono::Utc;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::sync::Semaphore;
-use url::Url;
-use uuid::Uuid;
+/// Initialize the auth provider registry from environment variables.
+/// This is called once at worker startup.
+fn init_auth_registry() -> AuthProviderRegistry {
+    let mut registry = AuthProviderRegistry::new();
+
+    // Google Drive — OAuth refresh-token (from stored config file or env vars)
+    match OAuthTokenProvider::from_env_or_file(
+        "GDRIVE",
+        "https://oauth2.googleapis.com/token",
+        "gdrive",
+    ) {
+        Ok(p) => {
+            tracing::info!("GDrive OAuth token provider registered");
+            registry.register("gdrive", Arc::new(p));
+        }
+        Err(e) => {
+            tracing::debug!("GDrive OAuth not configured: {e}");
+        }
+    }
+
+    // Dropbox OAuth — try config file first, then env vars
+    match OAuthTokenProvider::from_env_or_file(
+        "DROPBOX",
+        "https://api.dropbox.com/oauth2/token",
+        "dropbox",
+    ) {
+        Ok(p) => {
+            tracing::info!("Dropbox OAuth token provider registered");
+            registry.register("dropbox", Arc::new(p));
+        }
+        Err(e) => {
+            tracing::debug!("Dropbox OAuth not configured: {e}");
+        }
+    }
+
+    registry
+}
 
 fn parent_values(mut res: Resource, config: &AppConfig) -> (Resource, i32) {
     let resource_priority = res.priority.unwrap_or(config.priority);
@@ -30,6 +68,9 @@ fn parent_values(mut res: Resource, config: &AppConfig) -> (Resource, i32) {
     }
     if cfg.quality.is_none() {
         cfg.quality = config.quality;
+    }
+    if cfg.source_auth.is_none() {
+        cfg.source_auth = config.source_auth.clone();
     }
 
     let dest = res.dest.get_or_insert_with(|| Destination {
@@ -85,10 +126,7 @@ pub async fn enqueue(config: &AppConfig, resources: &[Resource]) -> Result<Strin
         }
     };
 
-    let mongo_service = MongoService::new(&config.mongo_uri).await.map_err(|e| {
-        tracing::error!("Failed to connect to MongoDB: {}", e);
-        ToolError::MongoConnectionError(e)
-    })?;
+    let mongo_service = MongoService::new(&config.mongo_uri).await?;
 
     let temp_dir = &config.temp_dir;
     tokio::fs::create_dir_all(temp_dir).await?;
@@ -96,7 +134,7 @@ pub async fn enqueue(config: &AppConfig, resources: &[Resource]) -> Result<Strin
     let batch_id = Uuid::new_v4().to_string();
     let mut batch = Batch {
         _id: batch_id.clone(),
-        created_at: Utc::now(),
+        created_at: chrono::Utc::now(),
         yaml_path: config.yaml_path.clone(),
         status: JobStatus::Pending,
         job_ids: vec![],
@@ -112,10 +150,11 @@ pub async fn enqueue(config: &AppConfig, resources: &[Resource]) -> Result<Strin
             priority: resource_priority,
             status: JobStatus::Pending,
             retry_count: 0,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
             file_hash: None,
             error: None,
+            chunk_size: Some(config.chunk_size.clone()),
         };
         batch.job_ids.push(file_job._id.clone());
         tracing::debug!(job_id=%file_job._id,"Inserted file job from the batch id: {}", batch._id);
@@ -162,6 +201,9 @@ pub async fn worker_with_services(
     let file_handler = Arc::new(FileJobHandler);
     let chunk_handler = Arc::new(ChunkJobHandler);
 
+    // Initialize auth providers
+    let auth_registry = Arc::new(init_auth_registry());
+
     tracing::info!("Starting worker mode");
     tracing::info!(
         file_workers = config.file_workers,
@@ -172,7 +214,12 @@ pub async fn worker_with_services(
     let file_semaphore = Arc::new(Semaphore::new(config.file_workers));
     let chunk_semaphore = Arc::new(Semaphore::new(config.chunk_workers));
 
-    let ctx_factory = Arc::new(ContextFactory::new(mongo_service, redis_service, config));
+    let ctx_factory = Arc::new(ContextFactory::new(
+        mongo_service,
+        redis_service,
+        config,
+        Some(auth_registry),
+    )?);
 
     scheduler_loop(
         file_handler,
@@ -182,7 +229,7 @@ pub async fn worker_with_services(
         chunk_semaphore,
         shutdown,
     )
-    .await;
+    .await?;
 
     Ok(())
 }
@@ -200,14 +247,11 @@ pub async fn worker(config: AppConfig) -> Result<(), ToolError> {
         }
         Err(e) => {
             tracing::error!("Failed to connect to Redis: {}", e);
-            return Err(ToolError::from(e));
+            return Err(e.into());
         }
     };
 
-    let mongo_service = MongoService::new(&config.mongo_uri).await.map_err(|e| {
-        tracing::error!("Failed to connect to MongoDB: {}", e);
-        ToolError::MongoConnectionError(e)
-    })?;
+    let mongo_service = MongoService::new(&config.mongo_uri).await?;
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_clone = shutdown.clone();
@@ -343,6 +387,7 @@ mod tests {
             compression_override: None,
             headers: None,
             quality: None,
+            source_auth: None,
             yaml_path: std::path::PathBuf::new(),
             priority: 0,
             dry_run: false,
@@ -362,6 +407,7 @@ mod tests {
                 compression_override: None,
                 quality: None,
                 headers,
+                source_auth: None,
             }),
         }
     }
@@ -388,6 +434,7 @@ mod tests {
                 compression_override: None,
                 quality,
                 headers: None,
+                source_auth: None,
             }),
         }
     }
