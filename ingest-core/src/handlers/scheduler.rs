@@ -313,7 +313,7 @@ async fn execute(
     handler: Arc<dyn JobHandler>,
     job_id: String,
     _permit: OwnedSemaphorePermit,
-    hb_shutdown: Arc<AtomicBool>,
+    shutdown_flag: Arc<AtomicBool>,
     timeout_duration: Duration,
 ) -> Result<Result<JobOutcome, JobErrorOutcome>, Elapsed> {
     let hb_redis = ctx.redis.clone();
@@ -323,7 +323,7 @@ async fn execute(
         let mut interval = tokio::time::interval(Duration::from_secs(10));
         loop {
             interval.tick().await;
-            if hb_done_clone.load(Ordering::Relaxed) || hb_shutdown.load(Ordering::Relaxed) {
+            if hb_done_clone.load(Ordering::Relaxed) || shutdown_flag.load(Ordering::Relaxed) {
                 break;
             }
             let _ = hb_redis.renew_lease(&job_id).await;

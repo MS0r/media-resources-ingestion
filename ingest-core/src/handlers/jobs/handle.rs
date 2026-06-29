@@ -61,6 +61,12 @@ pub(crate) async fn handle_new_file(
         .and_then(|c| c.compression_override.as_ref());
 
     let compression_timeout = Duration::from_secs(ctx.config.compression_timeout_secs);
+    let quality = resource
+        .config
+        .as_ref()
+        .and_then(|c| c.quality)
+        .unwrap_or(ctx.config.compression_quality);
+
     let (local_file, compressed_size, final_mime) = match override_strategy {
         Some(strategy) => match strategy {
             CompressionOverride::Image(image_s) => {
@@ -77,7 +83,7 @@ pub(crate) async fn handle_new_file(
                             &download.filename,
                             &download.mime_type,
                             download.content_length,
-                            ctx.config.compression_quality,
+                            quality,
                             &temp_path,
                             image_s,
                         ),
@@ -122,7 +128,7 @@ pub(crate) async fn handle_new_file(
                             &download.filename,
                             &download.mime_type,
                             download.content_length,
-                            ctx.config.compression_quality,
+                            quality,
                             &temp_path,
                             video_s,
                             cancel_video_clone,
@@ -154,13 +160,8 @@ pub(crate) async fn handle_new_file(
                 }
             }
             CompressionOverride::Generic(strategy) => {
-                match compress_generic_local(
-                    &temp_path,
-                    &download.filename,
-                    strategy,
-                    ctx.config.compression_quality,
-                )
-                .await
+                match compress_generic_local(&temp_path, &download.filename, strategy, quality)
+                    .await
                 {
                     Ok((path, size)) => {
                         let mime = if path == temp_path {
@@ -195,17 +196,12 @@ pub(crate) async fn handle_new_file(
     }
 
     // Verify storage provider is healthy before attempting upload
-    let _ = ctx.storage.health_check().await.map_err(|e| {
-        tracing::error!("Storage provider health check failed before upload");
-        JobErrorOutcome::from(e)
-    });
+    let _ = ctx.storage.health_check().await?;
 
     if let Some(pr) = pr {
         pr.report("uploading", 6, Some(7), None).await;
     }
-    let mut file = tokio::fs::File::open(&local_file)
-        .await
-        .map_err(|e| JobErrorOutcome::from(JobError::from(e)))?;
+    let mut file = tokio::fs::File::open(&local_file).await?;
     ctx.storage.upload(&final_path, &mut file).await?;
 
     if final_path != local_file {
@@ -233,8 +229,6 @@ pub(crate) async fn handle_duplicate(
         "Duplicate detected (existing hash: {}), cleaning up",
         existing_hash
     );
-    tokio::fs::remove_file(temp_path)
-        .await
-        .map_err(|e| JobErrorOutcome::Retryable(e.to_string()))?;
+    tokio::fs::remove_file(temp_path).await?;
     Ok(JobOutcome::Duplicated)
 }

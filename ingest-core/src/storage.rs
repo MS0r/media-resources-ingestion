@@ -37,20 +37,20 @@ impl From<String> for Provider {
             _ => Provider::Local,
         }
     }
-}
+}  
+
+pub type DynError = Box<dyn Error + Send + Sync>;
 
 #[async_trait]
 pub trait StorageProvider: Send + Sync {
     async fn upload(&self, path: &str, file: &mut File)
-    -> Result<(), Box<dyn Error + Send + Sync>>;
+    -> Result<(), DynError>;
     async fn download(
         &self,
         path: &str,
-    ) -> Result<Box<dyn AsyncRead + Unpin + Send>, Box<dyn Error + Send + Sync>>;
-    async fn health_check(&self) -> Result<(), Box<dyn Error + Send + Sync>>;
+    ) -> Result<Box<dyn AsyncRead + Unpin + Send>, DynError>;
+    async fn health_check(&self) -> Result<(), DynError>;
 }
-
-pub type DynError = Box<dyn Error + Send + Sync>;
 
 // ── LocalProvider ────────────────────────────────────────────────────────────
 
