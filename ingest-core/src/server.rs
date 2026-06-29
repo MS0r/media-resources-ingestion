@@ -408,7 +408,7 @@ impl From<ToolError> for Status {
             | ToolError::EnvError(_)
             | ToolError::UrlParseError(_) => Status::invalid_argument(e.to_string()),
 
-            ToolError::AuthError(_) => Status::unauthenticated(e.to_string()),
+            ToolError::AuthError(_) | ToolError::AuthResolution(_) => Status::unauthenticated(e.to_string()),
 
             ToolError::SemaphoreError(_) => Status::unavailable(e.to_string()),
 

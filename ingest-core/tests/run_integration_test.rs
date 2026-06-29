@@ -2,9 +2,9 @@ use std::env;
 use std::io::Write;
 use std::path::PathBuf;
 
-use ingest_core::enqueue;
 use ingest_core::OutputFormat;
 use ingest_core::config::RunConfig;
+use ingest_core::enqueue;
 use ingest_core::models::load_config;
 use ingest_core::{AppConfig, MongoService, TomlRawConfig, ToolError};
 
@@ -137,9 +137,7 @@ async fn run_duplicate_urls_rejected() {
 
     let (config, yaml_path) = build_app_config(yaml_path, true, false);
     let yaml_config = load_config(&yaml_path).expect("load test YAML");
-    let err = enqueue(&config, &yaml_config.resources)
-        .await
-        .unwrap_err();
+    let err = enqueue(&config, &yaml_config.resources).await.unwrap_err();
 
     assert!(matches!(err, ToolError::ValidationError(_)));
 }
@@ -187,9 +185,7 @@ async fn run_dry_run_missing_file_fails() {
     };
     let (config, yaml_path) = build_app_config_full(yaml_path, args);
     let yaml_config = load_config(&yaml_path).expect("load test YAML");
-    let err = enqueue(&config, &yaml_config.resources)
-        .await
-        .unwrap_err();
+    let err = enqueue(&config, &yaml_config.resources).await.unwrap_err();
     assert!(matches!(err, ToolError::ValidationError(_)));
 }
 
@@ -212,8 +208,6 @@ async fn run_dry_run_invalid_scheme_fails() {
     };
     let (config, yaml_path) = build_app_config_full(yaml_path, args);
     let yaml_config = load_config(&yaml_path).expect("load test YAML");
-    let err = enqueue(&config, &yaml_config.resources)
-        .await
-        .unwrap_err();
+    let err = enqueue(&config, &yaml_config.resources).await.unwrap_err();
     assert!(matches!(err, ToolError::ValidationError(_)));
 }

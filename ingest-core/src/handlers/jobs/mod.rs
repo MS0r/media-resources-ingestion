@@ -11,7 +11,6 @@ use async_trait::async_trait;
 use std::{path::PathBuf, sync::Arc};
 
 use crate::{
-    auth::AuthProviderRegistry,
     error::JobErrorOutcome,
     models::{AppConfig, ChunkRef, Metadata},
     services::redis::ProgressReporter,
@@ -37,7 +36,7 @@ pub struct JobContext {
     pub job: JobEnvelope,
     pub progress: Option<ProgressReporter>,
     pub http_client: Arc<wreq::Client>,
-    pub auth_registry: Option<Arc<AuthProviderRegistry>>,
+    pub auth_token: Option<String>,
 }
 
 impl JobContext {
@@ -47,7 +46,7 @@ impl JobContext {
         redis: Arc<RedisService>,
         config: Arc<AppConfig>,
         http_client: Arc<wreq::Client>,
-        auth_registry: Option<Arc<AuthProviderRegistry>>,
+        auth_token: Option<String>,
         provider_cache: &ProviderCache,
     ) -> Self {
         let progress = Some(ProgressReporter::new(job._id.clone(), (*redis).clone()));
@@ -67,7 +66,7 @@ impl JobContext {
             job: JobEnvelope::File(job),
             progress,
             http_client,
-            auth_registry,
+            auth_token,
         }
     }
 
@@ -77,7 +76,6 @@ impl JobContext {
         redis: Arc<RedisService>,
         config: Arc<AppConfig>,
         http_client: Arc<wreq::Client>,
-        auth_registry: Option<Arc<AuthProviderRegistry>>,
         provider_cache: &ProviderCache,
     ) -> Self {
         Self {
@@ -88,7 +86,7 @@ impl JobContext {
             job: JobEnvelope::Chunk(job),
             progress: None,
             http_client,
-            auth_registry,
+            auth_token: None,
         }
     }
 

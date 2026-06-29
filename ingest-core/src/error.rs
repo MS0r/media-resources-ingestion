@@ -12,6 +12,19 @@ use url::ParseError as url_parse_error;
 
 use crate::storage::DynError;
 
+/// Errors that occur when resolving source auth tokens (OAuth, S3 presigning).
+#[derive(Error, Debug)]
+pub enum AuthResolutionError {
+    #[error("Source auth requires '{0}' but no auth registry configured")]
+    NoRegistry(String),
+    #[error("Source auth provider '{0}' not registered in auth registry")]
+    Unregistered(String),
+    #[error("Token refresh failed for '{provider}': {error}")]
+    TokenRefresh { provider: String, error: String },
+    #[error("Failed to generate S3 presigned URL: {0}")]
+    S3Presign(String),
+}
+
 #[derive(Error, Debug)]
 pub enum ToolError {
     #[error("Redis error: {0}")]
@@ -46,6 +59,8 @@ pub enum ToolError {
     ValidationError(String),
     #[error("Auth error: {0}")]
     AuthError(String),
+    #[error("Auth resolution error: {0}")]
+    AuthResolution(#[from] AuthResolutionError),
     #[error("Job execution error: {0}")]
     JobExecutionError(String),
     #[error("Semaphore acquisition failed: {0}")]
@@ -75,7 +90,7 @@ impl ToolError {
             | ToolError::MongoPoolError(_)
             | ToolError::MongoConnectionError(_)
             | ToolError::BsonError(_) => 3,
-            ToolError::AuthError(_) => 4,
+            ToolError::AuthError(_) | ToolError::AuthResolution(_) => 4,
             ToolError::SemaphoreError(_) => 1,
             ToolError::Interrupted => 130,
             _ => 1,
@@ -99,6 +114,8 @@ pub enum JobError {
     ZipError(#[from] zip::result::ZipError),
     #[error("7-Zip error: {0}")]
     SevenZError(#[from] sevenz_rust::Error),
+    #[error("Channel send error: {0}")]
+    SendError(#[from] tokio::sync::mpsc::error::SendError<ffmpeg_next::frame::Video>),
     #[error("{0}")]
     OtherRetryable(String),
     #[error("{0}")]
@@ -143,7 +160,8 @@ impl From<ToolError> for JobErrorOutcome {
             | ToolError::ConfigParseError(_)
             | ToolError::YamlError(_)
             | ToolError::ValidationError(_)
-            | ToolError::AuthError(_)
+            |             ToolError::AuthError(_)
+            | ToolError::AuthResolution(_)
             | ToolError::EnvError(_)
             | ToolError::UrlParseError(_)
             | ToolError::Interrupted
@@ -164,7 +182,8 @@ impl From<JobError> for JobErrorOutcome {
             JobError::ImageError(_)
             | JobError::OtherFatal(_)
             | JobError::FfmpegError(_)
-            | JobError::SevenZError(_) => JobErrorOutcome::Fatal(e.to_string()),
+            | JobError::SevenZError(_)
+            | JobError::SendError(_) => JobErrorOutcome::Fatal(e.to_string()),
         }
     }
 }

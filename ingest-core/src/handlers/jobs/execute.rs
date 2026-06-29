@@ -4,7 +4,7 @@ use chrono::Utc;
 use crate::{
     AppConfig,
     auth::AuthProviderRegistry,
-    error::JobErrorOutcome,
+    error::{AuthResolutionError, JobErrorOutcome},
     models::{ChunkRef, CompressionOverride, GenericCompressionStrategy, Resource},
     services::mongo::UpsertResult,
     storage::Provider,
@@ -45,10 +45,10 @@ fn parse_chunk_size(s: &str) -> u64 {
 ///
 /// For S3 sources, this generates a pre-signed URL and stores it in the
 /// returned data so the caller can replace the resource URL.
-async fn resolve_source_auth(
+pub(crate) async fn resolve_source_auth(
     resource: &Resource,
     auth_registry: Option<&AuthProviderRegistry>,
-) -> Result<Option<String>, JobErrorOutcome> {
+) -> Result<Option<String>, AuthResolutionError> {
     let config = resource.config.as_ref();
     let source_auth = config
         .and_then(|c| c.source_auth.as_deref())
@@ -65,16 +65,16 @@ async fn resolve_source_auth(
     match provider {
         Some(name @ ("gdrive" | "dropbox")) => {
             let registry = auth_registry.ok_or_else(|| {
-                JobErrorOutcome::Fatal(format!(
-                    "Source auth requires {} but no auth registry configured",
-                    name
-                ))
+                AuthResolutionError::NoRegistry(name.to_string())
             })?;
             let tp = registry.get(name).ok_or_else(|| {
-                JobErrorOutcome::Fatal(format!("Source auth provider '{}' not registered", name))
+                AuthResolutionError::Unregistered(name.to_string())
             })?;
             let token = tp.access_token().await.map_err(|e| {
-                JobErrorOutcome::Fatal(format!("Token refresh failed for {name}: {e}"))
+                AuthResolutionError::TokenRefresh {
+                    provider: name.to_string(),
+                    error: e.to_string(),
+                }
             })?;
             Ok(Some(token))
         }
@@ -85,17 +85,10 @@ async fn resolve_source_auth(
             tracing::info!("S3 source auth: generating pre-signed URL");
             match generate_s3_presigned_url(resource.url.as_str()).await {
                 Ok(presigned_url) => {
-                    // We can't modify the resource in place, so we return the URL
-                    // and let the caller use it. For simplicity, return None for auth token
-                    // and let the caller handle URL replacement.
                     tracing::info!("Generated pre-signed S3 URL");
-                    // Convert pre-signed URL to a header: we pass the pre-signed URL
-                    // as if it were an auth token, but the caller knows to check for S3.
                     Ok(Some(format!("__S3_PRESIGNED__{}", presigned_url)))
                 }
-                Err(e) => Err(JobErrorOutcome::Fatal(format!(
-                    "Failed to generate S3 presigned URL: {e}"
-                ))),
+                Err(e) => Err(AuthResolutionError::S3Presign(e)),
             }
         }
         None | Some(_) => Ok(None),
@@ -275,8 +268,8 @@ impl super::JobHandler for FileJobHandler {
         let threshold_bytes = ctx.config.compression_threshold_mb * 1024 * 1024;
         let pr = ctx.progress.as_ref();
 
-        // ── Phase 0: Resolve source auth ─────────────────────────────────
-        let auth_token = resolve_source_auth(resource, ctx.auth_registry.as_deref()).await?;
+        // ── Phase 0: Use pre-resolved source auth ─────────────────────────
+        let auth_token = ctx.auth_token.clone();
 
         // ── Phase 1: HEAD preflight ──────────────────────────────────────
         if let Some(pr) = pr {

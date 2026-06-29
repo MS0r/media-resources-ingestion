@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::{
     auth::AuthProviderRegistry,
     error::ToolError,
-    handlers::jobs::JobContext,
+    handlers::jobs::{resolve_source_auth, JobContext},
     models::AppConfig,
     services::{mongo::MongoService, redis::RedisService},
     storage::ProviderCache,
@@ -71,10 +71,6 @@ impl ContextFactory {
         self.http_client.clone()
     }
 
-    pub fn auth_registry(&self) -> Option<Arc<AuthProviderRegistry>> {
-        self.auth_registry.clone()
-    }
-
     pub fn provider_cache(&self) -> Arc<ProviderCache> {
         self.provider_cache.clone()
     }
@@ -82,13 +78,15 @@ impl ContextFactory {
     pub async fn build_file_context(&self, job_id: &str) -> Result<JobContext, ToolError> {
         if let Some(file_job) = self.mongo.get_file_job(job_id).await? {
             tracing::info!(job_id = %job_id, "Building file job context from Mongo");
+            let auth_token = resolve_source_auth(&file_job.resource, self.auth_registry.as_deref())
+                .await?;
             Ok(JobContext::from_file_job(
                 file_job,
                 self.mongo.clone(),
                 self.redis.clone(),
                 self.config.clone(),
                 self.http_client.clone(),
-                self.auth_registry.clone(),
+                auth_token,
                 &self.provider_cache,
             ))
         } else {
@@ -105,7 +103,6 @@ impl ContextFactory {
                 self.redis.clone(),
                 self.config.clone(),
                 self.http_client.clone(),
-                self.auth_registry.clone(),
                 &self.provider_cache,
             ))
         } else {
