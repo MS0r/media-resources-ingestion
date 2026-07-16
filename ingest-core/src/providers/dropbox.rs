@@ -1,55 +1,21 @@
 use async_trait::async_trait;
 use std::sync::Arc;
-use tokio::sync::OnceCell;
+use tokio_util::io::ReaderStream;
 
-use crate::auth::{OAuthTokenProvider, TokenProvider};
-use crate::error::ToolError;
+use crate::auth::TokenProvider;
 use crate::storage::{DynError, StorageProvider};
 
 pub struct DropboxProvider {
-    token_provider: OnceCell<Arc<dyn TokenProvider>>,
+    token_provider: Arc<dyn TokenProvider>,
 }
 
 impl DropboxProvider {
-    pub fn new() -> Self {
-        Self {
-            token_provider: OnceCell::new(),
-        }
-    }
-
-    /// Create from environment variables (`DROPBOX_APP_KEY`, `_SECRET`, `_REFRESH_TOKEN`).
-    pub fn from_env() -> Result<Self, ToolError> {
-        let _ = OAuthTokenProvider::from_env(
-            "DROPBOX",
-            "https://api.dropbox.com/oauth2/token",
-            "dropbox",
-        )?;
-        Ok(Self::new())
-    }
-
-    async fn token_provider(&self) -> &Arc<dyn TokenProvider> {
-        self.token_provider
-            .get_or_init(|| async {
-                match OAuthTokenProvider::from_env_or_file(
-                    "DROPBOX",
-                    "https://api.dropbox.com/oauth2/token",
-                    "dropbox",
-                ) {
-                    Ok(p) => Arc::new(p) as Arc<dyn TokenProvider>,
-                    Err(e) => {
-                        tracing::error!("Dropbox auth not configured: {e}");
-                        Arc::new(crate::auth::StaticTokenProvider::new(
-                            String::new(),
-                            "dropbox-unconfigured",
-                        ))
-                    }
-                }
-            })
-            .await
+    pub fn new(token_provider: Arc<dyn TokenProvider>) -> Self {
+        Self { token_provider }
     }
 
     async fn token_string(&self) -> Result<String, DynError> {
-        Ok(self.token_provider().await.access_token().await?)
+        Ok(self.token_provider.access_token().await?)
     }
 
     /// Read a failed response body and return a description that includes both
@@ -100,10 +66,7 @@ impl DropboxProvider {
 impl StorageProvider for DropboxProvider {
     async fn upload(&self, path: &str, file: &mut tokio::fs::File) -> Result<(), DynError> {
         let token = self.token_string().await?;
-
-        use tokio::io::AsyncReadExt;
-        let mut data = Vec::new();
-        file.read_to_end(&mut data).await?;
+        let file_size = file.metadata().await?.len();
 
         let api_path = Self::dropbox_path(path);
         let dropbox_arg = serde_json::json!({
@@ -114,13 +77,15 @@ impl StorageProvider for DropboxProvider {
             "strict_conflict": false,
         });
 
+        let stream = ReaderStream::new(file.try_clone().await?);
         let client = wreq::Client::new();
         let resp = client
             .post("https://content.dropboxapi.com/2/files/upload")
             .bearer_auth(&token)
             .header("Dropbox-API-Arg", dropbox_arg.to_string())
             .header("Content-Type", "application/octet-stream")
-            .body(data)
+            .header("Content-Length", file_size.to_string())
+            .body(wreq::Body::wrap_stream(stream))
             .send()
             .await?;
 

@@ -4,6 +4,7 @@ use crate::{
     models::{ChunkRef, JobStatusFilter, ProgressEvent, ProgressJobType, ProgressStatus},
     services::mongo::MongoService,
 };
+use futures_util::StreamExt;
 use redis::{AsyncCommands, Client, aio::MultiplexedConnection};
 
 #[derive(Clone)]
@@ -256,10 +257,17 @@ impl RedisService {
     pub async fn recover_orphaned_jobs(&self) -> Result<usize, ToolError> {
         let mut conn = self.get_connection().await?;
 
-        let running_keys: Vec<String> = conn.keys("jobs:running:*").await?;
+        let keys: Vec<String> = {
+            let iter = conn.scan_match("jobs:running:*").await.map_err(|e| {
+                tracing::error!(error = %e, "Failed to scan for orphaned jobs");
+                ToolError::from(e)
+            })?;
+            let res: Vec<Result<String, _>> = iter.collect().await;
+            res.into_iter().filter_map(|r| r.ok()).collect()
+        };
 
-        let mut recovered = 0usize;
-        for key in running_keys {
+        let mut rec = 0usize;
+        for key in keys {
             let job_id = key
                 .strip_prefix("jobs:running:")
                 .unwrap_or(&key)
@@ -282,17 +290,15 @@ impl RedisService {
             let _: () = conn.hset(&state_key, "status", "pending").await?;
             let _: () = conn.del(&key).await?;
             let _: () = conn.zadd("jobs:pending", &member, 0.0).await?;
-            recovered += 1;
+            rec += 1;
             tracing::info!(job_id = %job_id, kind = ?kind, "Recovered orphaned job");
         }
 
-        if recovered > 0 {
-            tracing::warn!(
-                count = recovered,
-                "Recovered orphaned jobs from crashed workers"
-            );
+        if rec > 0 {
+            tracing::warn!(count = rec, "Recovered orphaned jobs from crashed workers");
         }
-        Ok(recovered)
+
+        Ok(rec)
     }
 
     /// Cancels all pending jobs in a batch by removing their IDs from the
@@ -309,20 +315,6 @@ impl RedisService {
             }
         }
         tracing::info!(count = removed, "Cancelled jobs from Redis pending queue");
-        Ok(removed)
-    }
-
-    /// Cancels a list of specific job IDs from the pending queue.
-    pub async fn cancel_jobs(&self, job_ids: &[String]) -> Result<usize, ToolError> {
-        let mut conn = self.get_connection().await?;
-        let mut removed = 0usize;
-        for job_id in job_ids {
-            for prefix in &["file", "chunk"] {
-                let member = format!("{}:{}", prefix, job_id);
-                let n: usize = conn.zrem("jobs:pending", &member).await?;
-                removed += n;
-            }
-        }
         Ok(removed)
     }
 

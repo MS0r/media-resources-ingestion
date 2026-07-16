@@ -337,7 +337,6 @@ pub(crate) async fn compress_video_local(
         let mut ost = octx.add_stream(encoder_codec)?;
         ost.set_parameters(&video_encoder);
     }
-    
 
     let mut audio_encoder = None;
     let mut audio_filter = None;
@@ -393,14 +392,14 @@ pub(crate) async fn compress_video_local(
         audio_ost_index = Some(ost_idx);
     }
 
-    octx.set_metadata(ictx.metadata().to_owned());    
+    octx.set_metadata(ictx.metadata().to_owned());
     octx.write_header()?;
 
     if let Some(ost_idx) = audio_ost_index {
-        audio_ostb = Some(octx
-            .stream(ost_idx)
-            .ok_or_else(|| JobError::OtherFatal("Missing audio output stream".into()))?
-            .time_base()
+        audio_ostb = Some(
+            octx.stream(ost_idx)
+                .ok_or_else(|| JobError::OtherFatal("Missing audio output stream".into()))?
+                .time_base(),
         );
     }
 

@@ -1,10 +1,6 @@
 use std::path::PathBuf;
 
-use crate::{
-    config::{EnqueueConfig, RunConfig},
-    settings::TomlRawConfig,
-    storage::Provider,
-};
+use crate::{config::RunConfig, settings::TomlRawConfig, storage::Provider};
 use mongodb::bson::DateTime as MongoDateTime;
 use serde::{Deserialize, Serialize};
 use url::Url;
@@ -327,24 +323,6 @@ pub fn extract_run_config(
     Ok((config, resources))
 }
 
-pub fn extract_enqueue_config(
-    yaml_config: IngestionConfig,
-    toml_config: TomlRawConfig,
-    enqueue_args: EnqueueConfig,
-    redis_uri: String,
-    mongo_uri: String,
-) -> Result<(AppConfig, Vec<Resource>), crate::error::ToolError> {
-    let config = AppConfig::from_enqueue_args(
-        &yaml_config,
-        toml_config,
-        enqueue_args,
-        redis_uri,
-        mongo_uri,
-    );
-    let resources = yaml_config.resources;
-    Ok((config, resources))
-}
-
 impl AppConfig {
     pub fn from_sources(
         yaml: &IngestionConfig,
@@ -437,62 +415,6 @@ impl AppConfig {
             dry_run: false,
             follow: false,
             output: OutputFormat::Table,
-        }
-    }
-
-    pub fn from_enqueue_args(
-        yaml: &IngestionConfig,
-        toml: TomlRawConfig,
-        args: EnqueueConfig,
-        redis_uri: String,
-        mongo_uri: String,
-    ) -> Self {
-        let (default_provider, default_path) = match &yaml.default_dest {
-            Some(dest) => {
-                let pr = match &dest.provider {
-                    Some(p) => p.to_string(),
-                    None => toml.storage.default_provider,
-                };
-                let pa = match &dest.path {
-                    Some(p) => p.to_string(),
-                    None => toml.storage.default_path,
-                };
-                (pr, pa)
-            }
-            None => (toml.storage.default_provider, toml.storage.default_path),
-        };
-        let chunk_size = yaml.chunk_size.clone().unwrap_or(toml.storage.chunk_size);
-        let priority = args.priority.or(yaml.priority).unwrap_or(0);
-        let quality = yaml.quality.or(Some(toml.compression.quality));
-        let file_workers = args.workers.unwrap_or(toml.scheduler.file_workers);
-
-        Self {
-            redis_uri,
-            mongo_uri,
-            file_workers,
-            chunk_workers: toml.scheduler.chunk_workers,
-            max_pending_jobs: toml.scheduler.max_pending_jobs,
-            max_per_host: toml.scheduler.max_per_host,
-            job_timeout_secs: toml.scheduler.job_timeout_secs,
-            compression_threshold_mb: toml.compression.threshold_mb,
-            compression_quality: toml.compression.quality,
-            compression_timeout_secs: toml.compression.max_compression_seconds,
-            default_provider,
-            default_path,
-            chunk_size,
-            temp_dir: toml.storage.temp_dir,
-            running_job_ttl_secs: toml.retry.running_job_ttl_secs,
-            max_retries: toml.retry.max_attempts,
-            backoff_secs: toml.retry.backoff_secs.clone(),
-            compression_override: yaml.compression_override.clone(),
-            headers: yaml.headers.clone(),
-            quality,
-            source_auth: yaml.source_auth.clone(),
-            yaml_path: args.yaml_path.clone(),
-            priority,
-            dry_run: args.dry_run,
-            follow: false,
-            output: args.output,
         }
     }
 }

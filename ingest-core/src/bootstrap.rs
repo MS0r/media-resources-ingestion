@@ -202,7 +202,7 @@ pub async fn worker_with_services(
     let chunk_handler = Arc::new(ChunkJobHandler);
 
     // Initialize auth providers
-    let auth_registry = Arc::new(init_auth_registry());
+    let auth_registry = init_auth_registry();
 
     tracing::info!("Starting worker mode");
     tracing::info!(
@@ -218,7 +218,7 @@ pub async fn worker_with_services(
         mongo_service,
         redis_service,
         config,
-        Some(auth_registry),
+        auth_registry,
     )?);
 
     scheduler_loop(

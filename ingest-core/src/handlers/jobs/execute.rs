@@ -3,11 +3,10 @@ use chrono::Utc;
 
 use crate::{
     AppConfig,
-    auth::AuthProviderRegistry,
     error::{AuthResolutionError, JobErrorOutcome},
     models::{ChunkRef, CompressionOverride, GenericCompressionStrategy, Resource},
     services::mongo::UpsertResult,
-    storage::Provider,
+    storage::{Provider, ProviderCache},
 };
 
 use super::{
@@ -47,7 +46,7 @@ fn parse_chunk_size(s: &str) -> u64 {
 /// returned data so the caller can replace the resource URL.
 pub(crate) async fn resolve_source_auth(
     resource: &Resource,
-    auth_registry: Option<&AuthProviderRegistry>,
+    provider_cache: &ProviderCache,
 ) -> Result<Option<String>, AuthResolutionError> {
     let config = resource.config.as_ref();
     let source_auth = config
@@ -55,7 +54,7 @@ pub(crate) async fn resolve_source_auth(
         .unwrap_or("auto");
 
     let provider = if source_auth == "auto" {
-        AuthProviderRegistry::detect_from_url(resource.url.as_str())
+        ProviderCache::detect_from_url(resource.url.as_str())
     } else if source_auth == "headers" || source_auth == "none" || source_auth == "auto" {
         None
     } else {
@@ -64,18 +63,16 @@ pub(crate) async fn resolve_source_auth(
 
     match provider {
         Some(name @ ("gdrive" | "dropbox")) => {
-            let registry = auth_registry.ok_or_else(|| {
-                AuthResolutionError::NoRegistry(name.to_string())
-            })?;
-            let tp = registry.get(name).ok_or_else(|| {
-                AuthResolutionError::Unregistered(name.to_string())
-            })?;
-            let token = tp.access_token().await.map_err(|e| {
-                AuthResolutionError::TokenRefresh {
+            let tp = provider_cache
+                .get_token_provider(name)
+                .ok_or_else(|| AuthResolutionError::Unregistered(name.to_string()))?;
+            let token = tp
+                .access_token()
+                .await
+                .map_err(|e| AuthResolutionError::TokenRefresh {
                     provider: name.to_string(),
                     error: e.to_string(),
-                }
-            })?;
+                })?;
             Ok(Some(token))
         }
         Some("s3") => {
@@ -367,41 +364,12 @@ impl super::JobHandler for FileJobHandler {
                         spawn_chunk_jobs(file_job, byte_count, &ctx.config, auth_token.as_deref())
                             .await?;
                     return Ok(JobOutcome::SpawnedChunks(chunks));
-                }
-
-                // Probe: send a Range: 0-0 to check server support
-                let (auth, cookie) = resolve_auth_for_chunks(resource, auth_token.as_deref());
-                let auth_ref = auth.as_deref();
-                let cookie_ref = cookie.as_deref();
-
-                match initiate_range_download(
-                    &resource.url,
-                    0,
-                    0,
-                    auth_ref,
-                    cookie_ref,
-                    &ctx.http_client,
-                )
-                .await
-                {
-                    Ok((probe, _)) if probe.status() == 206 => {
-                        drop(probe);
-                        let chunks = spawn_chunk_jobs(
-                            file_job,
-                            byte_count,
-                            &ctx.config,
-                            auth_token.as_deref(),
-                        )
-                        .await?;
-                        return Ok(JobOutcome::SpawnedChunks(chunks));
-                    }
-                    _ => {
-                        return Err(JobErrorOutcome::Fatal(format!(
-                            "File exceeds {} MB threshold (streamed {} bytes) but server does not \
+                } else {
+                    return Err(JobErrorOutcome::Fatal(format!(
+                        "File exceeds {} MB threshold (streamed {} bytes) but server does not \
                          support Range requests — cannot chunk",
-                            ctx.config.compression_threshold_mb, byte_count
-                        )));
-                    }
+                        ctx.config.compression_threshold_mb, byte_count
+                    )));
                 }
             }
         };

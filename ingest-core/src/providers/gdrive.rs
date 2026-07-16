@@ -4,65 +4,31 @@ use std::{
     path::{Component, Path},
     sync::Arc,
 };
-use tokio::{
-    fs::File,
-    sync::{Mutex, OnceCell},
-};
+use tokio::{fs::File, sync::Mutex};
+use tokio_util::io::ReaderStream;
 
 use crate::{
-    auth::{OAuthTokenProvider, StaticTokenProvider, TokenProvider},
-    error::ToolError,
+    auth::TokenProvider,
     storage::{DynError, StorageProvider},
 };
 
 pub struct GDriveProvider {
     parent_folder_id: String,
-    token_provider: OnceCell<Arc<dyn TokenProvider>>,
+    token_provider: Arc<dyn TokenProvider>,
     folder_cache: Mutex<HashMap<String, String>>,
 }
 
 impl GDriveProvider {
-    pub fn new(parent_folder_id: String) -> Self {
+    pub fn new(parent_folder_id: String, token_provider: Arc<dyn TokenProvider>) -> Self {
         Self {
             parent_folder_id,
-            token_provider: OnceCell::new(),
+            token_provider,
             folder_cache: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Create from environment variables (`GDRIVE_CLIENT_ID` + `_SECRET` + `_REFRESH_TOKEN`).
-    pub fn from_env(parent_folder_id: String) -> Result<Self, ToolError> {
-        let _ = OAuthTokenProvider::from_env_or_file(
-            "GDRIVE",
-            "https://oauth2.googleapis.com/token",
-            "gdrive",
-        )?;
-        Ok(Self::new(parent_folder_id))
-    }
-
-    async fn token_provider(&self) -> &Arc<dyn TokenProvider> {
-        self.token_provider
-            .get_or_init(|| async {
-                match OAuthTokenProvider::from_env_or_file(
-                    "GDRIVE",
-                    "https://oauth2.googleapis.com/token",
-                    "gdrive",
-                ) {
-                    Ok(p) => Arc::new(p) as Arc<dyn TokenProvider>,
-                    Err(e) => {
-                        tracing::error!("GDrive auth not configured: {e}");
-                        Arc::new(StaticTokenProvider::new(
-                            String::new(),
-                            "gdrive-unconfigured",
-                        ))
-                    }
-                }
-            })
-            .await
-    }
-
     async fn token_string(&self) -> Result<String, DynError> {
-        Ok(self.token_provider().await.access_token().await?)
+        Ok(self.token_provider.access_token().await?)
     }
 
     /// Walk the directory path components under `self.parent_folder_id`,
@@ -96,7 +62,7 @@ impl GDriveProvider {
                 }
                 accumulated.push_str(name_str);
 
-                // Check cache again for this sub-path
+                // Check cache for this sub-path
                 {
                     let cache = self.folder_cache.lock().await;
                     if let Some(id) = cache.get(&accumulated) {
@@ -105,7 +71,6 @@ impl GDriveProvider {
                     }
                 }
 
-                // Build query: find folder with this name under current parent
                 let q = format!(
                     "name='{}' and '{}' in parents and mimeType='application/vnd.google-apps.folder'",
                     name_str.replace('\'', "\\'"),
@@ -141,7 +106,35 @@ impl GDriveProvider {
                             .await?;
 
                         let create_status = create_resp.status();
-                        if !create_status.is_success() {
+                        if create_status.is_success() {
+                            let created: serde_json::Value = create_resp.json().await?;
+                            created["id"]
+                                .as_str()
+                                .ok_or("GDrive folder creation returned no id")?
+                                .to_string()
+                        } else if create_status == 409 {
+                            // A concurrent worker created the folder between our
+                            // query and create call. Re-query to get its ID.
+                            tracing::debug!(
+                                "GDrive folder '{}' already exists under '{}', re-querying",
+                                name_str,
+                                current_parent
+                            );
+                            let resp2 = client.get(&url).bearer_auth(token).send().await?;
+                            let body2: serde_json::Value = resp2.json().await?;
+                            let files2 = body2["files"].as_array().cloned().unwrap_or_default();
+                            files2
+                                .into_iter()
+                                .next()
+                                .and_then(|f| f["id"].as_str().map(String::from))
+                                .ok_or_else(|| -> DynError {
+                                    format!(
+                                        "GDrive folder '{}' created by concurrent worker but not found on re-query",
+                                        name_str
+                                    )
+                                    .into()
+                                })?
+                        } else {
                             let text = create_resp.text().await.unwrap_or_default();
                             return Err(format!(
                                 "GDrive folder creation failed: HTTP {} - {}",
@@ -149,11 +142,6 @@ impl GDriveProvider {
                             )
                             .into());
                         }
-                        let created: serde_json::Value = create_resp.json().await?;
-                        created["id"]
-                            .as_str()
-                            .ok_or("GDrive folder creation returned no id")?
-                            .to_string()
                     }
                 } else {
                     let query_status = resp.status();
@@ -201,16 +189,13 @@ impl StorageProvider for GDriveProvider {
         // Start resumable upload session
         let upload_url = start_drive_session(&token, file_size, file_name, &parent_id).await?;
 
-        // Read file and upload
-        use tokio::io::AsyncReadExt;
-        let mut data = Vec::new();
-        file.read_to_end(&mut data).await?;
-
+        // Stream file and upload
+        let stream = ReaderStream::new(file.try_clone().await?);
         let client = wreq::Client::new();
         let resp = client
             .put(&upload_url)
-            .header("Content-Length", data.len().to_string())
-            .body(data)
+            .header("Content-Length", file_size.to_string())
+            .body(wreq::Body::wrap_stream(stream))
             .send()
             .await?;
 

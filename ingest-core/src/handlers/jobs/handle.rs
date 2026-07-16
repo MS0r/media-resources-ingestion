@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::{
-    error::{JobError, JobErrorOutcome},
+    error::JobErrorOutcome,
     handlers::jobs::{
         compression::{
             compress_generic_local, compress_image_local, compress_video_local,

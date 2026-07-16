@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::{
     auth::AuthProviderRegistry,
     error::ToolError,
-    handlers::jobs::{resolve_source_auth, JobContext},
+    handlers::jobs::{JobContext, resolve_source_auth},
     models::AppConfig,
     services::{mongo::MongoService, redis::RedisService},
     storage::ProviderCache,
@@ -14,20 +14,19 @@ use wreq::{
 };
 
 pub struct ContextFactory {
-    mongo: Arc<MongoService>,
+    db: Arc<MongoService>,
     redis: Arc<RedisService>,
     config: Arc<AppConfig>,
     http_client: Arc<Client>,
-    auth_registry: Option<Arc<AuthProviderRegistry>>,
     provider_cache: Arc<ProviderCache>,
 }
 
 impl ContextFactory {
     pub fn new(
-        mongo: MongoService,
+        db: MongoService,
         redis: RedisService,
         config: AppConfig,
-        auth_registry: Option<Arc<AuthProviderRegistry>>,
+        auth_registry: AuthProviderRegistry,
     ) -> Result<Self, ToolError> {
         let mut default_headers = HeaderMap::new();
         default_headers.insert(
@@ -46,12 +45,11 @@ impl ContextFactory {
         );
 
         Ok(Self {
-            mongo: Arc::new(mongo),
+            db: Arc::new(db),
             redis: Arc::new(redis),
             config: Arc::new(config),
             http_client,
-            auth_registry,
-            provider_cache: Arc::new(ProviderCache::new()),
+            provider_cache: Arc::new(ProviderCache::new(auth_registry)),
         })
     }
 
@@ -59,8 +57,8 @@ impl ContextFactory {
         self.redis.clone()
     }
 
-    pub fn mongo_service(&self) -> Arc<MongoService> {
-        self.mongo.clone()
+    pub fn db_service(&self) -> Arc<MongoService> {
+        self.db.clone()
     }
 
     pub fn config(&self) -> Arc<AppConfig> {
@@ -76,13 +74,12 @@ impl ContextFactory {
     }
 
     pub async fn build_file_context(&self, job_id: &str) -> Result<JobContext, ToolError> {
-        if let Some(file_job) = self.mongo.get_file_job(job_id).await? {
+        if let Some(file_job) = self.db.get_file_job(job_id).await? {
             tracing::info!(job_id = %job_id, "Building file job context from Mongo");
-            let auth_token = resolve_source_auth(&file_job.resource, self.auth_registry.as_deref())
-                .await?;
+            let auth_token = resolve_source_auth(&file_job.resource, &self.provider_cache).await?;
             Ok(JobContext::from_file_job(
                 file_job,
-                self.mongo.clone(),
+                self.db.clone(),
                 self.redis.clone(),
                 self.config.clone(),
                 self.http_client.clone(),
@@ -95,11 +92,11 @@ impl ContextFactory {
     }
 
     pub async fn build_chunk_context(&self, job_id: &str) -> Result<JobContext, ToolError> {
-        if let Some(chunk_job) = self.mongo.get_chunk_job(job_id).await? {
+        if let Some(chunk_job) = self.db.get_chunk_job(job_id).await? {
             tracing::info!(job_id = %job_id, "Building chunk job context from Mongo");
             Ok(JobContext::from_chunk_job(
                 chunk_job,
-                self.mongo.clone(),
+                self.db.clone(),
                 self.redis.clone(),
                 self.config.clone(),
                 self.http_client.clone(),

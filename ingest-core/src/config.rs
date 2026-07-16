@@ -14,13 +14,3 @@ pub struct RunConfig {
     pub no_follow: bool,
     pub output: OutputFormat,
 }
-
-/// Non-CLI configuration for the `enqueue` command.
-#[derive(Debug, Clone)]
-pub struct EnqueueConfig {
-    pub yaml_path: PathBuf,
-    pub dry_run: bool,
-    pub priority: Option<i32>,
-    pub workers: Option<usize>,
-    pub output: OutputFormat,
-}

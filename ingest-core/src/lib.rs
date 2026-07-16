@@ -12,7 +12,7 @@ pub mod settings;
 pub mod storage;
 
 pub use bootstrap::enqueue;
-pub use config::{EnqueueConfig, RunConfig};
+pub use config::RunConfig;
 pub use error::ToolError;
 pub use models::{AppConfig, JobStatusFilter, OutputFormat};
 pub use services::mongo::MongoService;

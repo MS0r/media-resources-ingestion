@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::primitives::{ByteStream, Length};
 use tokio::sync::OnceCell;
 
 use crate::error::ToolError;
@@ -44,10 +44,12 @@ impl S3Provider {
 #[async_trait]
 impl StorageProvider for S3Provider {
     async fn upload(&self, path: &str, file: &mut tokio::fs::File) -> Result<(), DynError> {
-        use tokio::io::AsyncReadExt;
-        let mut data = Vec::new();
-        file.read_to_end(&mut data).await?;
-        let body = ByteStream::from(data);
+        let file_size = file.metadata().await?.len();
+        let body = ByteStream::read_from()
+            .file(file.try_clone().await?)
+            .length(Length::Exact(file_size))
+            .build()
+            .await?;
         self.client()
             .await
             .put_object()

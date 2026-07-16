@@ -24,7 +24,7 @@ pub use oauth::OAuthTokenProvider;
 pub use static_provider::StaticTokenProvider;
 
 /// Registry of named token providers, initialized once at startup.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct AuthProviderRegistry {
     providers: Vec<(String, Arc<dyn TokenProvider>)>,
 }

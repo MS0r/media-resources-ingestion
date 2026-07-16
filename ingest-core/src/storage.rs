@@ -5,7 +5,10 @@ use std::sync::Arc;
 use tokio::fs::File;
 use tokio::io::AsyncRead;
 
-use crate::providers::{DropboxProvider, GDriveProvider, S3Provider};
+use crate::{
+    auth::{AuthProviderRegistry, StaticTokenProvider, TokenProvider},
+    providers::{DropboxProvider, GDriveProvider, S3Provider},
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(rename_all = "lowercase")]
@@ -37,18 +40,14 @@ impl From<String> for Provider {
             _ => Provider::Local,
         }
     }
-}  
+}
 
 pub type DynError = Box<dyn Error + Send + Sync>;
 
 #[async_trait]
 pub trait StorageProvider: Send + Sync {
-    async fn upload(&self, path: &str, file: &mut File)
-    -> Result<(), DynError>;
-    async fn download(
-        &self,
-        path: &str,
-    ) -> Result<Box<dyn AsyncRead + Unpin + Send>, DynError>;
+    async fn upload(&self, path: &str, file: &mut File) -> Result<(), DynError>;
+    async fn download(&self, path: &str) -> Result<Box<dyn AsyncRead + Unpin + Send>, DynError>;
     async fn health_check(&self) -> Result<(), DynError>;
 }
 
@@ -86,30 +85,46 @@ impl StorageProvider for LocalProvider {
 ///
 /// Each provider is created at construction time with its default configuration.
 /// `get()` returns an `Arc::clone` — a cheap ref-count bump.
+///
+/// Also owns the `AuthProviderRegistry` so that source-auth resolution
+/// for downloads can reuse the same token providers used for storage.
 pub struct ProviderCache {
     local: Arc<dyn StorageProvider>,
     gdrive: Arc<dyn StorageProvider>,
     dropbox: Arc<dyn StorageProvider>,
     s3: Arc<dyn StorageProvider>,
+    auth_registry: AuthProviderRegistry,
 }
 
 impl ProviderCache {
-    pub fn new() -> Self {
+    pub fn new(auth_registry: AuthProviderRegistry) -> Self {
         Self {
             local: Arc::new(LocalProvider),
             gdrive: Arc::new({
                 let gdrive_root =
-                    std::env::var("GDRIVE_FOLDER_ID").unwrap_or_else(|_| "root".into());
-                GDriveProvider::from_env(gdrive_root)
-                    .unwrap_or_else(|_| GDriveProvider::new("root".into()))
+                    std::env::var("GDRIVE_PARENT_FOLDER_ID").unwrap_or_else(|_| "root".into());
+                let token = auth_registry.get("gdrive").unwrap_or_else(|| {
+                    Arc::new(StaticTokenProvider::new(
+                        String::new(),
+                        "gdrive-unconfigured",
+                    ))
+                });
+                GDriveProvider::new(gdrive_root, token)
             }),
-            dropbox: Arc::new(
-                DropboxProvider::from_env().unwrap_or_else(|_| DropboxProvider::new()),
-            ),
+            dropbox: Arc::new({
+                let token = auth_registry.get("dropbox").unwrap_or_else(|| {
+                    Arc::new(StaticTokenProvider::new(
+                        String::new(),
+                        "dropbox-unconfigured",
+                    ))
+                });
+                DropboxProvider::new(token)
+            }),
             s3: Arc::new({
                 let bucket = std::env::var("AWS_BUCKET").unwrap_or_else(|_| "default".into());
                 S3Provider::new(bucket)
             }),
+            auth_registry,
         }
     }
 
@@ -120,6 +135,15 @@ impl ProviderCache {
             Provider::Dropbox => self.dropbox.clone(),
             Provider::S3 => self.s3.clone(),
         }
+    }
+
+    pub fn get_token_provider(&self, name: &str) -> Option<Arc<dyn TokenProvider>> {
+        self.auth_registry.get(name)
+    }
+
+    /// Attempt to detect the source provider from a URL hostname.
+    pub fn detect_from_url(url: &str) -> Option<&'static str> {
+        AuthProviderRegistry::detect_from_url(url)
     }
 }
 
@@ -202,7 +226,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_provider_cache_get_local() {
-        let cache = ProviderCache::new();
+        let cache = ProviderCache::new(AuthProviderRegistry::new());
         let local = cache.get(&Provider::Local);
         // verify it returns a valid provider (health_check passes)
         assert!(local.health_check().await.is_ok());

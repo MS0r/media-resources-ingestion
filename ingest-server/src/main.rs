@@ -1,12 +1,8 @@
-use std::{net::SocketAddr, env::var as env_var};
+use std::{env::var as env_var, net::SocketAddr};
 
-use tracing_subscriber::{registry, fmt::layer};
 use ingest_core::ToolError;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
-
-fn init_ffmpeg() {
-    ffmpeg_next::init().ok();
-}
+use tracing_subscriber::{fmt::layer, registry};
 
 fn setup_logging() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
@@ -24,7 +20,6 @@ fn setup_logging() {
 async fn main() -> Result<(), ToolError> {
     dotenvy::dotenv().ok();
     setup_logging();
-    init_ffmpeg();
 
     let addr: SocketAddr = std::env::var("INGEST_SERVER_ADDR")
         .unwrap_or_else(|_| "[::1]:50051".into())

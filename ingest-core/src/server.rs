@@ -254,7 +254,7 @@ impl IngestService for IngestServer {
             .map_err(internal_err)?
         {
             self.redis
-                .cancel_jobs(&batch.job_ids)
+                .cancel_batch_jobs(&batch.job_ids)
                 .await
                 .map_err(internal_err)?;
             for job_id in &batch.job_ids {
@@ -408,7 +408,9 @@ impl From<ToolError> for Status {
             | ToolError::EnvError(_)
             | ToolError::UrlParseError(_) => Status::invalid_argument(e.to_string()),
 
-            ToolError::AuthError(_) | ToolError::AuthResolution(_) => Status::unauthenticated(e.to_string()),
+            ToolError::AuthError(_) | ToolError::AuthResolution(_) => {
+                Status::unauthenticated(e.to_string())
+            }
 
             ToolError::SemaphoreError(_) => Status::unavailable(e.to_string()),
 

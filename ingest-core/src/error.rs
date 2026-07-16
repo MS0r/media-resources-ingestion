@@ -15,8 +15,6 @@ use crate::storage::DynError;
 /// Errors that occur when resolving source auth tokens (OAuth, S3 presigning).
 #[derive(Error, Debug)]
 pub enum AuthResolutionError {
-    #[error("Source auth requires '{0}' but no auth registry configured")]
-    NoRegistry(String),
     #[error("Source auth provider '{0}' not registered in auth registry")]
     Unregistered(String),
     #[error("Token refresh failed for '{provider}': {error}")]
@@ -160,7 +158,7 @@ impl From<ToolError> for JobErrorOutcome {
             | ToolError::ConfigParseError(_)
             | ToolError::YamlError(_)
             | ToolError::ValidationError(_)
-            |             ToolError::AuthError(_)
+            | ToolError::AuthError(_)
             | ToolError::AuthResolution(_)
             | ToolError::EnvError(_)
             | ToolError::UrlParseError(_)
