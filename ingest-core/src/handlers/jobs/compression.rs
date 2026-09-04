@@ -71,6 +71,33 @@ pub(crate) async fn compress_image_local(
     original_name: &str,
     mime_type: &str,
     original_size: u64,
+    quality: u8,
+    temp_path: &str,
+    strategy: &ImageCompressionStrategy,
+) -> Result<(String, u64, String), JobError> {
+    let original_name = original_name.to_string();
+    let mime_type = mime_type.to_string();
+    let temp_path = temp_path.to_string();
+    let strategy = strategy.clone();
+
+    tokio::task::spawn_blocking(move || {
+        compress_image_local_inner(
+            &original_name,
+            &mime_type,
+            original_size,
+            quality,
+            &temp_path,
+            &strategy,
+        )
+    })
+    .await
+    .map_err(|e| JobError::OtherFatal(format!("Image compression join failed: {e}")))?
+}
+
+fn compress_image_local_inner(
+    original_name: &str,
+    mime_type: &str,
+    original_size: u64,
     _quality: u8,
     temp_path: &str,
     strategy: &ImageCompressionStrategy,

@@ -84,6 +84,19 @@ pub enum JobStatus {
     Cancelled,
 }
 
+impl JobStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Running { .. } => "running",
+            Self::Retrying { .. } => "retrying",
+            Self::Completed { .. } => "completed",
+            Self::Failed { .. } => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
 pub struct DownloadInfo {
     pub filename: String,
     pub extension: String,

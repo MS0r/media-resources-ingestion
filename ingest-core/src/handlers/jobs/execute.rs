@@ -204,6 +204,7 @@ async fn spawn_chunk_jobs(
         .and_then(|d| d.provider.clone())
         .unwrap_or(Provider::Local);
 
+    let now = Utc::now();
     let build_chunk = |i: u32| {
         let offset_start = (i as u64) * chunk_size;
         let offset_end = ((i as u64 + 1) * chunk_size - 1).min(total_size.saturating_sub(1));
@@ -228,8 +229,8 @@ async fn spawn_chunk_jobs(
             priority: file_job.priority as i64,
             status: JobStatus::Pending,
             retry_count: 0,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            created_at: now,
+            updated_at: now,
             chunk_hash: None,
             error: None,
             url: chunk_url,
@@ -243,7 +244,8 @@ async fn spawn_chunk_jobs(
         }
     };
 
-    let chunks: Vec<ChunkJob> = (0..total_chunks).map(build_chunk).collect();
+    let mut chunks: Vec<ChunkJob> = Vec::with_capacity(total_chunks as usize);
+    chunks.extend((0..total_chunks).map(build_chunk));
 
     tracing::info!(
         file_job_id = %file_job._id,
@@ -265,15 +267,12 @@ impl super::JobHandler for FileJobHandler {
         let threshold_bytes = ctx.config.compression_threshold_mb * 1024 * 1024;
         let pr = ctx.progress.as_ref();
 
-        // ── Phase 0: Use pre-resolved source auth ─────────────────────────
-        let auth_token = ctx.auth_token.clone();
-
         // ── Phase 1: HEAD preflight ──────────────────────────────────────
         if let Some(pr) = pr {
             pr.report("preflight", 1, Some(7), None).await;
         }
         let (head_size, head_ranges) =
-            match initiate_head(resource, &ctx.http_client, auth_token.as_deref()).await {
+            match initiate_head(resource, &ctx.http_client, ctx.auth_token.as_deref()).await {
                 Ok(info) => (info.content_length, info.accept_ranges),
                 Err(e) => {
                     tracing::warn!(error = %e, "HEAD preflight failed, falling back to GET");
@@ -289,7 +288,7 @@ impl super::JobHandler for FileJobHandler {
                             .await;
                     }
                     let chunks =
-                        spawn_chunk_jobs(file_job, size, &ctx.config, auth_token.as_deref())
+                        spawn_chunk_jobs(file_job, size, &ctx.config, ctx.auth_token.as_deref())
                             .await?;
                     return Ok(JobOutcome::SpawnedChunks(chunks));
                 }
@@ -305,7 +304,7 @@ impl super::JobHandler for FileJobHandler {
             pr.report("download", 2, Some(7), None).await;
         }
         let (response, mut download) =
-            initiate_download(resource, &ctx.http_client, auth_token.as_deref()).await?;
+            initiate_download(resource, &ctx.http_client, ctx.auth_token.as_deref()).await?;
 
         let resp_content_length = response.content_length();
         let resp_accept_ranges = response
@@ -323,7 +322,7 @@ impl super::JobHandler for FileJobHandler {
                         .await;
                 }
                 let chunks =
-                    spawn_chunk_jobs(file_job, resp_size, &ctx.config, auth_token.as_deref())
+                    spawn_chunk_jobs(file_job, resp_size, &ctx.config, ctx.auth_token.as_deref())
                         .await?;
                 return Ok(JobOutcome::SpawnedChunks(chunks));
             }
@@ -360,9 +359,13 @@ impl super::JobHandler for FileJobHandler {
                 );
 
                 if resp_accept_ranges {
-                    let chunks =
-                        spawn_chunk_jobs(file_job, byte_count, &ctx.config, auth_token.as_deref())
-                            .await?;
+                    let chunks = spawn_chunk_jobs(
+                        file_job,
+                        byte_count,
+                        &ctx.config,
+                        ctx.auth_token.as_deref(),
+                    )
+                    .await?;
                     return Ok(JobOutcome::SpawnedChunks(chunks));
                 } else {
                     return Err(JobErrorOutcome::Fatal(format!(
