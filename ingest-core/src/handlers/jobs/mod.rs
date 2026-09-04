@@ -13,6 +13,7 @@ use std::{path::PathBuf, sync::Arc};
 use crate::{
     error::JobErrorOutcome,
     models::{AppConfig, ChunkRef, Metadata},
+    services::heartbeat::HeartbeatSupervisor,
     services::redis::ProgressReporter,
     services::{mongo::MongoService, redis::RedisService},
     storage::{Provider, ProviderCache, StorageProvider},
@@ -37,6 +38,7 @@ pub struct JobContext {
     pub progress: Option<ProgressReporter>,
     pub http_client: Arc<wreq::Client>,
     pub auth_token: Option<String>,
+    pub heartbeat: Arc<HeartbeatSupervisor>,
 }
 
 impl JobContext {
@@ -48,6 +50,7 @@ impl JobContext {
         http_client: Arc<wreq::Client>,
         auth_token: Option<String>,
         provider_cache: &ProviderCache,
+        heartbeat: Arc<HeartbeatSupervisor>,
     ) -> Self {
         let progress = Some(ProgressReporter::new(job._id.clone(), (*redis).clone()));
         let storage = if let Some(dest) = &job.resource.dest
@@ -67,6 +70,7 @@ impl JobContext {
             progress,
             http_client,
             auth_token,
+            heartbeat,
         }
     }
 
@@ -77,6 +81,7 @@ impl JobContext {
         config: Arc<AppConfig>,
         http_client: Arc<wreq::Client>,
         provider_cache: &ProviderCache,
+        heartbeat: Arc<HeartbeatSupervisor>,
     ) -> Self {
         Self {
             storage: provider_cache.get(&job.storage),
@@ -87,6 +92,7 @@ impl JobContext {
             progress: None,
             http_client,
             auth_token: None,
+            heartbeat,
         }
     }
 

@@ -5,7 +5,7 @@ use crate::{
     error::ToolError,
     handlers::jobs::{JobContext, resolve_source_auth},
     models::AppConfig,
-    services::{mongo::MongoService, redis::RedisService},
+    services::{heartbeat::HeartbeatSupervisor, mongo::MongoService, redis::RedisService},
     storage::ProviderCache,
 };
 use wreq::{
@@ -19,6 +19,7 @@ pub struct ContextFactory {
     config: Arc<AppConfig>,
     http_client: Arc<Client>,
     provider_cache: Arc<ProviderCache>,
+    heartbeat: Arc<HeartbeatSupervisor>,
 }
 
 impl ContextFactory {
@@ -44,12 +45,16 @@ impl ContextFactory {
                 .map_err(|e| ToolError::Message(format!("Failed to build HTTP client: {e}")))?,
         );
 
+        let redis = Arc::new(redis);
+        let heartbeat = Arc::new(HeartbeatSupervisor::new());
+
         Ok(Self {
             db: Arc::new(db),
-            redis: Arc::new(redis),
+            redis,
             config: Arc::new(config),
             http_client,
             provider_cache: Arc::new(ProviderCache::new(auth_registry)),
+            heartbeat,
         })
     }
 
@@ -73,6 +78,10 @@ impl ContextFactory {
         self.provider_cache.clone()
     }
 
+    pub fn heartbeat(&self) -> Arc<HeartbeatSupervisor> {
+        self.heartbeat.clone()
+    }
+
     pub async fn build_file_context(&self, job_id: &str) -> Result<JobContext, ToolError> {
         if let Some(file_job) = self.db.get_file_job(job_id).await? {
             tracing::info!(job_id = %job_id, "Building file job context from Mongo");
@@ -85,6 +94,7 @@ impl ContextFactory {
                 self.http_client.clone(),
                 auth_token,
                 &self.provider_cache,
+                self.heartbeat.clone(),
             ))
         } else {
             Err(format!("File job {job_id} not found in Mongo").into())
@@ -101,6 +111,7 @@ impl ContextFactory {
                 self.config.clone(),
                 self.http_client.clone(),
                 &self.provider_cache,
+                self.heartbeat.clone(),
             ))
         } else {
             Err(format!("Chunk job {job_id} not found in Mongo").into())
