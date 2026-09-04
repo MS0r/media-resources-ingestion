@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::{
     AppConfig, JobStatusFilter, MongoService, ToolError, bootstrap,
     models::{self, ProgressEvent, ProgressJobType, ProgressStatus},
-    services::redis::RedisService,
+    services::redis::{RedisService, derive_worker_id},
     settings::load_toml,
 };
 use tonic::transport::Server;
@@ -33,6 +33,8 @@ pub struct IngestServer {
     mongo: MongoService,
     redis: RedisService,
     toml_config: crate::TomlRawConfig,
+    redis_uri: String,
+    mongo_uri: String,
 }
 
 impl IngestServer {
@@ -41,13 +43,20 @@ impl IngestServer {
         let mongo_uri = std::env::var("MONGODB_URI")?;
         let toml_config = load_toml(&toml_path.to_path_buf())?;
 
-        let mongo = MongoService::new(&mongo_uri).await?;
+        let mongo = MongoService::new(
+            &mongo_uri,
+            toml_config.scheduler.mongo_pool_min,
+            toml_config.scheduler.mongo_pool_max,
+        )
+        .await?;
         let redis = RedisService::new(&redis_uri, 3600, 3, vec![5, 30, 120])?;
 
         Ok(Self {
             mongo,
             redis,
             toml_config,
+            redis_uri,
+            mongo_uri,
         })
     }
 
@@ -58,8 +67,6 @@ impl IngestServer {
         file_workers: i32,
         dry_run: bool,
     ) -> Result<(AppConfig, Vec<models::Resource>), ToolError> {
-        let redis_uri = std::env::var("REDIS_URI")?;
-        let mongo_uri = std::env::var("MONGODB_URI")?;
         let yaml = load_yaml_from_str(yaml_content)?;
         let priority = if priority > 0 { Some(priority) } else { None };
         let workers = if file_workers > 0 {
@@ -82,8 +89,8 @@ impl IngestServer {
             &yaml,
             self.toml_config.clone(),
             run_config,
-            redis_uri,
-            mongo_uri,
+            self.redis_uri.clone(),
+            self.mongo_uri.clone(),
         );
 
         Ok((config, yaml.resources))
@@ -132,7 +139,7 @@ impl IngestService for IngestServer {
 
         Ok(Response::new(BatchStatus {
             batch_id: batch._id,
-            status: format!("{:?}", batch.status),
+            status: batch.status.as_str().to_string(),
             created_at: batch.created_at.to_rfc3339(),
             total_jobs: batch.job_ids.len() as i32,
             job_ids: batch.job_ids,
@@ -154,7 +161,7 @@ impl IngestService for IngestServer {
         Ok(Response::new(JobDetail {
             job_id: job._id,
             batch_id: job.batch_id,
-            status: format!("{:?}", job.status),
+            status: job.status.as_str().to_string(),
             url: job.resource.url.to_string(),
             error: job.error.unwrap_or_default(),
             retry_count: job.retry_count as i32,
@@ -202,7 +209,7 @@ impl IngestService for IngestServer {
             .map(|job| JobDetail {
                 job_id: job._id,
                 batch_id: job.batch_id,
-                status: format!("{:?}", job.status),
+                status: job.status.as_str().to_string(),
                 url: job.resource.url.to_string(),
                 error: job.error.unwrap_or_default(),
                 retry_count: job.retry_count as i32,
@@ -221,7 +228,10 @@ impl IngestService for IngestServer {
         let cancelled = self.mongo.cancel_job(&job_id).await.map_err(internal_err)?;
 
         if cancelled {
-            self.redis.cancel_job(&job_id).await.map_err(internal_err)?;
+            self.redis
+                .cancel_job(&job_id, self.toml_config.scheduler.shard_count)
+                .await
+                .map_err(internal_err)?;
             publish_cancelled(&self.redis, &job_id, ProgressJobType::FileJob).await;
         }
 
@@ -254,7 +264,7 @@ impl IngestService for IngestServer {
             .map_err(internal_err)?
         {
             self.redis
-                .cancel_batch_jobs(&batch.job_ids)
+                .cancel_batch_jobs(&batch.job_ids, self.toml_config.scheduler.shard_count)
                 .await
                 .map_err(internal_err)?;
             for job_id in &batch.job_ids {
@@ -282,7 +292,12 @@ impl IngestService for IngestServer {
         if retried {
             let _ = self
                 .redis
-                .retry_job(&job_id, crate::handlers::jobs::JobKind::File)
+                .retry_job(
+                    &job_id,
+                    crate::handlers::jobs::JobKind::File,
+                    self.toml_config.scheduler.shard_count,
+                    None,
+                )
                 .await;
             let event = ProgressEvent {
                 job_id: job_id.clone(),
@@ -427,14 +442,24 @@ pub async fn serve(addr: SocketAddr, toml_path: &Path) -> Result<(), ToolError> 
     let toml_config = load_toml(&toml_path.to_path_buf())?;
     let redis_uri = std::env::var("REDIS_URI")?;
     let mongo_uri = std::env::var("MONGODB_URI")?;
-    let mongo = MongoService::new(&mongo_uri).await?;
+    let mongo = MongoService::new(
+        &mongo_uri,
+        toml_config.scheduler.mongo_pool_min,
+        toml_config.scheduler.mongo_pool_max,
+    )
+    .await?;
     let redis = RedisService::new(&redis_uri, 3600, 3, vec![5, 30, 120])?;
 
     tracing::info!("Ingest gRPC server listening on {addr}");
 
-    let worker_config =
-        AppConfig::from_worker_args(toml_config.clone(), redis_uri, mongo_uri, None);
+    let worker_config = AppConfig::from_worker_args(
+        toml_config.clone(),
+        redis_uri.clone(),
+        mongo_uri.clone(),
+        None,
+    );
 
+    let worker_id = derive_worker_id();
     let worker_shutdown = shutdown.clone();
     let worker_mongo = mongo.clone();
     let worker_redis = redis.clone();
@@ -446,6 +471,7 @@ pub async fn serve(addr: SocketAddr, toml_path: &Path) -> Result<(), ToolError> 
             worker_redis,
             worker_config,
             worker_shutdown,
+            worker_id,
         )
         .await
         {
@@ -459,6 +485,8 @@ pub async fn serve(addr: SocketAddr, toml_path: &Path) -> Result<(), ToolError> 
         mongo,
         redis,
         toml_config,
+        redis_uri,
+        mongo_uri,
     };
 
     let server_shutdown = shutdown.clone();

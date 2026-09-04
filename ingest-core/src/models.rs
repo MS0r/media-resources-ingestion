@@ -237,6 +237,14 @@ pub struct AppConfig {
     pub max_retries: u8,
     pub backoff_secs: Vec<u64>,
 
+    // Mongo pool sizing (TOML)
+    pub mongo_pool_min: u32,
+    pub mongo_pool_max: u32,
+
+    // Sharding (TOML + derived)
+    pub shard_count: u32,
+    pub worker_id: u32,
+
     // Compression + headers + quality + source_auth (YAML, merged in from_sources)
     pub compression_override: Option<CompressionOverride>,
     pub headers: Option<Headers>,
@@ -369,6 +377,10 @@ impl AppConfig {
             running_job_ttl_secs: toml.retry.running_job_ttl_secs,
             max_retries: toml.retry.max_attempts,
             backoff_secs: toml.retry.backoff_secs.clone(),
+            mongo_pool_min: toml.scheduler.mongo_pool_min,
+            mongo_pool_max: toml.scheduler.mongo_pool_max,
+            shard_count: toml.scheduler.shard_count,
+            worker_id: 0,
             compression_override: yaml.compression_override.clone(),
             headers: yaml.headers.clone(),
             quality,
@@ -406,6 +418,10 @@ impl AppConfig {
             running_job_ttl_secs: toml.retry.running_job_ttl_secs,
             max_retries: toml.retry.max_attempts,
             backoff_secs: toml.retry.backoff_secs.clone(),
+            mongo_pool_min: toml.scheduler.mongo_pool_min,
+            mongo_pool_max: toml.scheduler.mongo_pool_max,
+            shard_count: toml.scheduler.shard_count,
+            worker_id: 0,
             compression_override: None,
             headers: None,
             quality: None,

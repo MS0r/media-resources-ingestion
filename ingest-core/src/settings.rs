@@ -10,10 +10,28 @@ pub struct SchedulerConfig {
     pub max_per_host: usize,
     #[serde(default = "default_job_timeout")]
     pub job_timeout_secs: u64,
+    #[serde(default = "default_mongo_pool_min")]
+    pub mongo_pool_min: u32,
+    #[serde(default = "default_mongo_pool_max")]
+    pub mongo_pool_max: u32,
+    #[serde(default = "default_shard_count")]
+    pub shard_count: u32,
 }
 
 const fn default_job_timeout() -> u64 {
     7200
+}
+
+const fn default_mongo_pool_min() -> u32 {
+    1
+}
+
+const fn default_mongo_pool_max() -> u32 {
+    16
+}
+
+const fn default_shard_count() -> u32 {
+    16
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -126,7 +126,12 @@ pub async fn enqueue(config: &AppConfig, resources: &[Resource]) -> Result<Strin
         }
     };
 
-    let mongo_service = MongoService::new(&config.mongo_uri).await?;
+    let mongo_service = MongoService::new(
+        &config.mongo_uri,
+        config.mongo_pool_min,
+        config.mongo_pool_max,
+    )
+    .await?;
 
     let temp_dir = &config.temp_dir;
     tokio::fs::create_dir_all(temp_dir).await?;
@@ -159,7 +164,9 @@ pub async fn enqueue(config: &AppConfig, resources: &[Resource]) -> Result<Strin
         batch.job_ids.push(file_job._id.clone());
         tracing::debug!(job_id=%file_job._id,"Inserted file job from the batch id: {}", batch._id);
         mongo_service.save_file_job(&file_job).await?;
-        redis_service.enqueue_file_job(&file_job).await?;
+        redis_service
+            .enqueue_file_job(&file_job, config.shard_count)
+            .await?;
     }
 
     tracing::info!(batch_id = %batch._id, "Batch created");
@@ -176,8 +183,12 @@ pub async fn worker_with_services(
     redis_service: RedisService,
     config: AppConfig,
     shutdown: Arc<AtomicBool>,
+    worker_id: u32,
 ) -> Result<(), ToolError> {
-    match redis_service.recover_orphaned_jobs().await {
+    match redis_service
+        .recover_orphaned_jobs(config.shard_count)
+        .await
+    {
         Ok(n) => {
             if n > 0 {
                 tracing::warn!(count = n, "Recovered orphaned jobs at worker startup");
@@ -228,13 +239,14 @@ pub async fn worker_with_services(
         file_semaphore,
         chunk_semaphore,
         shutdown,
+        worker_id,
     )
     .await?;
 
     Ok(())
 }
 
-pub async fn worker(config: AppConfig) -> Result<(), ToolError> {
+pub async fn worker(config: AppConfig, worker_id: u32) -> Result<(), ToolError> {
     let redis_service = match RedisService::new(
         &config.redis_uri,
         config.running_job_ttl_secs,
@@ -251,7 +263,12 @@ pub async fn worker(config: AppConfig) -> Result<(), ToolError> {
         }
     };
 
-    let mongo_service = MongoService::new(&config.mongo_uri).await?;
+    let mongo_service = MongoService::new(
+        &config.mongo_uri,
+        config.mongo_pool_min,
+        config.mongo_pool_max,
+    )
+    .await?;
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_clone = shutdown.clone();
@@ -263,7 +280,7 @@ pub async fn worker(config: AppConfig) -> Result<(), ToolError> {
         shutdown_clone.store(true, Ordering::Relaxed);
     });
 
-    worker_with_services(mongo_service, redis_service, config, shutdown).await
+    worker_with_services(mongo_service, redis_service, config, shutdown, worker_id).await
 }
 
 /// Perform a preflight check on a URL (HEAD request for HTTP/HTTPS)
@@ -384,6 +401,10 @@ mod tests {
             running_job_ttl_secs: 0,
             max_retries: 0,
             backoff_secs: vec![],
+            mongo_pool_min: 1,
+            mongo_pool_max: 16,
+            shard_count: 16,
+            worker_id: 0,
             compression_override: None,
             headers: None,
             quality: None,

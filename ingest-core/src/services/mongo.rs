@@ -12,6 +12,7 @@ use mongodb::{
     bson::{DateTime, doc, serialize_to_bson},
     options::{ClientOptions, IndexOptions},
 };
+use std::future::Future;
 use std::time::Duration;
 
 type MongoPool = Pool<MongodbConnectionManager>;
@@ -27,7 +28,7 @@ pub struct MongoService {
 }
 
 impl MongoService {
-    pub async fn new(uri: &str) -> Result<Self, bb8_mongodb::Error> {
+    pub async fn new(uri: &str, pool_min: u32, pool_max: u32) -> Result<Self, bb8_mongodb::Error> {
         let client_options = ClientOptions::parse(uri).await?;
 
         let client = Client::with_options(client_options.clone())?;
@@ -74,6 +75,8 @@ impl MongoService {
 
         let connection_manager = MongodbConnectionManager::new(client_options, "ingestion");
         let pool = Pool::builder()
+            .min_idle(Some(pool_min))
+            .max_size(pool_max)
             .connection_timeout(Duration::from_secs(10))
             .idle_timeout(Some(Duration::from_secs(60)))
             .max_lifetime(Some(Duration::from_secs(300)))
@@ -90,6 +93,20 @@ impl MongoService {
         bb8::RunError<bb8_mongodb::Error>,
     > {
         self.pool.get().await
+    }
+
+    pub async fn with_collection<T, F, R>(&self, name: &str, f: F) -> Result<R, ToolError>
+    where
+        T: Send + Sync + 'static,
+        F: for<'a> FnOnce(
+            &'a Collection<T>,
+        ) -> std::pin::Pin<
+            Box<dyn Future<Output = Result<R, mongodb::error::Error>> + Send + 'a>,
+        >,
+    {
+        let conn = self.client().await?;
+        let coll: Collection<T> = conn.collection(name);
+        f(&coll).await.map_err(ToolError::MongoError)
     }
 
     pub async fn complete_job(

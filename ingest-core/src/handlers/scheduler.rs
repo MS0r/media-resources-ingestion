@@ -31,12 +31,12 @@ pub async fn scheduler_loop(
     file_semaphore: Arc<Semaphore>,
     chunk_semaphore: Arc<Semaphore>,
     shutdown: Arc<AtomicBool>,
+    worker_id: u32,
 ) -> Result<(), ToolError> {
     let redis = ctx_factory.redis_service();
-    let job_timeout_secs = ctx_factory.config().job_timeout_secs;
-    let timeout_duration = Duration::from_secs(job_timeout_secs);
-    let timeout_secs = job_timeout_secs;
-    let max_file_workers = file_semaphore.available_permits();
+    let config = ctx_factory.config();
+    let timeout_duration = Duration::from_secs(config.job_timeout_secs);
+    let shard_count = config.shard_count;
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
@@ -44,8 +44,7 @@ pub async fn scheduler_loop(
             break;
         }
 
-        let worker = max_file_workers - file_semaphore.available_permits() + 1;
-        if let Ok(Some((kind, job_id))) = redis.dequeue_job(worker).await {
+        if let Ok(Some((kind, job_id))) = redis.dequeue_job(worker_id, shard_count).await {
             match kind {
                 JobKind::File => {
                     let permit = file_semaphore.clone().acquire_owned().await?;
@@ -70,30 +69,27 @@ pub async fn scheduler_loop(
                     };
 
                     let handler = file_handler.clone();
-                    let shutdown_flag = shutdown.clone();
 
-                    let job_id_copy = job_id.clone();
                     tokio::spawn(async move {
-                        let result = execute(
-                            &ctx,
-                            handler,
-                            job_id,
-                            permit,
-                            shutdown_flag,
-                            timeout_duration,
-                        )
-                        .await;
+                        let result =
+                            execute(&ctx, handler, &job_id, permit, timeout_duration).await;
 
                         match result {
                             Ok(Ok(JobOutcome::SpawnedChunks(chunks))) => {
-                                if let Err(e) =
-                                    enqueue_chunks(&ctx.redis, &ctx.db, &job_id_copy, chunks).await
+                                if let Err(e) = enqueue_chunks(
+                                    &ctx.redis,
+                                    &ctx.db,
+                                    &job_id,
+                                    chunks,
+                                    ctx.config.shard_count,
+                                )
+                                .await
                                 {
-                                    tracing::error!(job_id = %job_id_copy, error = %e, "Failed to enqueue chunks, failing parent job");
+                                    tracing::error!(job_id = %job_id, error = %e, "Failed to enqueue chunks, failing parent job");
                                     let _ = fail_job(
                                         &ctx.redis,
                                         &ctx.db,
-                                        &job_id_copy,
+                                        &job_id,
                                         format!("Chunk enqueue failed: {e}"),
                                     )
                                     .await;
@@ -101,20 +97,20 @@ pub async fn scheduler_loop(
                             }
                             Ok(Ok(JobOutcome::Completed(metadata))) => {
                                 let completion =
-                                    complete_job(&ctx.redis, &ctx.db, &job_id_copy, metadata).await;
+                                    complete_job(&ctx.redis, &ctx.db, &job_id, metadata).await;
                                 if let Err(e) = &completion {
-                                    tracing::error!(job_id = %job_id_copy, error = %e, "Post-execution completion failed, marking job as failed");
+                                    tracing::error!(job_id = %job_id, error = %e, "Post-execution completion failed, marking job as failed");
                                     let _ = fail_job(
                                         &ctx.redis,
                                         &ctx.db,
-                                        &job_id_copy,
+                                        &job_id,
                                         format!("Post-execution completion failed: {e}"),
                                     )
                                     .await;
                                 }
                                 publish_done_event(
                                     &ctx.redis,
-                                    &job_id_copy,
+                                    &job_id,
                                     if completion.is_ok() {
                                         None
                                     } else {
@@ -125,14 +121,13 @@ pub async fn scheduler_loop(
                             }
                             Ok(Ok(JobOutcome::Duplicated)) => {
                                 let completion =
-                                    complete_job_no_metadata(&ctx.redis, &ctx.db, &job_id_copy)
-                                        .await;
+                                    complete_job_no_metadata(&ctx.redis, &ctx.db, &job_id).await;
                                 if let Err(e) = &completion {
-                                    tracing::error!(job_id = %job_id_copy, error = %e, "Post-execution completion failed for duplicate, marking job as failed");
+                                    tracing::error!(job_id = %job_id, error = %e, "Post-execution completion failed for duplicate, marking job as failed");
                                     let _ = fail_job(
                                         &ctx.redis,
                                         &ctx.db,
-                                        &job_id_copy,
+                                        &job_id,
                                         format!(
                                             "Post-execution completion failed for duplicate: {e}"
                                         ),
@@ -141,7 +136,7 @@ pub async fn scheduler_loop(
                                 }
                                 publish_done_event(
                                     &ctx.redis,
-                                    &job_id_copy,
+                                    &job_id,
                                     if completion.is_ok() {
                                         Some("Duplicate, skipped")
                                     } else {
@@ -151,20 +146,21 @@ pub async fn scheduler_loop(
                                 .await;
                             }
                             Ok(Ok(JobOutcome::ChunkCompleted(_, _))) => {
-                                tracing::warn!(job_id = %job_id_copy, "Unexpected ChunkCompleted from file job");
+                                tracing::warn!(job_id = %job_id, "Unexpected ChunkCompleted from file job");
                             }
                             Ok(Err(JobErrorOutcome::Retryable(e))) => {
-                                retry_job(&ctx.redis, &ctx.db, &job_id_copy, e).await;
+                                retry_job(&ctx.redis, &ctx.db, &job_id, e, ctx.config.shard_count)
+                                    .await;
                             }
                             Ok(Err(JobErrorOutcome::Fatal(e))) => {
-                                let _ = fail_job(&ctx.redis, &ctx.db, &job_id_copy, e).await;
+                                let _ = fail_job(&ctx.redis, &ctx.db, &job_id, e).await;
                             }
                             Err(_elapsed) => {
                                 let _ = fail_job(
                                     &ctx.redis,
                                     &ctx.db,
-                                    &job_id_copy,
-                                    format!("Job timed out after {}s", timeout_secs),
+                                    &job_id,
+                                    format!("Job timed out after {}s", ctx.config.job_timeout_secs),
                                 )
                                 .await;
                             }
@@ -186,57 +182,57 @@ pub async fn scheduler_loop(
                     };
 
                     let handler = chunk_handler.clone();
-                    let shutdown_flag = shutdown.clone();
 
-                    let job_id_copy = job_id.clone();
                     tokio::spawn(async move {
-                        let result = execute(
-                            &ctx,
-                            handler,
-                            job_id,
-                            permit,
-                            shutdown_flag,
-                            timeout_duration,
-                        )
-                        .await;
+                        let result =
+                            execute(&ctx, handler, &job_id, permit, timeout_duration).await;
 
                         match result {
                             Ok(Ok(JobOutcome::ChunkCompleted(chunk, mime))) => {
                                 if let Err(e) = complete_chunk(
                                     &ctx.redis,
                                     &ctx.db,
-                                    &job_id_copy,
+                                    &job_id,
                                     ctx.chunk_job(),
                                     chunk,
                                     mime,
                                 )
                                 .await
                                 {
-                                    tracing::error!(job_id = %job_id_copy, error = %e, "Failed to complete chunk job — chunk data stored but TTL will handle retry");
+                                    tracing::error!(job_id = %job_id, error = %e, "Failed to complete chunk job — chunk data stored but TTL will handle retry");
                                 } else {
-                                    tracing::info!(job_id = %job_id_copy, "Chunk job completed");
+                                    tracing::info!(job_id = %job_id, "Chunk job completed");
                                 }
                             }
                             Ok(Ok(JobOutcome::SpawnedChunks(_))) => {
-                                tracing::warn!(job_id = %job_id_copy, "Unexpected SpawnedChunks from chunk job");
+                                tracing::warn!(job_id = %job_id, "Unexpected SpawnedChunks from chunk job");
                             }
                             Ok(Ok(JobOutcome::Completed(_))) => {
-                                tracing::warn!(job_id = %job_id_copy, "Unexpected Completed(Metadata) from chunk job");
+                                tracing::warn!(job_id = %job_id, "Unexpected Completed(Metadata) from chunk job");
                             }
                             Ok(Ok(JobOutcome::Duplicated)) => {
-                                tracing::warn!(job_id = %job_id_copy, "Unexpected Duplicated from chunk job");
+                                tracing::warn!(job_id = %job_id, "Unexpected Duplicated from chunk job");
                             }
                             Ok(Err(JobErrorOutcome::Retryable(e))) => {
                                 tracing::error!(
-                                    ?job_id_copy,
-                                    "retrying chunk job due to error: ({e})"
+                                    job_id = %job_id,
+                                    error = %e,
+                                    "Retrying chunk job"
                                 );
-                                if let Err(err) =
-                                    ctx.redis.retry_job(&job_id_copy, JobKind::Chunk).await
+                                if let Err(err) = ctx
+                                    .redis
+                                    .retry_job(
+                                        &job_id,
+                                        JobKind::Chunk,
+                                        ctx.config.shard_count,
+                                        Some(&ctx.chunk_job().parent_job_id),
+                                    )
+                                    .await
                                 {
                                     tracing::error!(
-                                        ?err,
-                                        "failed to reenqueue retryable chunk job"
+                                        job_id = %job_id,
+                                        error = %err,
+                                        "Failed to reenqueue retryable chunk job"
                                     );
                                 }
                                 let parent_id = ctx.chunk_job().parent_job_id.clone();
@@ -255,8 +251,8 @@ pub async fn scheduler_loop(
                                 ctx.redis.publish_progress(&parent_id, &event).await.ok();
                             }
                             Ok(Err(JobErrorOutcome::Fatal(e))) => {
-                                tracing::error!(?e, "Fatal chunk job error");
-                                fail_job(&ctx.redis, &ctx.db, &job_id_copy, e).await.ok();
+                                tracing::error!(job_id = %job_id, error = %e, "Fatal chunk job error");
+                                fail_job(&ctx.redis, &ctx.db, &job_id, e).await.ok();
                                 let parent_id = ctx.chunk_job().parent_job_id.clone();
                                 let event = ProgressEvent {
                                     job_id: parent_id.clone(),
@@ -273,11 +269,11 @@ pub async fn scheduler_loop(
                                 ctx.redis.publish_progress(&parent_id, &event).await.ok();
                             }
                             Err(_elapsed) => {
-                                tracing::error!(job_id = %job_id_copy, "Chunk job timed out");
+                                tracing::error!(job_id = %job_id, "Chunk job timed out");
                                 fail_job(
                                     &ctx.redis,
                                     &ctx.db,
-                                    &job_id_copy,
+                                    &job_id,
                                     "Chunk job timed out".to_string(),
                                 )
                                 .await
@@ -302,8 +298,6 @@ pub async fn scheduler_loop(
                 }
             }
         }
-
-        tokio::time::sleep(Duration::from_millis(50)).await;
     }
     Ok(())
 }
@@ -311,24 +305,13 @@ pub async fn scheduler_loop(
 async fn execute(
     ctx: &JobContext,
     handler: Arc<dyn JobHandler>,
-    job_id: String,
+    job_id: &str,
     _permit: OwnedSemaphorePermit,
-    shutdown_flag: Arc<AtomicBool>,
     timeout_duration: Duration,
 ) -> Result<Result<JobOutcome, JobErrorOutcome>, Elapsed> {
-    let hb_redis = ctx.redis.clone();
     let hb_done = Arc::new(AtomicBool::new(false));
-    let hb_done_clone = hb_done.clone();
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(10));
-        loop {
-            interval.tick().await;
-            if hb_done_clone.load(Ordering::Relaxed) || shutdown_flag.load(Ordering::Relaxed) {
-                break;
-            }
-            let _ = hb_redis.renew_lease(&job_id).await;
-        }
-    });
+    ctx.heartbeat
+        .register(job_id.to_string(), ctx.redis.clone(), hb_done.clone());
 
     let result = timeout(timeout_duration, handler.execute(&ctx)).await;
     hb_done.store(true, Ordering::Relaxed);
@@ -340,14 +323,15 @@ async fn enqueue_chunks(
     db: &MongoService,
     parent_id: &str,
     chunks: Vec<ChunkJob>,
+    shard_count: u32,
 ) -> Result<(), JobErrorOutcome> {
     redis.create_counter(parent_id).await?;
     let chunks_len = chunks.len();
     for chunk in chunks {
-        redis.enqueue_chunk_job(&chunk).await?;
+        redis.enqueue_chunk_job(&chunk, shard_count).await?;
         db.save_chunk_job(chunk).await?;
     }
-    tracing::info!("Chunks enqueued {}", chunks_len);
+    tracing::info!(count = chunks_len, "Chunks enqueued");
     Ok(())
 }
 
@@ -367,10 +351,19 @@ async fn complete_job(
     Ok(())
 }
 
-async fn retry_job(redis: &RedisService, _db: &MongoService, job_id: &str, error: String) {
-    tracing::error!(?job_id, "retrying job due to error: ({error})");
-    if let Err(err) = redis.retry_job(job_id, JobKind::File).await {
-        tracing::error!(?err, "failed to reenqueue retryable job");
+async fn retry_job(
+    redis: &RedisService,
+    _db: &MongoService,
+    job_id: &str,
+    error: String,
+    shard_count: u32,
+) {
+    tracing::error!(job_id = %job_id, error = %error, "Retrying job");
+    if let Err(err) = redis
+        .retry_job(job_id, JobKind::File, shard_count, None)
+        .await
+    {
+        tracing::error!(job_id = %job_id, error = %err, "Failed to reenqueue retryable job");
     } else {
         let event = ProgressEvent {
             job_id: job_id.to_string(),
