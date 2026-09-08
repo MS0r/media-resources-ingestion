@@ -386,7 +386,7 @@ pub async fn scheduler_loop(
         match timeout(remaining, tasks.join_next()).await {
             Ok(Some(Ok(()))) => {} // task completed normally
             Ok(Some(Err(e))) => tracing::warn!(error = ?e, "Spawned task panicked"),
-            Ok(None) => break,     // join_next returned None (empty set)
+            Ok(None) => break, // join_next returned None (empty set)
             Err(_) => {
                 tracing::warn!("Drain timeout, aborting remaining tasks");
                 tasks.abort_all();

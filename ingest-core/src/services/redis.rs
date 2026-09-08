@@ -97,7 +97,10 @@ impl RedisService {
     }
 
     async fn get_connection(&self) -> Result<MultiplexedConnection, redis::RedisError> {
-        with_retry("get_connection", || self.client.get_multiplexed_async_connection()).await
+        with_retry("get_connection", || {
+            self.client.get_multiplexed_async_connection()
+        })
+        .await
     }
 
     /// Enqueues a batch record into `batches:state:<id>` as a serialised JSON
@@ -419,38 +422,45 @@ impl RedisService {
     /// Cancels all pending jobs in a batch by removing their IDs from the
     /// Redis sorted set. Accepts the list of job IDs (from the Batch document
     /// in Mongo). Tries all shards since we don't know which shard holds each job.
+    /// Cancels all pending jobs in a batch by removing their IDs from the
+    /// Redis sorted set. Accepts the list of job IDs (from the Batch document
+    /// in Mongo). Tries all shards since we don't know which shard holds each job.
+    /// Batches into a single pipeline round-trip.
     pub async fn cancel_batch_jobs(
         &self,
         job_ids: &[String],
         shard_count: u32,
     ) -> Result<usize, ToolError> {
         let mut conn = self.get_connection().await?;
-        let mut removed = 0usize;
+        let mut pipe = redis::pipe();
         for job_id in job_ids {
             for prefix in &["file", "chunk"] {
                 let member = format!("{}:{}", prefix, job_id);
                 for s in 0..shard_count {
-                    let n: usize = conn.zrem(shard_key(s), &member).await?;
-                    removed += n;
+                    pipe.zrem(shard_key(s), &member).ignore();
                 }
             }
         }
+        let results: Vec<i64> = pipe.query_async(&mut conn).await?;
+        let removed = results.iter().filter(|&&n| n > 0).count();
         tracing::info!(count = removed, "Cancelled jobs from Redis pending queue");
         Ok(removed)
     }
 
     /// Cancels a single pending job (handles both file and chunk prefixes).
     /// Tries all shards since we don't know which shard holds the job.
+    /// Uses a pipeline for a single round-trip.
     pub async fn cancel_job(&self, job_id: &str, shard_count: u32) -> Result<(), ToolError> {
         let mut conn = self.get_connection().await?;
-        let mut removed: usize = 0;
+        let mut pipe = redis::pipe();
         for prefix in &["file", "chunk"] {
             let member = format!("{}:{}", prefix, job_id);
             for s in 0..shard_count {
-                let n: usize = conn.zrem(shard_key(s), &member).await?;
-                removed += n;
+                pipe.zrem(shard_key(s), &member).ignore();
             }
         }
+        let results: Vec<i64> = pipe.query_async(&mut conn).await?;
+        let removed: usize = results.iter().filter(|&&n| n > 0).count();
         if removed > 0 {
             tracing::info!(job_id = %job_id, "Cancelled job from pending queue");
         }
@@ -505,6 +515,7 @@ impl RedisService {
         let mut conn = self.get_connection().await?;
         let key = format!("jobs:counter:{parent_id}");
         let _: () = conn.set(&key, "0").await?;
+        let _: () = conn.expire(&key, (7 * 24 * 3600) as i64).await?;
         Ok(())
     }
 
@@ -513,6 +524,7 @@ impl RedisService {
         let mut conn = self.get_connection().await?;
         let key = format!("jobs:chunks:{parent_id}");
         let _: () = conn.sadd(&key, chunk_id).await?;
+        let _: () = conn.expire(&key, (7 * 24 * 3600) as i64).await?;
         Ok(())
     }
 
@@ -583,6 +595,11 @@ impl RedisService {
             .incr(&count_key, 1)
             .query_async(&mut conn)
             .await?;
+
+        // Auto-expire chunk tracking keys after 7 days
+        let ttl_secs = 7 * 24 * 3600;
+        let _: () = conn.expire(&result_key, ttl_secs).await?;
+        let _: () = conn.expire(&count_key, ttl_secs).await?;
 
         Ok(count)
     }

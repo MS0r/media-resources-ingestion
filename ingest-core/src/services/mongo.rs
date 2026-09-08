@@ -73,6 +73,18 @@ impl MongoService {
 
         chunks_jobs_coll.create_index(parent_job_id_index).await?;
 
+        // TTL: auto-delete chunk job rows after 7 days
+        let chunk_ttl_index = IndexModel::builder()
+            .keys(doc! { "updated_at": 1 })
+            .options(
+                IndexOptions::builder()
+                    .expire_after(Duration::from_secs(7 * 24 * 3600))
+                    .build(),
+            )
+            .build();
+
+        chunks_jobs_coll.create_index(chunk_ttl_index).await?;
+
         let connection_manager = MongodbConnectionManager::new(client_options, "ingestion");
         let pool = Pool::builder()
             .min_idle(Some(pool_min))
