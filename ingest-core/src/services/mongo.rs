@@ -115,9 +115,28 @@ impl MongoService {
         job_id: &str,
     ) -> Result<(), ToolError> {
         let client = self.client().await?;
-        let collection: Collection<Metadata> = client.collection("files_metadata");
-        collection.insert_one(&metadata).await?;
 
+        // Upsert the full metadata. $set (not insert_one) avoids conflicts with
+        // the placeholder created by upsert_file_metadata, and does NOT touch
+        // duplicate_reference_count (which is owned by upsert_file_metadata).
+        let collection: Collection<Metadata> = client.collection("files_metadata");
+        let update = doc! { "$set": {
+            "original_url": metadata.original_url.to_string(),
+            "storage_provider": metadata.storage_provider.to_string(),
+            "storage_path": &metadata.storage_path,
+            "original_file_size": metadata.original_file_size as i64,
+            "compressed_file_size": metadata.compressed_file_size.map(|c| c as i64),
+            "compression_ratio": metadata.compression_ratio,
+            "mime_type": &metadata.mime_type,
+            "chunk_manifest": serialize_to_bson(&metadata.chunk_manifest)?,
+            "upload_date": serialize_to_bson(&metadata.upload_date)?,
+        }};
+        collection
+            .update_one(doc! { "file_hash": &metadata.file_hash }, update)
+            .upsert(true)
+            .await?;
+
+        // FileJob status update -- always runs (idempotent).
         let complete_job = serialize_to_bson(&JobStatus::Completed {
             finished_at: Utc::now(),
         })?;
@@ -133,20 +152,47 @@ impl MongoService {
     }
 
     pub async fn upsert_file_metadata(&self, file_hash: &str) -> Result<UpsertResult, ToolError> {
+        use mongodb::options::{FindOneAndUpdateOptions, ReturnDocument};
+
         let client = self.client().await?;
         let collection: Collection<Metadata> = client.collection("files_metadata");
 
         let filter = doc! { "file_hash": file_hash };
         let update = doc! {
-            "$set" : {
-                "duplicate_reference_count" : 1u32,
-                "update_date" : DateTime::now(),
-            }
+            "$inc": { "duplicate_reference_count": 1i32 },
+            "$set": { "update_date": DateTime::now() },
+            "$setOnInsert": {
+                // Minimal placeholder fields so Metadata deserialization succeeds
+                // when find_one_and_update returns the upserted document.
+                // These are overwritten by complete_job's full metadata update.
+                "original_url": "",
+                "storage_provider": "Local",
+                "storage_path": "",
+                "original_file_size": 0i64,
+                "mime_type": "",
+                "upload_date": DateTime::now(),
+            },
         };
 
-        match collection.find_one_and_update(filter, update).await? {
-            None => Ok(UpsertResult::Inserted),
-            Some(existing) => Ok(UpsertResult::Duplicate(Box::new(existing))),
+        let opts = FindOneAndUpdateOptions::builder()
+            .upsert(true)
+            .return_document(ReturnDocument::After)
+            .build();
+
+        let doc = collection
+            .find_one_and_update(filter, update)
+            .with_options(opts)
+            .await?
+            .ok_or_else(|| {
+                ToolError::Message(
+                    "find_one_and_update with upsert returned no document".to_string(),
+                )
+            })?;
+
+        if doc.duplicate_reference_count == 1 {
+            Ok(UpsertResult::Inserted)
+        } else {
+            Ok(UpsertResult::Duplicate(Box::new(doc)))
         }
     }
 
