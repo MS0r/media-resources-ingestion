@@ -16,6 +16,8 @@ pub struct SchedulerConfig {
     pub mongo_pool_max: u32,
     #[serde(default = "default_shard_count")]
     pub shard_count: u32,
+    #[serde(default = "default_shutdown_grace")]
+    pub shutdown_grace_secs: u64,
 }
 
 const fn default_job_timeout() -> u64 {
@@ -32,6 +34,10 @@ const fn default_mongo_pool_max() -> u32 {
 
 const fn default_shard_count() -> u32 {
     16
+}
+
+const fn default_shutdown_grace() -> u64 {
+    30
 }
 
 #[derive(Debug, Clone, Deserialize)]

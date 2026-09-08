@@ -272,11 +272,16 @@ pub async fn worker(config: AppConfig, worker_id: u32) -> Result<(), ToolError> 
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_clone = shutdown.clone();
+    let shutdown_redis = redis_service.clone();
     tokio::spawn(async move {
         tokio::signal::ctrl_c().await.ok();
         tracing::warn!(
             "SIGINT received, initiating graceful shutdown (press Ctrl+C again to force)"
         );
+        // Clear running keys so recovery on next start is immediate
+        if let Err(e) = shutdown_redis.delete_all_running().await {
+            tracing::warn!(error = %e, "Failed to clear running keys on shutdown");
+        }
         shutdown_clone.store(true, Ordering::Relaxed);
     });
 
@@ -405,6 +410,7 @@ mod tests {
             mongo_pool_max: 16,
             shard_count: 16,
             worker_id: 0,
+            shutdown_grace_secs: 30,
             compression_override: None,
             headers: None,
             quality: None,

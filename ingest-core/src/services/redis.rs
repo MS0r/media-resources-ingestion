@@ -395,6 +395,27 @@ impl RedisService {
         Ok(rec)
     }
 
+    /// Delete all `jobs:running:*` keys. Called at worker shutdown
+    /// so the next worker's `recover_orphaned_jobs` picks them up
+    /// immediately instead of waiting for the 3600s TTL.
+    pub async fn delete_all_running(&self) -> Result<usize, ToolError> {
+        let mut conn = self.get_connection().await?;
+        let keys: Vec<String> = {
+            let iter = conn.scan_match("jobs:running:*").await.map_err(|e| {
+                tracing::error!(error = %e, "Failed to scan for running keys");
+                ToolError::from(e)
+            })?;
+            let res: Vec<Result<String, _>> = iter.collect().await;
+            res.into_iter().filter_map(|r| r.ok()).collect()
+        };
+        let n = keys.len();
+        if n > 0 {
+            let _: () = conn.del(&keys).await?;
+            tracing::info!(count = n, "Cleared running keys on shutdown");
+        }
+        Ok(n)
+    }
+
     /// Cancels all pending jobs in a batch by removing their IDs from the
     /// Redis sorted set. Accepts the list of job IDs (from the Batch document
     /// in Mongo). Tries all shards since we don't know which shard holds each job.

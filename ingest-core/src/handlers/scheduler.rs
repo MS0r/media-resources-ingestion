@@ -21,6 +21,7 @@ use std::{
 };
 use tokio::{
     sync::{OwnedSemaphorePermit, Semaphore},
+    task::JoinSet,
     time::{error::Elapsed, timeout},
 };
 
@@ -37,10 +38,15 @@ pub async fn scheduler_loop(
     let config = ctx_factory.config();
     let timeout_duration = Duration::from_secs(config.job_timeout_secs);
     let shard_count = config.shard_count;
+    let shutdown_grace = Duration::from_secs(config.shutdown_grace_secs);
+    let mut tasks: JoinSet<()> = JoinSet::new();
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
-            tracing::warn!("Shutdown signal received, stopping scheduler loop");
+            tracing::warn!(
+                "Shutdown signal received, draining spawned tasks (grace={:?})",
+                shutdown_grace
+            );
             break;
         }
 
@@ -75,7 +81,7 @@ pub async fn scheduler_loop(
 
                     let handler = file_handler.clone();
 
-                    tokio::spawn(async move {
+                    tasks.spawn(async move {
                         let result =
                             execute(&ctx, handler, &job_id, permit, timeout_duration).await;
 
@@ -188,7 +194,7 @@ pub async fn scheduler_loop(
 
                     let handler = chunk_handler.clone();
 
-                    tokio::spawn(async move {
+                    tasks.spawn(async move {
                         let result =
                             execute(&ctx, handler, &job_id, permit, timeout_duration).await;
 
@@ -363,6 +369,32 @@ pub async fn scheduler_loop(
             }
         }
     }
+
+    // Drain phase: wait up to shutdown_grace for spawned tasks to finish
+    let drain_start = std::time::Instant::now();
+    while !tasks.is_empty() {
+        if drain_start.elapsed() >= shutdown_grace {
+            tracing::warn!(
+                remaining = tasks.len(),
+                "Grace period exceeded, abandoning {} tasks",
+                tasks.len()
+            );
+            tasks.abort_all();
+            break;
+        }
+        let remaining = shutdown_grace - drain_start.elapsed();
+        match timeout(remaining, tasks.join_next()).await {
+            Ok(Some(Ok(()))) => {} // task completed normally
+            Ok(Some(Err(e))) => tracing::warn!(error = ?e, "Spawned task panicked"),
+            Ok(None) => break,     // join_next returned None (empty set)
+            Err(_) => {
+                tracing::warn!("Drain timeout, aborting remaining tasks");
+                tasks.abort_all();
+                break;
+            }
+        }
+    }
+
     Ok(())
 }
 

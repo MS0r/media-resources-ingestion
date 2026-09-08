@@ -483,7 +483,7 @@ pub async fn serve(addr: SocketAddr, toml_path: &Path) -> Result<(), ToolError> 
 
     let ingest_server = IngestServer {
         mongo,
-        redis,
+        redis: redis.clone(),
         toml_config,
         redis_uri,
         mongo_uri,
@@ -491,10 +491,15 @@ pub async fn serve(addr: SocketAddr, toml_path: &Path) -> Result<(), ToolError> 
 
     let server_shutdown = shutdown.clone();
     let (signal_tx, signal_rx) = tokio::sync::oneshot::channel::<()>();
+    let shutdown_redis = redis.clone();
 
     tokio::spawn(async move {
         tokio::signal::ctrl_c().await.ok();
         tracing::warn!("SIGINT received, shutting down server and worker...");
+        // Clear running keys so recovery on next start is immediate
+        if let Err(e) = shutdown_redis.delete_all_running().await {
+            tracing::warn!(error = %e, "Failed to clear running keys on shutdown");
+        }
         server_shutdown.store(true, Ordering::Relaxed);
         let _ = signal_tx.send(());
     });

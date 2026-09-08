@@ -245,6 +245,9 @@ pub struct AppConfig {
     pub shard_count: u32,
     pub worker_id: u32,
 
+    // Shutdown (TOML)
+    pub shutdown_grace_secs: u64,
+
     // Compression + headers + quality + source_auth (YAML, merged in from_sources)
     pub compression_override: Option<CompressionOverride>,
     pub headers: Option<Headers>,
@@ -381,6 +384,7 @@ impl AppConfig {
             mongo_pool_max: toml.scheduler.mongo_pool_max,
             shard_count: toml.scheduler.shard_count,
             worker_id: 0,
+            shutdown_grace_secs: toml.scheduler.shutdown_grace_secs,
             compression_override: yaml.compression_override.clone(),
             headers: yaml.headers.clone(),
             quality,
@@ -422,6 +426,7 @@ impl AppConfig {
             mongo_pool_max: toml.scheduler.mongo_pool_max,
             shard_count: toml.scheduler.shard_count,
             worker_id: 0,
+            shutdown_grace_secs: toml.scheduler.shutdown_grace_secs,
             compression_override: None,
             headers: None,
             quality: None,
