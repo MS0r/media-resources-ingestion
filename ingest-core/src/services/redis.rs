@@ -154,6 +154,9 @@ impl RedisService {
         let _: () = conn
             .hset(&state_key, "retry_count", job.retry_count)
             .await?;
+        let _: () = conn
+            .hset(&state_key, "parent_job_id", &job.parent_job_id)
+            .await?;
 
         // Shard by parent_job_id so all chunks from the same file land on one shard
         let shard = compute_shard(&job.parent_job_id, shard_count);
@@ -433,6 +436,49 @@ impl RedisService {
         Ok(())
     }
 
+    /// Move all members of `jobs:delayed` whose retry time has elapsed
+    /// into the appropriate `jobs:pending:{shard}` sorted set.
+    /// Called once per scheduler iteration before dequeue.
+    pub async fn promote_due_delayed(&self, shard_count: u32) -> Result<usize, ToolError> {
+        let mut conn = self.get_connection().await?;
+        let now_ts = chrono::Utc::now().timestamp();
+
+        // Upper bound: (now_ts + 1) * 1000 + shard_count covers all possible
+        // encoded scores for jobs that are due now or earlier.
+        let max_score = ((now_ts + 1) as f64) * 1000.0 + (shard_count as f64);
+        let due: Vec<(String, f64)> = redis::cmd("ZRANGEBYSCORE")
+            .arg("jobs:delayed")
+            .arg("-inf")
+            .arg(max_score)
+            .arg("WITHSCORES")
+            .query_async(&mut conn)
+            .await?;
+
+        if due.is_empty() {
+            return Ok(0);
+        }
+
+        let mut promoted = 0;
+        for (member, score) in &due {
+            let retry_at_ts = (score / 1000.0).floor() as i64;
+            if retry_at_ts > now_ts {
+                continue;
+            }
+
+            let shard = score.fract().round() as u32;
+            let shard = shard.min(shard_count.saturating_sub(1));
+
+            let _: () = conn.zadd(shard_key(shard), member, 0_f64).await?;
+            let _: () = conn.zrem("jobs:delayed", member).await?;
+            promoted += 1;
+        }
+
+        if promoted > 0 {
+            tracing::debug!(count = promoted, "Promoted delayed jobs to pending");
+        }
+        Ok(promoted)
+    }
+
     /// Create a counter for the counter pattern following the given parent_id
     pub async fn create_counter(&self, parent_id: &str) -> Result<(), ToolError> {
         let mut conn = self.get_connection().await?;
@@ -456,6 +502,43 @@ impl RedisService {
         let key = format!("jobs:chunks:{parent_id}");
         let members: Vec<String> = conn.smembers(&key).await?;
         Ok(members)
+    }
+
+    /// Returns the number of chunk jobs for a parent that are NOT yet
+    /// in a terminal state (completed/failed/cancelled).
+    /// Uses SCAN over jobs:state:* keys to find chunk entries with the given parent.
+    pub async fn live_chunk_count(&self, parent_id: &str) -> Result<u32, ToolError> {
+        let mut conn = self.get_connection().await?;
+        let keys: Vec<String> = {
+            let iter = conn.scan_match("jobs:state:*").await.map_err(|e| {
+                tracing::error!(error = %e, "Failed to scan for chunk state keys");
+                ToolError::from(e)
+            })?;
+            let res: Vec<Result<String, _>> = iter.collect().await;
+            res.into_iter().filter_map(|r| r.ok()).collect()
+        };
+
+        let mut count = 0u32;
+        for state_key in keys {
+            let (kind, status, p_id): (Option<String>, Option<String>, Option<String>) =
+                redis::cmd("HMGET")
+                    .arg(&state_key)
+                    .arg("kind")
+                    .arg("status")
+                    .arg("parent_job_id")
+                    .query_async(&mut conn)
+                    .await?;
+            if kind.as_deref() == Some("chunk")
+                && p_id.as_deref() == Some(parent_id)
+                && !matches!(
+                    status.as_deref(),
+                    Some("completed") | Some("failed") | Some("cancelled")
+                )
+            {
+                count += 1;
+            }
+        }
+        Ok(count)
     }
 
     /// Store a chunk's metadata in a Redis hash for later manifest assembly.

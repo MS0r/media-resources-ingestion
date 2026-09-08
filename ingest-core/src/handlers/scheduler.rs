@@ -44,6 +44,11 @@ pub async fn scheduler_loop(
             break;
         }
 
+        // Promote any delayed jobs whose retry time has elapsed.
+        if let Err(e) = redis.promote_due_delayed(shard_count).await {
+            tracing::warn!(error = %e, "Failed to promote delayed jobs");
+        }
+
         if let Ok(Some((kind, job_id))) = redis.dequeue_job(worker_id, shard_count).await {
             match kind {
                 JobKind::File => {
@@ -229,11 +234,32 @@ pub async fn scheduler_loop(
                                     )
                                     .await
                                 {
+                                    // retry_job returns Err only when max retries exceeded
+                                    // and fail_job is called internally
                                     tracing::error!(
                                         job_id = %job_id,
                                         error = %err,
                                         "Failed to reenqueue retryable chunk job"
                                     );
+                                    let parent_id = ctx.chunk_job().parent_job_id.clone();
+                                    let live = ctx
+                                        .redis
+                                        .live_chunk_count(&parent_id)
+                                        .await
+                                        .unwrap_or(u32::MAX);
+                                    if live == 0 {
+                                        let err_msg = format!(
+                                            "All chunks failed permanently (last chunk: {})",
+                                            ctx.chunk_job().chunk_index
+                                        );
+                                        fail_job(&ctx.redis, &ctx.db, &parent_id, err_msg)
+                                            .await
+                                            .ok();
+                                        ctx.redis
+                                            .cleanup_chunk_results(&parent_id)
+                                            .await
+                                            .ok();
+                                    }
                                 }
                                 let parent_id = ctx.chunk_job().parent_job_id.clone();
                                 let event = ProgressEvent {
@@ -254,6 +280,25 @@ pub async fn scheduler_loop(
                                 tracing::error!(job_id = %job_id, error = %e, "Fatal chunk job error");
                                 fail_job(&ctx.redis, &ctx.db, &job_id, e).await.ok();
                                 let parent_id = ctx.chunk_job().parent_job_id.clone();
+                                // Check if parent should be failed too
+                                let live = ctx
+                                    .redis
+                                    .live_chunk_count(&parent_id)
+                                    .await
+                                    .unwrap_or(u32::MAX);
+                                if live == 0 {
+                                    let err_msg = format!(
+                                        "All chunks failed permanently (last chunk: {})",
+                                        ctx.chunk_job().chunk_index
+                                    );
+                                    fail_job(&ctx.redis, &ctx.db, &parent_id, err_msg)
+                                        .await
+                                        .ok();
+                                    ctx.redis
+                                        .cleanup_chunk_results(&parent_id)
+                                        .await
+                                        .ok();
+                                }
                                 let event = ProgressEvent {
                                     job_id: parent_id.clone(),
                                     job_type: ProgressJobType::FileJob,
@@ -279,6 +324,25 @@ pub async fn scheduler_loop(
                                 .await
                                 .ok();
                                 let parent_id = ctx.chunk_job().parent_job_id.clone();
+                                // Check if parent should be failed too
+                                let live = ctx
+                                    .redis
+                                    .live_chunk_count(&parent_id)
+                                    .await
+                                    .unwrap_or(u32::MAX);
+                                if live == 0 {
+                                    let err_msg = format!(
+                                        "All chunks timed out (last chunk: {})",
+                                        ctx.chunk_job().chunk_index
+                                    );
+                                    fail_job(&ctx.redis, &ctx.db, &parent_id, err_msg)
+                                        .await
+                                        .ok();
+                                    ctx.redis
+                                        .cleanup_chunk_results(&parent_id)
+                                        .await
+                                        .ok();
+                                }
                                 let event = ProgressEvent {
                                     job_id: parent_id.clone(),
                                     job_type: ProgressJobType::FileJob,
