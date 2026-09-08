@@ -22,11 +22,11 @@ pub struct HeartbeatSupervisor {
 impl HeartbeatSupervisor {
     pub fn new() -> Self {
         let (tx, mut rx) = mpsc::unbounded_channel();
-        tokio::spawn(async move {
+
+        let handle = tokio::spawn(async move {
             let mut active: HashMap<String, Entry> = HashMap::new();
             let mut ticker = tokio::time::interval(Duration::from_secs(10));
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            // Skip the immediate first tick
             ticker.tick().await;
             loop {
                 tokio::select! {
@@ -34,7 +34,10 @@ impl HeartbeatSupervisor {
                         Some(Msg::Register { job_id, entry }) => {
                             active.insert(job_id, entry);
                         }
-                        None => break,
+                        None => {
+                            tracing::warn!("HeartbeatSupervisor channel closed, exiting");
+                            break;
+                        }
                     },
                     _ = ticker.tick() => {
                         let mut done_keys = Vec::new();
@@ -52,6 +55,25 @@ impl HeartbeatSupervisor {
                 }
             }
         });
+
+        tokio::spawn(async move {
+            match handle.await {
+                Ok(()) => {
+                    tracing::warn!("HeartbeatSupervisor task ended (channel closed)")
+                }
+                Err(e) if e.is_panic() => {
+                    tracing::error!(
+                        error = ?e,
+                        "HeartbeatSupervisor task PANICKED — leases will not be renewed; \
+                         recovery depends on jobs:running TTL expiry or process restart"
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(error = ?e, "HeartbeatSupervisor task cancelled");
+                }
+            }
+        });
+
         Self { tx }
     }
 

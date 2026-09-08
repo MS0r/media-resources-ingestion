@@ -7,6 +7,46 @@ use crate::{
 use crc32fast::Hasher;
 use futures_util::StreamExt;
 use redis::{AsyncCommands, Client, aio::MultiplexedConnection};
+use std::time::Duration;
+
+const MAX_REDIS_RETRIES: usize = 3;
+const REDIS_BACKOFF_BASE_MS: u64 = 100;
+
+/// Retry a Redis operation with exponential backoff.
+/// Used to absorb transient connection drops / network blips.
+async fn with_retry<F, Fut, T>(op_name: &'static str, mut f: F) -> Result<T, redis::RedisError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, redis::RedisError>>,
+{
+    let mut attempt = 0;
+    loop {
+        match f().await {
+            Ok(v) => {
+                if attempt > 0 {
+                    tracing::debug!(op = op_name, attempt, "Redis op succeeded after retry");
+                }
+                return Ok(v);
+            }
+            Err(e) if attempt < MAX_REDIS_RETRIES => {
+                let backoff_ms = REDIS_BACKOFF_BASE_MS * (1 << attempt);
+                tracing::warn!(
+                    op = op_name,
+                    attempt,
+                    backoff_ms,
+                    error = %e,
+                    "Redis op failed, retrying"
+                );
+                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                attempt += 1;
+            }
+            Err(e) => {
+                tracing::error!(op = op_name, error = %e, "Redis op failed after retries");
+                return Err(e);
+            }
+        }
+    }
+}
 
 pub fn compute_shard(key: &str, shard_count: u32) -> u32 {
     let mut h = Hasher::new();
@@ -57,7 +97,7 @@ impl RedisService {
     }
 
     async fn get_connection(&self) -> Result<MultiplexedConnection, redis::RedisError> {
-        self.client.get_multiplexed_async_connection().await
+        with_retry("get_connection", || self.client.get_multiplexed_async_connection()).await
     }
 
     /// Enqueues a batch record into `batches:state:<id>` as a serialised JSON
