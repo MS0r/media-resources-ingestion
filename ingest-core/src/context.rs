@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::{
     auth::AuthProviderRegistry,
@@ -102,19 +103,49 @@ impl ContextFactory {
     }
 
     pub async fn build_chunk_context(&self, job_id: &str) -> Result<JobContext, ToolError> {
-        if let Some(chunk_job) = self.db.get_chunk_job(job_id).await? {
-            tracing::info!(job_id = %job_id, "Building chunk job context from Mongo");
-            Ok(JobContext::from_chunk_job(
-                chunk_job,
-                self.db.clone(),
-                self.redis.clone(),
-                self.config.clone(),
-                self.http_client.clone(),
-                &self.provider_cache,
-                self.heartbeat.clone(),
-            ))
-        } else {
-            Err(format!("Chunk job {job_id} not found in Mongo").into())
+        // Retry on None — the chunk may not have propagated to Mongo yet if
+        // the producer saved to Mongo and then pushed to Redis (the correct
+        // order), but a replica set or pooled connection is lagging. 5 × 50 ms
+        // = 250 ms total budget; this is defense-in-depth (Step 1 in
+        // enqueue_chunks eliminates the race at the source).
+        const RETRIES: u32 = 5;
+        const BACKOFF_MS: u64 = 50;
+
+        for attempt in 0..=RETRIES {
+            match self.db.get_chunk_job(job_id).await? {
+                Some(chunk_job) => {
+                    if attempt > 0 {
+                        tracing::info!(
+                            job_id = %job_id, attempt,
+                            "Chunk context built after retry"
+                        );
+                    }
+                    tracing::info!(job_id = %job_id, "Building chunk job context from Mongo");
+                    return Ok(JobContext::from_chunk_job(
+                        chunk_job,
+                        self.db.clone(),
+                        self.redis.clone(),
+                        self.config.clone(),
+                        self.http_client.clone(),
+                        &self.provider_cache,
+                        self.heartbeat.clone(),
+                    ));
+                }
+                None if attempt < RETRIES => {
+                    tracing::warn!(
+                        job_id = %job_id, attempt,
+                        "Chunk not yet in Mongo, retrying context build"
+                    );
+                    tokio::time::sleep(Duration::from_millis(BACKOFF_MS)).await;
+                }
+                None => {
+                    return Err(ToolError::Message(format!(
+                        "Chunk job {job_id} not found in Mongo after {} attempts",
+                        RETRIES + 1
+                    )));
+                }
+            }
         }
+        unreachable!()
     }
 }

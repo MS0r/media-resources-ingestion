@@ -37,6 +37,42 @@ fn parse_chunk_size(s: &str) -> u64 {
     }
 }
 
+/// Pick a sensible default chunk compression strategy based on the source MIME type.
+///
+/// Re-compressing already-compressed data with gzip **grows** it (DEFLATE can't
+/// improve on the entropy) and produces a "corrupted" reassembly if the
+/// manifest's `compression` field is ever missing. For these formats, store the
+/// raw chunk bytes (`OriginalFormat`).
+fn default_chunk_compression(mime: &str) -> GenericCompressionStrategy {
+    match mime {
+        // Archive formats
+        "application/x-rar"
+        | "application/vnd.rar"
+        | "application/rar"
+        | "application/zip"
+        | "application/x-7z-compressed"
+        | "application/x-tar"
+        | "application/gzip"
+        | "application/zstd" => GenericCompressionStrategy::OriginalFormat,
+        // Video
+        "video/mp4" | "video/x-matroska" | "video/webm" | "video/quicktime" => {
+            GenericCompressionStrategy::OriginalFormat
+        }
+        // Audio
+        "audio/mpeg" | "audio/ogg" | "audio/flac" | "audio/mp4" | "audio/aac" => {
+            GenericCompressionStrategy::OriginalFormat
+        }
+        // Image (most modern formats are already compressed)
+        "image/jpeg" | "image/png" | "image/webp" | "image/avif" | "image/gif" => {
+            GenericCompressionStrategy::OriginalFormat
+        }
+        // Documents
+        "application/pdf" => GenericCompressionStrategy::OriginalFormat,
+        // Compressible by default
+        _ => GenericCompressionStrategy::Gzip,
+    }
+}
+
 /// Resolve the source auth token for a resource.
 ///
 /// Returns `Some(token)` if a dynamic OAuth token should be used,
@@ -165,6 +201,7 @@ async fn spawn_chunk_jobs(
     total_size: u64,
     config: &AppConfig,
     resolved_auth: Option<&str>,
+    mime: &str,
 ) -> Result<Vec<ChunkJob>, JobErrorOutcome> {
     let chunk_size = match &file_job.chunk_size {
         Some(s) => parse_chunk_size(s),
@@ -175,6 +212,11 @@ async fn spawn_chunk_jobs(
 
     let (auth, cookie) = resolve_auth_for_chunks(resource, resolved_auth);
 
+    // Always set a compression_strategy. If the user didn't pick one
+    // explicitly, fall back to a MIME-aware default (see
+    // `default_chunk_compression`). This guarantees the stored manifest
+    // has a non-null `compression` field, so reassembly never silently
+    // falls through to the passthrough branch.
     let compression_strategy = resource
         .config
         .as_ref()
@@ -182,7 +224,8 @@ async fn spawn_chunk_jobs(
         .and_then(|co| match co {
             CompressionOverride::Generic(s) => Some(s.clone()),
             _ => None,
-        });
+        })
+        .unwrap_or_else(|| default_chunk_compression(mime));
 
     let resource_name = resource.name.clone().unwrap_or_else(|| {
         filename_from_url(&resource.url)
@@ -240,7 +283,7 @@ async fn spawn_chunk_jobs(
             storage: dest_provider.clone(),
             total_chunks,
             total_file_size: total_size,
-            compression_strategy: compression_strategy.clone(),
+            compression_strategy: Some(compression_strategy.clone()),
         }
     };
 
@@ -271,12 +314,12 @@ impl super::JobHandler for FileJobHandler {
         if let Some(pr) = pr {
             pr.report("preflight", 1, Some(7), None).await;
         }
-        let (head_size, head_ranges) =
+        let (head_size, head_ranges, head_mime) =
             match initiate_head(resource, &ctx.http_client, ctx.auth_token.as_deref()).await {
-                Ok(info) => (info.content_length, info.accept_ranges),
+                Ok(info) => (info.content_length, info.accept_ranges, info.mime_type),
                 Err(e) => {
                     tracing::warn!(error = %e, "HEAD preflight failed, falling back to GET");
-                    (None, false)
+                    (None, false, "application/octet-stream".to_string())
                 }
             };
 
@@ -287,9 +330,14 @@ impl super::JobHandler for FileJobHandler {
                         pr.report("splitting", 2, Some(7), Some("Spawning chunk jobs"))
                             .await;
                     }
-                    let chunks =
-                        spawn_chunk_jobs(file_job, size, &ctx.config, ctx.auth_token.as_deref())
-                            .await?;
+                    let chunks = spawn_chunk_jobs(
+                        file_job,
+                        size,
+                        &ctx.config,
+                        ctx.auth_token.as_deref(),
+                        &head_mime,
+                    )
+                    .await?;
                     return Ok(JobOutcome::SpawnedChunks(chunks));
                 }
                 tracing::warn!(
@@ -321,9 +369,14 @@ impl super::JobHandler for FileJobHandler {
                     pr.report("splitting", 2, Some(7), Some("Spawning chunk jobs"))
                         .await;
                 }
-                let chunks =
-                    spawn_chunk_jobs(file_job, resp_size, &ctx.config, ctx.auth_token.as_deref())
-                        .await?;
+                let chunks = spawn_chunk_jobs(
+                    file_job,
+                    resp_size,
+                    &ctx.config,
+                    ctx.auth_token.as_deref(),
+                    &download.mime_type,
+                )
+                .await?;
                 return Ok(JobOutcome::SpawnedChunks(chunks));
             }
         }
@@ -364,6 +417,7 @@ impl super::JobHandler for FileJobHandler {
                         byte_count,
                         &ctx.config,
                         ctx.auth_token.as_deref(),
+                        &download.mime_type,
                     )
                     .await?;
                     return Ok(JobOutcome::SpawnedChunks(chunks));
@@ -523,6 +577,51 @@ mod tests {
         ));
         assert!(!is_s3_presigned("Bearer token123"));
         assert!(!is_s3_presigned(""));
+    }
+
+    #[test]
+    fn test_default_chunk_compression_passthrough_for_compressed_formats() {
+        // Already-compressed formats must use OriginalFormat to avoid
+        // the gzip-on-incompressible-data growth bug.
+        for mime in [
+            "application/x-rar",
+            "application/zip",
+            "application/x-7z-compressed",
+            "application/pdf",
+            "video/mp4",
+            "video/x-matroska",
+            "video/webm",
+            "audio/mpeg",
+            "audio/flac",
+            "image/jpeg",
+            "image/png",
+            "image/webp",
+        ] {
+            assert_eq!(
+                default_chunk_compression(mime),
+                GenericCompressionStrategy::OriginalFormat,
+                "expected OriginalFormat for {mime}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_default_chunk_compression_gzip_for_text() {
+        // Text-like and unknown formats should default to gzip.
+        for mime in [
+            "text/plain",
+            "text/html",
+            "application/json",
+            "application/xml",
+            "application/octet-stream",
+            "",
+        ] {
+            assert_eq!(
+                default_chunk_compression(mime),
+                GenericCompressionStrategy::Gzip,
+                "expected Gzip for {mime}"
+            );
+        }
     }
 
     #[test]

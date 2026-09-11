@@ -328,6 +328,84 @@ pub async fn handle_retry(scope: cli::RetryScope, server_addr: &str) -> Result<(
     Ok(())
 }
 
+async fn handle_download(
+    client: &mut IngestServiceClient<tonic::transport::Channel>,
+    hash: &str,
+    output: Option<&str>,
+    range_start: Option<u64>,
+    range_end: Option<u64>,
+) -> Result<()> {
+    use std::io::Write;
+
+    let request = DownloadFileRequest {
+        hash: hash.to_string(),
+        range_start,
+        range_end,
+    };
+    let response = client.download_file(request).await?.into_inner();
+    let mut stream = response;
+
+    // First message must be a header.
+    let header = match stream.next().await {
+        Some(Ok(chunk)) => match chunk.payload {
+            Some(download_file_chunk::Payload::Header(h)) => h,
+            Some(download_file_chunk::Payload::Data(_)) => {
+                return Err("Server sent data before header".into());
+            }
+            None => return Err("Server sent empty frame".into()),
+        },
+        Some(Err(e)) => return Err(format!("Server error: {e}").into()),
+        None => return Err("Server closed stream before sending header".into()),
+    };
+
+    eprintln!(
+        "{} {} ({} bytes, {})",
+        "Downloading".green(),
+        header.filename,
+        header.total_size,
+        if header.is_chunked {
+            "chunked"
+        } else {
+            "single"
+        },
+    );
+
+    // Open the output sink — file or stdout.
+    let mut file: Box<dyn Write + Send> = match output {
+        Some(path) => {
+            let f =
+                std::fs::File::create(path).map_err(|e| format!("Failed to create {path}: {e}"))?;
+            Box::new(f)
+        }
+        None => Box::new(std::io::stdout()),
+    };
+
+    let mut bytes_written: u64 = 0;
+    while let Some(msg) = stream.next().await {
+        let chunk = msg.map_err(|e| format!("Stream error: {e}"))?;
+        match chunk.payload {
+            Some(download_file_chunk::Payload::Data(bytes)) => {
+                bytes_written += bytes.len() as u64;
+                file.write_all(&bytes)
+                    .map_err(|e| format!("Write failed: {e}"))?;
+            }
+            Some(download_file_chunk::Payload::Header(_)) => {
+                // Repeated header — ignore.
+            }
+            None => {}
+        }
+    }
+    file.flush().map_err(|e| format!("Flush failed: {e}"))?;
+
+    eprintln!(
+        "{} {} bytes to {}",
+        "Downloaded".green(),
+        bytes_written,
+        output.unwrap_or("stdout"),
+    );
+    Ok(())
+}
+
 pub async fn handle_files(scope: cli::FilesScope, server_addr: &str) -> Result<()> {
     let mut client = connect(server_addr).await?;
 
@@ -365,6 +443,21 @@ pub async fn handle_files(scope: cli::FilesScope, server_addr: &str) -> Result<(
             println!("  Compressed: {} bytes", f.compressed_file_size);
             println!("  Ratio: {:.2}", f.compression_ratio);
             println!("  MIME: {}", f.mime_type);
+        }
+        cli::FilesScope::Download {
+            hash,
+            output,
+            range_start,
+            range_end,
+        } => {
+            handle_download(
+                &mut client,
+                &hash,
+                output.as_deref(),
+                range_start,
+                range_end,
+            )
+            .await?;
         }
         cli::FilesScope::Delete { hash: _, yes } => {
             if !yes {

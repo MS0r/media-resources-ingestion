@@ -18,8 +18,9 @@ use crate::{
 };
 
 /// Initialize the auth provider registry from environment variables.
-/// This is called once at worker startup.
-fn init_auth_registry() -> AuthProviderRegistry {
+/// Called once at worker startup; also reused by the gRPC server to
+/// build its `ProviderCache`.
+pub(crate) fn init_auth_registry() -> AuthProviderRegistry {
     let mut registry = AuthProviderRegistry::new();
 
     // Google Drive — OAuth refresh-token (from stored config file or env vars)

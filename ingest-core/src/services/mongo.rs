@@ -169,6 +169,26 @@ impl MongoService {
         let client = self.client().await?;
         let collection: Collection<Metadata> = client.collection("files_metadata");
 
+        // Patch any orphaned placeholder documents left behind by a previously
+        // failed job. Two variants exist: old code wrote `original_url: ""` (not
+        // a valid Url) and `storage_provider: "Local"` (capital L, which fails
+        // `Provider`'s lowercase serde). Without this, find_one_and_update
+        // returns the stale document and BSON deserialization fails.
+        let patch_filter = doc! {
+            "file_hash": file_hash,
+            "$or": [
+                { "original_url": "" },
+                { "storage_provider": "Local" },
+            ],
+        };
+        let patch_update = doc! {
+            "$set": {
+                "original_url": "placeholder://pending",
+                "storage_provider": "local",
+            }
+        };
+        let _ = collection.update_one(patch_filter, patch_update).await;
+
         let filter = doc! { "file_hash": file_hash };
         let update = doc! {
             "$inc": { "duplicate_reference_count": 1i32 },
@@ -177,12 +197,13 @@ impl MongoService {
                 // Minimal placeholder fields so Metadata deserialization succeeds
                 // when find_one_and_update returns the upserted document.
                 // These are overwritten by complete_job's full metadata update.
-                "original_url": "",
-                "storage_provider": "Local",
+                "original_url": "placeholder://pending",
+                "storage_provider": "local",
                 "storage_path": "",
                 "original_file_size": 0i64,
                 "mime_type": "",
                 "upload_date": DateTime::now(),
+                "duplicate_reference_count": 0i32,
             },
         };
 
@@ -407,6 +428,32 @@ impl MongoService {
                 doc! { "_id": job_id },
                 doc! { "$set": { "status": failed_job } },
             )
+            .await?;
+        Ok(())
+    }
+
+    /// Test helper: insert a `Metadata` document directly. Used by
+    /// integration tests that want to seed MongoDB without going
+    /// through the full enqueue/worker pipeline.
+    pub async fn insert_test_metadata(&self, metadata: &Metadata) -> Result<(), ToolError> {
+        let client = self.client().await?;
+        let collection: Collection<Metadata> = client.collection("files_metadata");
+        // Drop any existing entry with the same hash to make the test
+        // idempotent across runs.
+        let _ = collection
+            .delete_one(doc! { "file_hash": &metadata.file_hash })
+            .await;
+        collection.insert_one(metadata).await?;
+        Ok(())
+    }
+
+    /// Test helper: remove a `Metadata` document by hash. Companion
+    /// to `insert_test_metadata`.
+    pub async fn delete_test_metadata(&self, file_hash: &str) -> Result<(), ToolError> {
+        let client = self.client().await?;
+        let collection: Collection<Metadata> = client.collection("files_metadata");
+        collection
+            .delete_one(doc! { "file_hash": file_hash })
             .await?;
         Ok(())
     }

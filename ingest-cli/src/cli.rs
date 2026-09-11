@@ -148,6 +148,21 @@ pub enum FilesScope {
     Get {
         hash: String,
     },
+    /// Download a stored file (single or chunked) by hash. Streams
+    /// the original (decompressed) bytes to `--output`, or to stdout
+    /// when `--output` is omitted.
+    Download {
+        hash: String,
+        /// Path to write the downloaded bytes to. Defaults to stdout.
+        #[arg(long, value_name = "path", short = 'o')]
+        output: Option<String>,
+        /// Inclusive start byte of the byte range to fetch.
+        #[arg(long, value_name = "N")]
+        range_start: Option<u64>,
+        /// Inclusive end byte of the byte range to fetch.
+        #[arg(long, value_name = "N")]
+        range_end: Option<u64>,
+    },
     Delete {
         hash: String,
         #[arg(long)]

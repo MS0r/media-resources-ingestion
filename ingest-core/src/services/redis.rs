@@ -103,6 +103,14 @@ impl RedisService {
         .await
     }
 
+    /// Flush the entire Redis database. **Test-only helper** — do not call in
+    /// production code.
+    pub async fn flush_db(&self) -> Result<(), ToolError> {
+        let mut conn = self.get_connection().await?;
+        let _: String = redis::cmd("FLUSHDB").query_async(&mut conn).await?;
+        Ok(())
+    }
+
     /// Enqueues a batch record into `batches:state:<id>` as a serialised JSON
     /// hash field. The batch has no position in the priority queue — it is
     /// metadata that lets `ingest status batch <id>` reconstruct the picture.
@@ -204,9 +212,9 @@ impl RedisService {
         Ok((job_kind, job_status, retry_count))
     }
 
-    /// Dequeues the highest-priority job from a sharded `jobs:pending:{shard}` (BZPOPMAX).
+    /// Dequeues the highest-priority job from across all sharded
+    /// `jobs:pending:{N}` sets (variadic BZPOPMAX over every shard).
     ///
-    /// The shard is computed as `worker_id % shard_count`.
     /// The job ID is stored in the sorted set with a prefix that encodes its
     /// kind: `"file:<uuid>"` or `"chunk:<uuid>"`. This avoids a second Redis
     /// round-trip to resolve the kind and keeps the dequeue path atomic.
@@ -220,13 +228,18 @@ impl RedisService {
     ) -> Result<Option<(JobKind, String)>, ToolError> {
         let mut conn = self.get_connection().await?;
 
-        let shard = worker_id % shard_count;
-        let key = shard_key(shard);
+        let keys: Vec<String> = (0..shard_count).map(shard_key).collect();
 
-        // BZPOPMAX blocks up to 2 s; returns (key, member, score) or nothing.
-        let result: (String, String, f64) = conn.bzpopmax(&key, 2.0).await?;
+        // BZPOPMAX blocks up to 2 s; returns (key, member, score) or nil.
+        let result: Option<(String, String, f64)> = redis::cmd("BZPOPMAX")
+            .arg(&keys)
+            .arg(2.0)
+            .query_async(&mut conn)
+            .await?;
 
-        let (_, raw_id, _score) = result;
+        let Some((_key, raw_id, _score)) = result else {
+            return Ok(None);
+        };
 
         // Decode the "kind:uuid" member into its parts.
         let (kind, job_id) = parse_job_member(&raw_id)
@@ -255,6 +268,52 @@ impl RedisService {
         let _: () = conn.hset(&state_key, "status", "completed").await?;
         let running_key = format!("jobs:running:{job_id}");
         let _: () = conn.del(&running_key).await?;
+        Ok(())
+    }
+
+    /// Read the `parent_job_id` from a chunk's state hash. Used by the
+    /// scheduler to re-enqueue a chunk after a context-build miss without
+    /// needing the caller to retain the parent_job_id.
+    pub async fn get_parent_for_chunk(&self, job_id: &str) -> Result<String, ToolError> {
+        let mut conn = self.get_connection().await?;
+        let state_key = format!("jobs:state:{job_id}");
+        let parent_id: String = redis::cmd("HGET")
+            .arg(&state_key)
+            .arg("parent_job_id")
+            .query_async(&mut conn)
+            .await?;
+        Ok(parent_id)
+    }
+
+    /// Re-enqueue a chunk job back to `jobs:pending:{shard}` after a
+    /// transient context-build failure (e.g. Mongo write lag).
+    ///
+    /// Clears the `jobs:running` lease, resets the state hash to
+    /// `pending`, and pushes the member back to the shard's sorted set.
+    /// Does NOT increment `retry_count` — this is a visibility recovery,
+    /// not a retry of the job itself.
+    pub async fn requeue_chunk_for_retry(
+        &self,
+        job_id: &str,
+        parent_id: &str,
+        shard_count: u32,
+    ) -> Result<(), ToolError> {
+        let mut conn = self.get_connection().await?;
+        let state_key = format!("jobs:state:{job_id}");
+        let running_key = format!("jobs:running:{job_id}");
+        // Clear the running lease so recover_orphaned_jobs won't pick it up
+        // and so dequeue_job won't see a stale lease.
+        let _: () = conn.del(&running_key).await?;
+        // Reset status to pending (the job is back in the queue).
+        let _: () = conn.hset(&state_key, "status", "pending").await?;
+        // Re-enqueue to the correct shard.
+        let shard = compute_shard(parent_id, shard_count);
+        let member = format!("chunk:{job_id}");
+        let _: () = conn.zadd(shard_key(shard), &member, 0_f64).await?;
+        tracing::info!(
+            job_id = %job_id, shard,
+            "Chunk re-enqueued for context-build recovery"
+        );
         Ok(())
     }
 

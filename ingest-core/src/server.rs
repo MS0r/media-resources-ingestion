@@ -1,13 +1,18 @@
 use std::net::SocketAddr;
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use futures_util::StreamExt;
+
 use crate::{
     AppConfig, JobStatusFilter, MongoService, ToolError, bootstrap,
+    handlers::assemble::{self, Frame},
     models::{self, ProgressEvent, ProgressJobType, ProgressStatus},
     services::redis::{RedisService, derive_worker_id},
     settings::load_toml,
+    storage::ProviderCache,
 };
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
@@ -35,6 +40,7 @@ pub struct IngestServer {
     toml_config: crate::TomlRawConfig,
     redis_uri: String,
     mongo_uri: String,
+    provider_cache: Arc<ProviderCache>,
 }
 
 impl IngestServer {
@@ -50,14 +56,38 @@ impl IngestServer {
         )
         .await?;
         let redis = RedisService::new(&redis_uri, 3600, 3, vec![5, 30, 120])?;
+        let auth_registry = bootstrap::init_auth_registry();
+        let provider_cache = Arc::new(ProviderCache::new(auth_registry));
 
-        Ok(Self {
+        Ok(Self::new_from_parts(
             mongo,
             redis,
             toml_config,
             redis_uri,
             mongo_uri,
-        })
+            provider_cache,
+        ))
+    }
+
+    /// Build an `IngestServer` from already-constructed services.
+    /// Used by integration tests to inject test-specific services and
+    /// a pre-built `ProviderCache`.
+    pub fn new_from_parts(
+        mongo: MongoService,
+        redis: RedisService,
+        toml_config: crate::TomlRawConfig,
+        redis_uri: String,
+        mongo_uri: String,
+        provider_cache: Arc<ProviderCache>,
+    ) -> Self {
+        Self {
+            mongo,
+            redis,
+            toml_config,
+            redis_uri,
+            mongo_uri,
+            provider_cache,
+        }
     }
 
     fn build_app_config(
@@ -104,6 +134,9 @@ fn load_yaml_from_str(yaml_content: &str) -> Result<models::IngestionConfig, Too
 
 #[tonic::async_trait]
 impl IngestService for IngestServer {
+    type DownloadFileStream =
+        Pin<Box<dyn futures_util::Stream<Item = Result<DownloadFileChunk, Status>> + Send>>;
+
     async fn enqueue(
         &self,
         request: Request<EnqueueRequest>,
@@ -399,6 +432,61 @@ impl IngestService for IngestServer {
             },
         }))
     }
+
+    async fn download_file(
+        &self,
+        request: Request<DownloadFileRequest>,
+    ) -> Result<Response<Self::DownloadFileStream>, Status> {
+        let req = request.into_inner();
+        let hash = req.hash;
+
+        if let (Some(start), Some(end)) = (req.range_start, req.range_end)
+            && start > end
+        {
+            return Err(Status::invalid_argument(format!(
+                "range_start ({start}) > range_end ({end})"
+            )));
+        }
+
+        let metadata = self
+            .mongo
+            .get_file_metadata(&hash)
+            .await
+            .map_err(internal_err)?
+            .ok_or_else(|| Status::not_found(format!("file with hash {hash} not found")))?;
+
+        let cache = self.provider_cache.clone();
+        let inner = assemble::assemble_file(metadata, cache, req.range_start, req.range_end);
+
+        // Map Frame -> tonic::Response<DownloadFileChunk>.
+        // The header is emitted as a oneof variant of DownloadFileChunk
+        // (the first message); data frames carry the raw bytes.
+        let output = async_stream::try_stream! {
+            let mut stream = inner;
+            while let Some(item) = stream.next().await {
+                let frame = item.map_err(|e| tonic::Status::internal(e.to_string()))?;
+                let chunk = match frame {
+                    Frame::Header(h) => DownloadFileChunk {
+                        payload: Some(download_file_chunk::Payload::Header(
+                            DownloadFileHeader {
+                                file_hash: h.file_hash,
+                                mime_type: h.mime_type,
+                                filename: h.filename,
+                                total_size: h.total_size,
+                                is_chunked: h.is_chunked,
+                            },
+                        )),
+                    },
+                    Frame::Data(b) => DownloadFileChunk {
+                        payload: Some(download_file_chunk::Payload::Data(b.to_vec())),
+                    },
+                };
+                yield chunk;
+            }
+        };
+
+        Ok(Response::new(Box::pin(output)))
+    }
 }
 
 impl From<ToolError> for Status {
@@ -487,6 +575,7 @@ pub async fn serve(addr: SocketAddr, toml_path: &Path) -> Result<(), ToolError> 
         toml_config,
         redis_uri,
         mongo_uri,
+        provider_cache: Arc::new(ProviderCache::new(bootstrap::init_auth_registry())),
     };
 
     let server_shutdown = shutdown.clone();

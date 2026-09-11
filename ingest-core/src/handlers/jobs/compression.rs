@@ -8,13 +8,16 @@ use ffmpeg_next::{
     },
     frame, media, picture,
 };
+use tokio::io::{AsyncRead, ReadBuf};
 use tokio::sync::mpsc::{Receiver, Sender};
 
 use std::{
     io,
     path::Path,
+    pin::Pin,
     sync::Arc,
     sync::atomic::{AtomicBool, Ordering},
+    task::{Context, Poll},
 };
 
 use crate::{
@@ -78,6 +81,19 @@ pub(crate) fn generic_compression_extension(strategy: &GenericCompressionStrateg
     match strategy {
         GenericCompressionStrategy::Gzip => "gz",
         GenericCompressionStrategy::Zstd => "zst",
+        GenericCompressionStrategy::Zip => "zip",
+        GenericCompressionStrategy::SevenZ => "7z",
+        GenericCompressionStrategy::OriginalFormat | GenericCompressionStrategy::None => "",
+    }
+}
+
+/// Map a `GenericCompressionStrategy` to the canonical name used in
+/// `Manifest.compression` (the inverse of `generic_compression_extension`
+/// and `compress_generic_local`).
+pub(crate) fn generic_compression_name(strategy: &GenericCompressionStrategy) -> &'static str {
+    match strategy {
+        GenericCompressionStrategy::Gzip => "gzip",
+        GenericCompressionStrategy::Zstd => "zstd",
         GenericCompressionStrategy::Zip => "zip",
         GenericCompressionStrategy::SevenZ => "7z",
         GenericCompressionStrategy::OriginalFormat | GenericCompressionStrategy::None => "",
@@ -179,6 +195,10 @@ fn compress_image_local_inner(
         strategy,
         temp_path
     );
+    // `image 0.25` only exposes a lossless WebP encoder
+    // (`WebPEncoder::new_lossless`); there is no public lossy path.
+    // Both `Webp` and `LosslessWebp` use it. The `Webp` variant is
+    // retained for backward compatibility with existing YAML files.
     match strategy {
         ImageCompressionStrategy::Avif => {
             let file = File::create(&output_path)?;
@@ -898,6 +918,261 @@ pub(crate) async fn compress_generic_local(
     Ok(result)
 }
 
+/// `AsyncRead` adapter that pumps a synchronous `Read` (driven on a
+/// blocking task) into an async consumer via a bounded mpsc channel.
+///
+/// The producer side owns a synchronous reader, reads up to 64 KiB chunks,
+/// and `blocking_send`s them to the consumer. The consumer side returns
+/// `Pending` while it waits for the next chunk. Dropping the reader
+/// unblocks the producer (its `blocking_send` returns `Err`).
+pub(crate) struct BlockingReader {
+    rx: tokio::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>,
+    current: Vec<u8>,
+    current_pos: usize,
+    finished: bool,
+}
+
+impl BlockingReader {
+    fn new(rx: tokio::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>) -> Self {
+        Self {
+            rx,
+            current: Vec::new(),
+            current_pos: 0,
+            finished: false,
+        }
+    }
+}
+
+impl AsyncRead for BlockingReader {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        loop {
+            // Drain whatever we have buffered.
+            if self.current_pos < self.current.len() {
+                let remaining = self.current.len() - self.current_pos;
+                let to_copy = remaining.min(buf.remaining());
+                buf.put_slice(&self.current[self.current_pos..self.current_pos + to_copy]);
+                self.current_pos += to_copy;
+                return Poll::Ready(Ok(()));
+            }
+            if self.finished {
+                return Poll::Ready(Ok(()));
+            }
+            // No buffered bytes — try to receive the next chunk.
+            match Pin::new(&mut self.rx).poll_recv(cx) {
+                Poll::Ready(Some(Ok(bytes))) => {
+                    self.current = bytes;
+                    self.current_pos = 0;
+                    // Loop and try to fill the caller's buffer.
+                }
+                Poll::Ready(Some(Err(e))) => {
+                    self.finished = true;
+                    return Poll::Ready(Err(e));
+                }
+                Poll::Ready(None) => {
+                    self.finished = true;
+                    return Poll::Ready(Ok(()));
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+}
+
+/// Stream-decompress the bytes produced by `input` using the named
+/// strategy. `max_bytes` truncates the output at the given length (0
+/// means no limit). The returned `AsyncRead` is `Send + Unpin` so it
+/// composes with the rest of the pipeline.
+///
+/// Internally spawns a `spawn_blocking` task that:
+/// 1. Wraps the async input in `SyncIoBridge` to present it as `Read`.
+/// 2. Wraps that in the appropriate sync decompressor (gzip, zstd, zip, 7z).
+/// 3. `blocking_send`s 64 KiB chunks to the consumer.
+///
+/// For seek-required formats (zip, 7z) the compressed input is buffered
+/// into a `Vec<u8>` first; the format overhead on the buffer is small
+/// because those formats compress better than gzip.
+///
+/// The channel is bounded (capacity 8) — backpressure flows naturally
+/// from the consumer's `AsyncRead::poll_read` returning `Pending`.
+pub(crate) fn decompress_generic_reader(
+    mut input: Box<dyn AsyncRead + Unpin + Send>,
+    compression: &str,
+    max_bytes: u64,
+) -> Pin<Box<dyn AsyncRead + Send>> {
+    let compression = compression.to_string();
+    let (tx, rx) = tokio::sync::mpsc::channel::<std::io::Result<Vec<u8>>>(8);
+
+    let needs_seek = matches!(compression.as_str(), "zip" | "7z");
+    let tx_clone = tx.clone();
+    let compression_clone = compression.clone();
+
+    if needs_seek {
+        // Buffer the async input, then hand it to a blocking task that
+        // runs the seek-required decompressor over the buffer.
+        tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let mut buffered = Vec::new();
+            let result = match input.read_to_end(&mut buffered).await {
+                Ok(_) => {
+                    let tx_inner = tx_clone.clone();
+                    let compression_inner = compression_clone.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let result =
+                            decompress_buffered(&compression_inner, buffered, max_bytes, &tx_inner);
+                        if let Err(e) = result {
+                            let _ = tx_inner.blocking_send(Err(e));
+                        }
+                    });
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            };
+            if let Err(e) = result {
+                let _ = tx_clone.send(Err(e)).await;
+            }
+        });
+    } else {
+        // Streaming path — wrap the async input in SyncIoBridge inside a
+        // blocking task.
+        tokio::task::spawn_blocking(move || {
+            use tokio_util::io::SyncIoBridge;
+            let sync_input = SyncIoBridge::new(input);
+            let result = decompress_streaming(sync_input, &compression_clone, max_bytes, &tx);
+            if let Err(e) = result {
+                let _ = tx.blocking_send(Err(e));
+            }
+        });
+    }
+
+    let reader = BlockingReader::new(rx);
+    Box::pin(reader)
+}
+
+/// Streaming decompression — used for formats that don't need `Seek`
+/// (gzip, zstd, none, unknown passthrough).
+fn decompress_streaming<R: std::io::Read + Send + 'static>(
+    sync_input: R,
+    compression: &str,
+    max_bytes: u64,
+    tx: &tokio::sync::mpsc::Sender<std::io::Result<Vec<u8>>>,
+) -> std::io::Result<()> {
+    use std::io::Read;
+    let mut reader: Box<dyn Read + Send> = match compression {
+        "gzip" => Box::new(flate2::read::GzDecoder::new(sync_input)),
+        "zstd" => Box::new(zstd::stream::Decoder::new(sync_input)?),
+        "" | "none" | "originalformat" => Box::new(sync_input),
+        other => {
+            tracing::warn!(
+                compression = %other,
+                "Unknown chunk compression strategy; passing bytes through"
+            );
+            Box::new(sync_input)
+        }
+    };
+
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut sent: u64 = 0;
+    loop {
+        if max_bytes > 0 && sent >= max_bytes {
+            return Ok(());
+        }
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            return Ok(());
+        }
+        let to_send = if max_bytes > 0 {
+            let allowed = (max_bytes - sent) as usize;
+            n.min(allowed)
+        } else {
+            n
+        };
+        if to_send == 0 {
+            return Ok(());
+        }
+        if tx.blocking_send(Ok(buf[..to_send].to_vec())).is_err() {
+            return Ok(()); // consumer dropped
+        }
+        sent += to_send as u64;
+    }
+}
+
+/// Buffered decompression — used for formats that need `Seek` (zip, 7z).
+fn decompress_buffered(
+    compression: &str,
+    buffered: Vec<u8>,
+    max_bytes: u64,
+    tx: &tokio::sync::mpsc::Sender<std::io::Result<Vec<u8>>>,
+) -> std::io::Result<()> {
+    use std::io::Read;
+    let len = buffered.len() as u64;
+    let cursor = std::io::Cursor::new(buffered);
+
+    match compression {
+        "zip" => {
+            let mut archive = zip::ZipArchive::new(cursor)?;
+            if archive.len() == 0 {
+                return Ok(());
+            }
+            let file: zip::read::ZipFile<'_, std::io::Cursor<Vec<u8>>> = archive.by_index(0)?;
+            // Always wrap in `Take` so the types are uniform; `u64::MAX`
+            // means "no limit".
+            let limit = if max_bytes > 0 { max_bytes } else { u64::MAX };
+            let mut limited = file.take(limit);
+            let mut buf = vec![0u8; 64 * 1024];
+            loop {
+                let n = limited.read(&mut buf)?;
+                if n == 0 {
+                    return Ok(());
+                }
+                if tx.blocking_send(Ok(buf[..n].to_vec())).is_err() {
+                    return Ok(());
+                }
+            }
+        }
+        "7z" => {
+            let mut reader =
+                sevenz_rust::SevenZReader::new(cursor, len, sevenz_rust::Password::empty())
+                    .map_err(|e| {
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
+                    })?;
+            let mut sent: u64 = 0;
+            let mut buf = vec![0u8; 64 * 1024];
+            reader
+                .for_each_entries(|_entry, entry_reader| {
+                    loop {
+                        if max_bytes > 0 && sent >= max_bytes {
+                            return Ok(false);
+                        }
+                        let n = entry_reader.read(&mut buf)?;
+                        if n == 0 {
+                            return Ok(true);
+                        }
+                        let to_send = if max_bytes > 0 {
+                            let allowed = (max_bytes - sent) as usize;
+                            n.min(allowed)
+                        } else {
+                            n
+                        };
+                        if to_send == 0 {
+                            return Ok(false);
+                        }
+                        if tx.blocking_send(Ok(buf[..to_send].to_vec())).is_err() {
+                            return Ok(false);
+                        }
+                        sent += to_send as u64;
+                    }
+                })
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+            Ok(())
+        }
+        _ => unreachable!("decompress_buffered called for non-seek strategy: {compression}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1367,6 +1642,169 @@ mod tests {
         assert!(path.ends_with(".avif"), "expected .avif, got {path}");
         assert!(size > 0);
         assert_eq!(mime, "image/avif");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── Generic decompression tests ──────────────────────────────────────────────
+
+    use tokio::io::AsyncReadExt;
+
+    /// Run an `AsyncRead` to completion, returning the bytes read.
+    async fn read_all(mut r: Pin<Box<dyn AsyncRead + Send>>) -> std::io::Result<Vec<u8>> {
+        let mut out = Vec::new();
+        r.read_to_end(&mut out).await?;
+        Ok(out)
+    }
+
+    /// Compress `data` with gzip at level 6, return the encoded bytes.
+    fn gzip_encode(data: &[u8]) -> Vec<u8> {
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+        use std::io::Write;
+        let mut enc = GzEncoder::new(Vec::new(), Compression::new(6));
+        enc.write_all(data).unwrap();
+        enc.finish().unwrap()
+    }
+
+    /// Compress `data` with zstd at level 3, return the encoded bytes.
+    fn zstd_encode(data: &[u8]) -> Vec<u8> {
+        zstd::stream::encode_all(data, 3).unwrap()
+    }
+
+    /// Compress `data` as a single-entry zip, return the encoded bytes.
+    fn zip_encode(data: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut buf = Vec::new();
+        {
+            let mut zw = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated)
+                .compression_level(Some(6));
+            zw.start_file("payload.bin", opts).unwrap();
+            zw.write_all(data).unwrap();
+            zw.finish().unwrap();
+        }
+        buf
+    }
+
+    /// Compress `data` as a 7z archive, return the encoded bytes.
+    fn sevenz_encode(data: &[u8]) -> Vec<u8> {
+        let tmp_in = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        std::fs::write(&tmp_in, data).unwrap();
+        let tmp_out = std::env::temp_dir().join(format!("{}.7z", uuid::Uuid::new_v4()));
+        {
+            let mut szw = sevenz_rust::SevenZWriter::create(&tmp_out).unwrap();
+            let lzma2_opts = sevenz_rust::lzma::LZMA2Options::with_preset(6);
+            szw.set_content_methods(vec![sevenz_rust::SevenZMethodConfiguration::from(
+                lzma2_opts,
+            )]);
+            szw.push_source_path(&tmp_in, |_| true).unwrap();
+            szw.finish().unwrap();
+        }
+        let buf = std::fs::read(&tmp_out).unwrap();
+        std::fs::remove_file(&tmp_in).ok();
+        std::fs::remove_file(&tmp_out).ok();
+        buf
+    }
+
+    fn temp_dir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn test_decompress_generic_gzip_roundtrip() {
+        let original: Vec<u8> = (0..64 * 1024).map(|i| (i % 251) as u8).collect();
+        let encoded = gzip_encode(&original);
+        let input: Box<dyn AsyncRead + Unpin + Send> = Box::new(std::io::Cursor::new(encoded));
+        let reader = decompress_generic_reader(input, "gzip", original.len() as u64);
+        let out = read_all(reader).await.unwrap();
+        assert_eq!(out, original);
+    }
+
+    #[tokio::test]
+    async fn test_decompress_generic_zstd_roundtrip() {
+        let original: Vec<u8> = (0..128 * 1024u32)
+            .map(|i| (i.wrapping_mul(31) % 251) as u8)
+            .collect();
+        let encoded = zstd_encode(&original);
+        let input: Box<dyn AsyncRead + Unpin + Send> = Box::new(std::io::Cursor::new(encoded));
+        let reader = decompress_generic_reader(input, "zstd", original.len() as u64);
+        let out = read_all(reader).await.unwrap();
+        assert_eq!(out, original);
+    }
+
+    #[tokio::test]
+    async fn test_decompress_generic_zip_roundtrip() {
+        let original: Vec<u8> = (0..32 * 1024u32)
+            .map(|i| (i.wrapping_mul(13) % 251) as u8)
+            .collect();
+        let encoded = zip_encode(&original);
+        let input: Box<dyn AsyncRead + Unpin + Send> = Box::new(std::io::Cursor::new(encoded));
+        let reader = decompress_generic_reader(input, "zip", original.len() as u64);
+        let out = read_all(reader).await.unwrap();
+        assert_eq!(out, original);
+    }
+
+    #[tokio::test]
+    async fn test_decompress_generic_7z_roundtrip() {
+        let original: Vec<u8> = (0..16 * 1024u32)
+            .map(|i| (i.wrapping_mul(7) % 251) as u8)
+            .collect();
+        let encoded = sevenz_encode(&original);
+        let input: Box<dyn AsyncRead + Unpin + Send> = Box::new(std::io::Cursor::new(encoded));
+        let reader = decompress_generic_reader(input, "7z", original.len() as u64);
+        let out = read_all(reader).await.unwrap();
+        assert_eq!(out, original);
+    }
+
+    #[tokio::test]
+    async fn test_decompress_generic_passthrough() {
+        let original: Vec<u8> = b"hello world, no compression here".to_vec();
+        let input: Box<dyn AsyncRead + Unpin + Send> =
+            Box::new(std::io::Cursor::new(original.clone()));
+        let reader = decompress_generic_reader(input, "", 0);
+        let out = read_all(reader).await.unwrap();
+        assert_eq!(out, original);
+    }
+
+    #[tokio::test]
+    async fn test_decompress_generic_unknown_strategy_passthrough() {
+        let original: Vec<u8> = b"mystery bytes".to_vec();
+        let input: Box<dyn AsyncRead + Unpin + Send> =
+            Box::new(std::io::Cursor::new(original.clone()));
+        let reader = decompress_generic_reader(input, "not-a-real-codec", 0);
+        let out = read_all(reader).await.unwrap();
+        assert_eq!(out, original);
+    }
+
+    #[tokio::test]
+    async fn test_decompress_generic_max_bytes_truncates() {
+        let original: Vec<u8> = (0..8192).map(|i| (i % 251) as u8).collect();
+        let encoded = gzip_encode(&original);
+        let input: Box<dyn AsyncRead + Unpin + Send> = Box::new(std::io::Cursor::new(encoded));
+        let reader = decompress_generic_reader(input, "gzip", 100);
+        let out = read_all(reader).await.unwrap();
+        assert_eq!(out.len(), 100);
+        assert_eq!(out, &original[..100]);
+    }
+
+    #[tokio::test]
+    async fn test_decompress_generic_from_file() {
+        // End-to-end: write a gzipped file to disk, decompress via the reader.
+        let original: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
+        let encoded = gzip_encode(&original);
+        let dir = temp_dir();
+        let path = dir.join("payload.bin.gz");
+        std::fs::write(&path, &encoded).unwrap();
+
+        let file = tokio::fs::File::open(&path).await.unwrap();
+        let input: Box<dyn AsyncRead + Unpin + Send> = Box::new(file);
+        let reader = decompress_generic_reader(input, "gzip", original.len() as u64);
+        let out = read_all(reader).await.unwrap();
+        assert_eq!(out, original);
 
         std::fs::remove_dir_all(&dir).ok();
     }

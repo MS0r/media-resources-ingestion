@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 pub mod auth;
 pub(crate) mod bootstrap;
 pub mod config;
@@ -12,6 +13,7 @@ pub mod settings;
 pub mod storage;
 
 pub use bootstrap::enqueue;
+pub use bootstrap::worker_with_services;
 pub use config::RunConfig;
 pub use error::ToolError;
 pub use models::{AppConfig, JobStatusFilter, OutputFormat};

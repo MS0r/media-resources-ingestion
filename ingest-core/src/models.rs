@@ -25,6 +25,7 @@ pub struct Metadata {
     pub mime_type: String,
     pub chunk_manifest: Option<Manifest>,
     pub upload_date: MongoDateTime,
+    #[serde(default)]
     pub duplicate_reference_count: u32,
     pub update_date: Option<MongoDateTime>,
 }
@@ -105,6 +106,10 @@ pub struct ChunkRef {
 pub enum ImageCompressionStrategy {
     #[default]
     Avif,
+    // NOTE: in `image 0.25` both `Webp` and `LosslessWebp` resolve to
+    // the same lossless encoder. `Webp` is kept for backward
+    // compatibility with existing YAML files and may be wired to a
+    // lossy path if/when the `webp` crate is added.
     Webp,
     LosslessWebp,
 }

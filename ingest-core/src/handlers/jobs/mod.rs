@@ -4,6 +4,8 @@ mod execute;
 mod handle;
 mod types;
 
+pub(crate) use compression::decompress_generic_reader;
+
 pub use execute::*;
 pub use types::*;
 

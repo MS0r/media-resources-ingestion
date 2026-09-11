@@ -201,6 +201,8 @@ ingest cancel job <id>             # cancel single pending job
 ingest retry job <id>              # re-enqueue a failed job
 ingest files list [--mime] [--limit]     # list stored file metadata
 ingest files get <hash>            # get file metadata by hash
+ingest files download <hash> [--output PATH] [--range-start N] [--range-end N]
+                                  # stream original (decompressed) bytes
 ingest files delete <hash>         # delete file metadata
 ```
 

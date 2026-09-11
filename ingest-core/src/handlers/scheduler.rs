@@ -183,11 +183,50 @@ pub async fn scheduler_loop(
                     let ctx = match ctx_factory.build_chunk_context(&job_id).await {
                         Ok(ctx) => ctx,
                         Err(e) => {
-                            tracing::error!(job_id = %job_id, error = %e, "Failed to build chunk job context");
-                            redis
-                                .fail_job(&job_id, &format!("Context build failed: {e}"))
-                                .await
-                                .ok();
+                            // Context-build exhausted retries — the chunk's
+                            // Mongo row still doesn't exist. Instead of
+                            // fail_job (which would silently lose the chunk),
+                            // re-enqueue it so it gets another chance when the
+                            // Mongo write lands.
+                            tracing::error!(
+                                job_id = %job_id, error = %e,
+                                "Chunk context build failed, re-enqueueing for recovery"
+                            );
+                            match redis.get_parent_for_chunk(&job_id).await {
+                                Ok(parent_id) => {
+                                    if let Err(re_err) = redis
+                                        .requeue_chunk_for_retry(&job_id, &parent_id, shard_count)
+                                        .await
+                                    {
+                                        tracing::error!(
+                                            job_id = %job_id, error = %re_err,
+                                            "Failed to re-enqueue chunk, marking as failed"
+                                        );
+                                        let _ = redis
+                                            .fail_job(
+                                                &job_id,
+                                                &format!(
+                                                    "Context build failed and re-enqueue failed: {e}"
+                                                ),
+                                            )
+                                            .await;
+                                    }
+                                }
+                                Err(redis_err) => {
+                                    tracing::error!(
+                                        job_id = %job_id, error = %redis_err,
+                                        "Cannot read parent_job_id, marking chunk as failed"
+                                    );
+                                    let _ = redis
+                                        .fail_job(
+                                            &job_id,
+                                            &format!(
+                                                "Context build failed and parent lookup failed: {e}"
+                                            ),
+                                        )
+                                        .await;
+                                }
+                            }
                             continue;
                         }
                     };
@@ -423,9 +462,14 @@ async fn enqueue_chunks(
 ) -> Result<(), JobErrorOutcome> {
     redis.create_counter(parent_id).await?;
     let chunks_len = chunks.len();
+    // Save to Mongo FIRST, then push to Redis. The previous Redis-first order
+    // was a silent chunk-loss race: workers dequeued chunks from Redis before
+    // the `chunks_jobs` row existed in Mongo, `build_chunk_context` returned
+    // `None`, and the failure path `fail_job`'d the chunk without re-enqueueing.
+    // `ChunkJob` is small (strings + ints + Provider enum), so clone is cheap.
     for chunk in chunks {
+        db.save_chunk_job(chunk.clone()).await?;
         redis.enqueue_chunk_job(&chunk, shard_count).await?;
-        db.save_chunk_job(chunk).await?;
     }
     tracing::info!(count = chunks_len, "Chunks enqueued");
     Ok(())
