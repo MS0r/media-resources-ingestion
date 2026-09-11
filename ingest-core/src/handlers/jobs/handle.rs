@@ -160,10 +160,27 @@ pub(crate) async fn handle_new_file(
                 }
             }
             CompressionOverride::Generic(strategy) => {
-                match compress_generic_local(&temp_path, &download.filename, strategy, quality)
-                    .await
+                // Mirror the image/video branches: a tokio timeout enforces
+                // the configured compression budget, and an Arc<AtomicBool>
+                // signals the in-flight blocking encoder to bail on the
+                // next cancel-check boundary. The blocking thread is
+                // otherwise uninterruptible mid-`io::copy`, so the cancel
+                // check is best-effort.
+                let cancel_generic = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let cancel_generic_clone = cancel_generic.clone();
+                match timeout(
+                    compression_timeout,
+                    compress_generic_local(
+                        &temp_path,
+                        &download.filename,
+                        strategy,
+                        quality,
+                        cancel_generic_clone,
+                    ),
+                )
+                .await
                 {
-                    Ok((path, size)) => {
+                    Ok(Ok((path, size))) => {
                         let mime = if path == temp_path {
                             download.mime_type.clone()
                         } else {
@@ -176,8 +193,16 @@ pub(crate) async fn handle_new_file(
                         );
                         (path, Some(size), mime)
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         tracing::warn!("Generic compression failed: {e}, keeping original");
+                        (temp_path.clone(), Some(0), download.mime_type)
+                    }
+                    Err(_elapsed) => {
+                        tracing::warn!(
+                            "Generic compression timed out after {}s, keeping original",
+                            ctx.config.compression_timeout_secs
+                        );
+                        cancel_generic.store(true, std::sync::atomic::Ordering::Relaxed);
                         (temp_path.clone(), Some(0), download.mime_type)
                     }
                 }

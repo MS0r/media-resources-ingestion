@@ -441,6 +441,7 @@ impl super::JobHandler for ChunkJobHandler {
             &chunk_label,
             &strategy,
             ctx.config.compression_quality,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         )
         .await?;
 

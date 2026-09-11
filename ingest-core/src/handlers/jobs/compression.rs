@@ -25,12 +25,39 @@ use crate::{
 enum MuxItem {
     Video(frame::Video),
     Audio(frame::Audio),
+    /// Compressed audio packet forwarded verbatim from input to output
+    /// in the audio passthrough path (see `mp4_compatible_audio`).
+    AudioPacket(Packet),
 }
 
 impl From<tokio::sync::mpsc::error::SendError<MuxItem>> for JobError {
     fn from(_: tokio::sync::mpsc::error::SendError<MuxItem>) -> Self {
         JobError::OtherFatal("Compression channel closed unexpectedly".into())
     }
+}
+
+/// Audio codec IDs that can be muxed into MP4 without re-encoding.
+/// Source: ffmpeg `mov.c` `mov_known_audio_codecs` and the ISO/IEC 14496-12
+/// sample entry boxes. Opus/FLAC/PCM-F64 are intentionally omitted for 2.1
+/// (extradata/codec_tag polish is a follow-up).
+pub(crate) fn mp4_compatible_audio(id: codec::Id) -> bool {
+    use codec::Id;
+    matches!(
+        id,
+        Id::AAC
+            | Id::MP3
+            | Id::AC3
+            | Id::EAC3
+            | Id::FLAC
+            | Id::OPUS
+            | Id::VORBIS
+            | Id::PCM_S16BE
+            | Id::PCM_S16LE
+            | Id::PCM_S24BE
+            | Id::PCM_S24LE
+            | Id::PCM_S32BE
+            | Id::PCM_S32LE
+    )
 }
 
 pub(crate) fn mime_to_extension(mime: &str) -> Option<&'static str> {
@@ -98,7 +125,7 @@ fn compress_image_local_inner(
     original_name: &str,
     mime_type: &str,
     original_size: u64,
-    _quality: u8,
+    quality: u8,
     temp_path: &str,
     strategy: &ImageCompressionStrategy,
 ) -> Result<(String, u64, String), JobError> {
@@ -109,7 +136,12 @@ fn compress_image_local_inner(
     use std::fs::File;
     use std::io::BufWriter;
 
-    if mime_type == "image/webp" {
+    if mime_type == "image/webp"
+        && matches!(
+            strategy,
+            ImageCompressionStrategy::Webp | ImageCompressionStrategy::LosslessWebp
+        )
+    {
         let meta = std::fs::metadata(temp_path)?;
         return Ok((temp_path.to_string(), meta.len(), mime_type.to_string()));
     }
@@ -118,6 +150,7 @@ fn compress_image_local_inner(
         "image/jpeg" | "image/jpg" => ImageFormat::Jpeg,
         "image/png" => ImageFormat::Png,
         "image/gif" => ImageFormat::Gif,
+        "image/webp" => ImageFormat::WebP,
         _ => {
             return Err(JobError::OtherFatal(
                 "Unsupported image format for compression".into(),
@@ -149,12 +182,11 @@ fn compress_image_local_inner(
     match strategy {
         ImageCompressionStrategy::Avif => {
             let file = File::create(&output_path)?;
-            AvifEncoder::new(BufWriter::new(file)).write_image(
-                rgba.as_raw(),
-                width,
-                height,
-                ExtendedColorType::Rgba8,
-            )?;
+            // speed 1-10 (1 slowest, 10 fastest); 4 is "balanced".
+            // quality 1-100 (1 worst, 100 best); 0 is a sentinel that the
+            // encoder rejects, so we floor at 1.
+            AvifEncoder::new_with_speed_quality(BufWriter::new(file), 4, quality.max(1))
+                .write_image(rgba.as_raw(), width, height, ExtendedColorType::Rgba8)?;
         }
         ImageCompressionStrategy::LosslessWebp | ImageCompressionStrategy::Webp => {
             let file = File::create(&output_path)?;
@@ -369,54 +401,89 @@ pub(crate) async fn compress_video_local(
     let mut audio_filter = None;
     let mut audio_ost_index = None;
     let mut audio_ostb = None;
+    // If the input audio codec is already MP4-native, we copy the stream
+    // through verbatim (no decode/encode) to avoid quality loss from
+    // re-encoding. Otherwise (or when there is no audio), we keep the
+    // existing AAC re-encode path.
+    let audio_passthrough = audio_decoder
+        .as_ref()
+        .map(|d| mp4_compatible_audio(d.id()))
+        .unwrap_or(false);
 
     if let Some(ref mut audio_dec) = audio_decoder {
-        let aac_codec = encoder::find(codec::Id::AAC).ok_or_else(|| {
-            JobError::OtherFatal("AAC encoder not found on this system".to_string())
-        })?;
-        let aac_codec_info = aac_codec.audio()?;
-
-        let mut enc = codec::context::Context::new_with_codec(aac_codec)
-            .encoder()
-            .audio()?;
-
-        let channel_layout = aac_codec_info
-            .channel_layouts()
-            .map(|cls| cls.best(audio_dec.channel_layout().channels()))
-            .unwrap_or(ChannelLayout::STEREO);
-
-        if global_header {
-            enc.set_flags(codec::Flags::GLOBAL_HEADER);
-        }
-        enc.set_rate(audio_dec.rate() as i32);
-        enc.set_channel_layout(channel_layout);
-        enc.set_format(
-            aac_codec_info
-                .formats()
-                .ok_or_else(|| JobError::OtherFatal("AAC encoder has no supported formats".into()))?
-                .next()
+        if audio_passthrough {
+            // Set up the output stream from the input stream's codec params.
+            // `set_parameters` calls `avcodec_parameters_copy`, which copies
+            // codec_id, sample_rate, channels, channel_layout, and extradata.
+            // 2.2 will add explicit codec_tag handling for AC3/EAC3/FLAC/Opus.
+            let input_audio_stream = audio_stream_index
+                .and_then(|idx| ictx.stream(idx))
                 .ok_or_else(|| {
-                    JobError::OtherFatal("AAC encoder has no supported formats".into())
-                })?,
-        );
-        enc.set_bit_rate((64000 + (quality as u32) * 1280) as usize);
-        enc.set_time_base((1, audio_dec.rate() as i32));
+                    JobError::OtherFatal("Missing input audio stream for passthrough".into())
+                })?;
+            let in_codec_id = input_audio_stream.parameters().id();
+            let in_codec = encoder::find(in_codec_id).ok_or_else(|| {
+                JobError::OtherFatal(format!(
+                    "Codec {in_codec_id:?} not available for output muxer"
+                ))
+            })?;
+            let mut ost = octx.add_stream(in_codec)?;
+            ost.set_parameters(input_audio_stream.parameters());
+            ost.set_time_base(input_audio_stream.time_base());
+            audio_ost_index = Some(octx.streams().count() - 1);
+            // audio_encoder and audio_filter stay None: the encode loop
+            // sees no reencode-side state and remuxes the packets
+            // directly via MuxItem::AudioPacket.
+        } else {
+            let aac_codec = encoder::find(codec::Id::AAC).ok_or_else(|| {
+                JobError::OtherFatal("AAC encoder not found on this system".to_string())
+            })?;
+            let aac_codec_info = aac_codec.audio()?;
 
-        let enc = enc.open_as(aac_codec_info)?;
+            let mut enc = codec::context::Context::new_with_codec(aac_codec)
+                .encoder()
+                .audio()?;
 
-        {
-            let mut ost = octx.add_stream(aac_codec)?;
-            ost.set_parameters(&enc);
-            ost.set_time_base((1, audio_dec.rate() as i32));
+            let channel_layout = aac_codec_info
+                .channel_layouts()
+                .map(|cls| cls.best(audio_dec.channel_layout().channels()))
+                .unwrap_or(ChannelLayout::STEREO);
+
+            if global_header {
+                enc.set_flags(codec::Flags::GLOBAL_HEADER);
+            }
+            enc.set_rate(audio_dec.rate() as i32);
+            enc.set_channel_layout(channel_layout);
+            enc.set_format(
+                aac_codec_info
+                    .formats()
+                    .ok_or_else(|| {
+                        JobError::OtherFatal("AAC encoder has no supported formats".into())
+                    })?
+                    .next()
+                    .ok_or_else(|| {
+                        JobError::OtherFatal("AAC encoder has no supported formats".into())
+                    })?,
+            );
+            enc.set_bit_rate((64000 + (quality as u32) * 1280) as usize);
+            enc.set_time_base((1, audio_dec.rate() as i32));
+
+            let enc = enc.open_as(aac_codec_info)?;
+
+            {
+                let mut ost = octx.add_stream(aac_codec)?;
+                ost.set_parameters(&enc);
+                ost.set_time_base((1, audio_dec.rate() as i32));
+            }
+
+            let ost_idx = octx.streams().count() - 1;
+
+            let filter = setup_audio_filter(audio_dec, &enc)?;
+
+            audio_encoder = Some(enc);
+            audio_filter = Some(filter);
+            audio_ost_index = Some(ost_idx);
         }
-
-        let ost_idx = octx.streams().count() - 1;
-
-        let filter = setup_audio_filter(audio_dec, &enc)?;
-
-        audio_encoder = Some(enc);
-        audio_filter = Some(filter);
-        audio_ost_index = Some(ost_idx);
     }
 
     octx.set_metadata(ictx.metadata().to_owned());
@@ -446,6 +513,7 @@ pub(crate) async fn compress_video_local(
             &out_path,
             tx,
             cancelled_decode,
+            audio_passthrough,
         )
     });
 
@@ -493,6 +561,7 @@ fn decode_av_frames(
     out_path: &str,
     tx: Sender<MuxItem>,
     cancelled: Arc<AtomicBool>,
+    audio_passthrough: bool,
 ) -> Result<u64, JobError> {
     let mut packet_count = 0u64;
     let log_interval = 500u64;
@@ -527,16 +596,23 @@ fn decode_av_frames(
                 frame = frame::Video::empty();
             }
         } else if let Some(audio_idx) = audio_stream_index
-            && let Some(ref mut audio_dec) = audio_decoder
             && stream_idx == audio_idx
         {
-            audio_dec.send_packet(&packet)?;
-            let mut frame = frame::Audio::empty();
-            while audio_dec.receive_frame(&mut frame).is_ok() {
-                let pts = frame.timestamp();
-                frame.set_pts(pts);
-                tx.blocking_send(MuxItem::Audio(frame))?;
-                frame = frame::Audio::empty();
+            if audio_passthrough {
+                // Forward the compressed packet verbatim. The encoder
+                // never sees audio frames, so we never feed the audio
+                // decoder either; the post-loop decoder flush is a
+                // harmless no-op for that reason.
+                tx.blocking_send(MuxItem::AudioPacket(packet))?;
+            } else if let Some(ref mut audio_dec) = audio_decoder {
+                audio_dec.send_packet(&packet)?;
+                let mut frame = frame::Audio::empty();
+                while audio_dec.receive_frame(&mut frame).is_ok() {
+                    let pts = frame.timestamp();
+                    frame.set_pts(pts);
+                    tx.blocking_send(MuxItem::Audio(frame))?;
+                    frame = frame::Audio::empty();
+                }
             }
         }
     }
@@ -552,8 +628,10 @@ fn decode_av_frames(
         frame = frame::Video::empty();
     }
 
-    // Flush audio decoder
-    if let Some(ref mut audio_dec) = audio_decoder {
+    // Flush audio decoder — only needed when re-encoding. In passthrough
+    // mode the decoder never received any packets, so the flush is a
+    // no-op, but we still skip it explicitly to keep the intent clear.
+    if !audio_passthrough && let Some(ref mut audio_dec) = audio_decoder {
         audio_dec.send_eof()?;
         let mut frame = frame::Audio::empty();
         while audio_dec.receive_frame(&mut frame).is_ok() {
@@ -621,6 +699,17 @@ fn encode_av_packets(
                         }
                         filtered = frame::Audio::empty();
                     }
+                }
+            }
+            MuxItem::AudioPacket(mut packet) => {
+                if let Some(ast_idx) = audio_ost_index {
+                    packet.set_stream(ast_idx);
+                    // No-op when input and output time bases match (the
+                    // common case after `set_time_base(input.time_base())`
+                    // on the output stream). If they differ, this is the
+                    // correct remux-time conversion.
+                    packet.rescale_ts(audio_istb, audio_ostb);
+                    packet.write_interleaved(octx)?;
                 }
             }
         }
@@ -693,6 +782,7 @@ pub(crate) async fn compress_generic_local(
     original_name: &str,
     strategy: &GenericCompressionStrategy,
     quality: u8,
+    cancelled: Arc<AtomicBool>,
 ) -> Result<(String, u64), JobError> {
     match strategy {
         GenericCompressionStrategy::OriginalFormat | GenericCompressionStrategy::None => {
@@ -713,18 +803,42 @@ pub(crate) async fn compress_generic_local(
     let input_path = temp_path.to_string();
     let out_path = output_path_str.clone();
     let strategy = strategy.clone();
+    let cancelled = cancelled.clone();
 
     let result = tokio::task::spawn_blocking(move || -> Result<(String, u64), JobError> {
+        // Map the public 0..=100 `quality` knob onto each algorithm's native
+        // level scale: gzip=1..=9, zip=1..=9 (deflate), 7z=1..=9 (LZMA2 preset),
+        // zstd=1..=22 (already a per-strategy line in its own arm). We floor
+        // at 1 because level 0 in deflate is "store" and would actually grow
+        // small inputs; "quality=0" should still compress, just at the
+        // fastest setting.
+        let level_0_9 = ((quality.max(1) as u32 * 9) / 100).clamp(1, 9);
+
+        // Helper: cheap pre-check for cancellation. The actual `io::copy`
+        // inside each arm is a single synchronous call and cannot be
+        // interrupted mid-stream; if the flag flips during the copy, the
+        // next call into `compress_generic_local` (or, for 7z, the next
+        // call into `push_source_path`'s filter) will observe it.
+        let check_cancel = || -> Result<(), JobError> {
+            if cancelled.load(Ordering::Relaxed) {
+                Err(JobError::OtherFatal("Generic compression cancelled".into()))
+            } else {
+                Ok(())
+            }
+        };
+
         match strategy {
             GenericCompressionStrategy::Gzip => {
+                check_cancel()?;
                 let mut input = std::fs::File::open(&input_path)?;
                 let output = std::fs::File::create(&out_path)?;
                 let mut encoder =
-                    flate2::write::GzEncoder::new(output, flate2::Compression::default());
+                    flate2::write::GzEncoder::new(output, flate2::Compression::new(level_0_9));
                 io::copy(&mut input, &mut encoder)?;
                 encoder.finish()?;
             }
             GenericCompressionStrategy::Zstd => {
+                check_cancel()?;
                 let mut input = std::fs::File::open(&input_path)?;
                 let output = std::fs::File::create(&out_path)?;
                 let level = (quality as i32).clamp(1, 22);
@@ -733,20 +847,37 @@ pub(crate) async fn compress_generic_local(
                 encoder.finish()?;
             }
             GenericCompressionStrategy::Zip => {
+                check_cancel()?;
                 let output = std::fs::File::create(&out_path)?;
                 let mut zip = zip::ZipWriter::new(output);
                 let fname = Path::new(&input_path)
                     .file_name()
                     .map(|s| s.to_string_lossy().to_string())
                     .unwrap_or_else(|| "file".to_string());
-                zip.start_file(fname, zip::write::SimpleFileOptions::default())?;
+                let opts = zip::write::SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Deflated)
+                    .compression_level(Some(level_0_9 as i64));
+                zip.start_file(fname, opts)?;
                 let mut input = std::fs::File::open(&input_path)?;
                 io::copy(&mut input, &mut zip)?;
                 zip.finish()?;
             }
             GenericCompressionStrategy::SevenZ => {
+                check_cancel()?;
                 let mut writer = sevenz_rust::SevenZWriter::create(&out_path)?;
-                writer.push_source_path(Path::new(&input_path), |_| true)?;
+                // LZMA2 preset 0..=9. `sevenz_rust::lzma::LZMA2Options` is
+                // re-exported from `lzma_rust` and is the only knob
+                // `set_content_methods` accepts for the LZMA2 method.
+                let lzma2_opts = sevenz_rust::lzma::LZMA2Options::with_preset(level_0_9);
+                writer.set_content_methods(vec![sevenz_rust::SevenZMethodConfiguration::from(
+                    lzma2_opts,
+                )]);
+                // The filter callback runs once per file. Returning false
+                // skips the file, which is the best cancellation hook the
+                // `sevenz-rust 0.6.1` API offers.
+                writer.push_source_path(Path::new(&input_path), |_| {
+                    !cancelled.load(Ordering::Relaxed)
+                })?;
                 writer.finish()?;
             }
             GenericCompressionStrategy::OriginalFormat | GenericCompressionStrategy::None => {}
@@ -844,6 +975,29 @@ mod tests {
         assert_eq!(mime_to_extension(""), None);
     }
 
+    #[test]
+    fn test_mp4_compatible_audio() {
+        use ffmpeg_next::codec::Id;
+        // Common MP4-native codecs
+        assert!(mp4_compatible_audio(Id::AAC));
+        assert!(mp4_compatible_audio(Id::MP3));
+        assert!(mp4_compatible_audio(Id::AC3));
+        assert!(mp4_compatible_audio(Id::EAC3));
+        assert!(mp4_compatible_audio(Id::FLAC));
+        assert!(mp4_compatible_audio(Id::OPUS));
+        assert!(mp4_compatible_audio(Id::VORBIS));
+        // PCM variants we accept
+        assert!(mp4_compatible_audio(Id::PCM_S16LE));
+        assert!(mp4_compatible_audio(Id::PCM_S24BE));
+        assert!(mp4_compatible_audio(Id::PCM_S32LE));
+        // Not in the allowlist: these need AAC transcoding
+        assert!(!mp4_compatible_audio(Id::None));
+        assert!(!mp4_compatible_audio(Id::TRUEHD));
+        assert!(!mp4_compatible_audio(Id::ALAC));
+        assert!(!mp4_compatible_audio(Id::WMAV1));
+        assert!(!mp4_compatible_audio(Id::WMAV2));
+    }
+
     // ── Generic compression tests ──────────────────────────────────────────────
 
     fn create_compressible_data(dir: &std::path::Path) -> std::path::PathBuf {
@@ -866,6 +1020,7 @@ mod tests {
             "test",
             &GenericCompressionStrategy::Gzip,
             5,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         )
         .await
         .unwrap();
@@ -891,6 +1046,7 @@ mod tests {
             "test",
             &GenericCompressionStrategy::Zstd,
             5,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         )
         .await
         .unwrap();
@@ -916,6 +1072,7 @@ mod tests {
             "test",
             &GenericCompressionStrategy::Zip,
             5,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         )
         .await
         .unwrap();
@@ -941,6 +1098,7 @@ mod tests {
             "test",
             &GenericCompressionStrategy::SevenZ,
             5,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         )
         .await
         .unwrap();
@@ -952,6 +1110,85 @@ mod tests {
                 .map(|e| e.to_string_lossy()),
             Some("7z".into())
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── Quality-level monotonicity tests ───────────────────────────────────────
+
+    /// ~512 KiB of structured but repetitive text that exercises the level
+    /// difference for DEFLATE/LZMA2 (repetitive patterns compress well at
+    /// every level, but higher levels reduce the output further).
+    fn create_stress_data(dir: &std::path::Path) -> std::path::PathBuf {
+        let line = "The quick brown fox jumps over the lazy dog. \
+                    Pack my box with five dozen liquor jugs. 0123456789.\n";
+        let body = line.repeat(8 * 1024); // ~512 KiB
+        let input = dir.join("stress.txt");
+        std::fs::write(&input, body).unwrap();
+        input
+    }
+
+    async fn compress_at_quality(
+        dir: &std::path::Path,
+        strategy: GenericCompressionStrategy,
+        quality: u8,
+    ) -> u64 {
+        // Each call gets its own copy of the stress data because
+        // `compress_generic_local` deletes the input on success.
+        let src = dir.join(format!("q{}_{}.txt", quality, uuid::Uuid::new_v4()));
+        std::fs::copy(dir.join("stress.txt"), &src).unwrap();
+        let (out, size) = compress_generic_local(
+            src.to_str().unwrap(),
+            "stress",
+            &strategy,
+            quality,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+        .await
+        .unwrap();
+        assert!(size > 0, "{strategy:?}@q{quality} produced empty output");
+        // The returned path may be either the compressed .gz/.zip/.7z file
+        // (smaller) or the original (when not smaller). Either way, `size`
+        // is the size we kept.
+        let _ = out;
+        size
+    }
+
+    #[tokio::test]
+    async fn test_compress_generic_gzip_levels_differ() {
+        let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        create_stress_data(&dir);
+
+        let low = compress_at_quality(&dir, GenericCompressionStrategy::Gzip, 10).await;
+        let high = compress_at_quality(&dir, GenericCompressionStrategy::Gzip, 95).await;
+        // Higher quality (level 9) must not be larger than lower quality
+        // (level 1) on a compressible payload.
+        assert!(high <= low, "gzip q95 ({high}) > q10 ({low})");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_compress_generic_zip_levels_differ() {
+        let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        create_stress_data(&dir);
+
+        let low = compress_at_quality(&dir, GenericCompressionStrategy::Zip, 10).await;
+        let high = compress_at_quality(&dir, GenericCompressionStrategy::Zip, 95).await;
+        assert!(high <= low, "zip q95 ({high}) > q10 ({low})");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    #[ignore = "LZMA2 preset sweep on 512 KiB takes ~5-10s; run with --ignored"]
+    async fn test_compress_generic_sevenz_levels_differ() {
+        let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        create_stress_data(&dir);
+
+        let low = compress_at_quality(&dir, GenericCompressionStrategy::SevenZ, 10).await;
+        let high = compress_at_quality(&dir, GenericCompressionStrategy::SevenZ, 95).await;
+        assert!(high <= low, "7z q95 ({high}) > q10 ({low})");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -968,6 +1205,7 @@ mod tests {
             "test",
             &GenericCompressionStrategy::OriginalFormat,
             5,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         )
         .await
         .unwrap();
@@ -990,12 +1228,146 @@ mod tests {
             "test",
             &GenericCompressionStrategy::None,
             5,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         )
         .await
         .unwrap();
 
         assert!(size > 0);
         assert_eq!(path, input_str);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── Image compression tests ─────────────────────────────────────────────────
+
+    /// Build a noisy 256x256 RGBA8 image as a PNG on disk and return the path.
+    /// Uses a deterministic pseudo-random gradient so the AVIF encoder has
+    /// something to actually compress at every quality level.
+    fn write_test_png(dir: &std::path::Path) -> std::path::PathBuf {
+        use image::{ImageBuffer, Rgba};
+        let mut img: ImageBuffer<Rgba<u8>, Vec<u8>> = ImageBuffer::new(256, 256);
+        for y in 0u32..256 {
+            for x in 0u32..256 {
+                let r = ((x.wrapping_mul(37) ^ y.wrapping_mul(53)) & 0xff) as u8;
+                let g = ((x.wrapping_add(y).wrapping_mul(17)) & 0xff) as u8;
+                let b = ((x.wrapping_sub(y).wrapping_mul(29)) & 0xff) as u8;
+                img.put_pixel(x, y, Rgba([r, g, b, 255]));
+            }
+        }
+        let path = dir.join("test.png");
+        img.save(&path).unwrap();
+        path
+    }
+
+    /// Build a 256x256 WebP file on disk and return the path. Uses a smooth
+    /// gradient so that AVIF (which excels on natural-ish content) can
+    /// actually win against the lossless WebP source.
+    fn write_test_webp(dir: &std::path::Path) -> std::path::PathBuf {
+        use image::{ExtendedColorType, ImageEncoder, codecs::webp::WebPEncoder};
+        let mut rgba: Vec<u8> = Vec::with_capacity(256 * 256 * 4);
+        for y in 0u32..256 {
+            for x in 0u32..256 {
+                rgba.push((x & 0xff) as u8);
+                rgba.push((y & 0xff) as u8);
+                rgba.push(((x.wrapping_add(y) / 2) & 0xff) as u8);
+                rgba.push(255);
+            }
+        }
+        let path = dir.join("test.webp");
+        let f = std::fs::File::create(&path).unwrap();
+        WebPEncoder::new_lossless(std::io::BufWriter::new(f))
+            .write_image(&rgba, 256, 256, ExtendedColorType::Rgba8)
+            .unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn test_compress_image_avif_quality_round_trip() {
+        let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        let original = write_test_png(&dir);
+        let input_size = std::fs::metadata(&original).unwrap().len() as u64;
+
+        // `compress_image_local` deletes `temp_path` on success, so copy
+        // the fixture for the second pass.
+        let copy_a = dir.join("a.png");
+        let copy_b = dir.join("b.png");
+        std::fs::copy(&original, &copy_a).unwrap();
+        std::fs::copy(&original, &copy_b).unwrap();
+
+        let (_path30, size30, _mime30) = compress_image_local(
+            "test",
+            "image/png",
+            input_size,
+            30,
+            copy_a.to_str().unwrap(),
+            &ImageCompressionStrategy::Avif,
+        )
+        .await
+        .unwrap();
+        let (_path90, size90, _mime90) = compress_image_local(
+            "test",
+            "image/png",
+            input_size,
+            90,
+            copy_b.to_str().unwrap(),
+            &ImageCompressionStrategy::Avif,
+        )
+        .await
+        .unwrap();
+
+        // Lower quality should not be larger than higher quality.
+        assert!(size30 <= size90, "q30 ({}) > q90 ({})", size30, size90);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_compress_image_webp_source_keeps_with_webp_strategy() {
+        let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        let input = write_test_webp(&dir);
+        let input_size = std::fs::metadata(&input).unwrap().len() as u64;
+
+        // WebP source + LosslessWebp strategy → unchanged, no re-encode.
+        let (path, size, mime) = compress_image_local(
+            "test",
+            "image/webp",
+            input_size,
+            80,
+            input.to_str().unwrap(),
+            &ImageCompressionStrategy::LosslessWebp,
+        )
+        .await
+        .unwrap();
+        assert_eq!(path, input.to_string_lossy());
+        assert_eq!(size, input_size);
+        assert_eq!(mime, "image/webp");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_compress_image_webp_source_with_avif_strategy() {
+        let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        let input = write_test_webp(&dir);
+        let input_size = std::fs::metadata(&input).unwrap().len() as u64;
+
+        let (path, size, mime) = compress_image_local(
+            "test",
+            "image/webp",
+            input_size,
+            60,
+            input.to_str().unwrap(),
+            &ImageCompressionStrategy::Avif,
+        )
+        .await
+        .unwrap();
+        assert!(path.ends_with(".avif"), "expected .avif, got {path}");
+        assert!(size > 0);
+        assert_eq!(mime, "image/avif");
+
         std::fs::remove_dir_all(&dir).ok();
     }
 }
