@@ -1,18 +1,19 @@
 use std::net::SocketAddr;
 use std::path::Path;
 use std::pin::Pin;
+use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use futures_util::StreamExt;
 
 use crate::{
-    AppConfig, JobStatusFilter, MongoService, ToolError, bootstrap,
+    AppConfig, ToolError, bootstrap,
+    config::toml::load_toml,
+    domain::JobStatusFilter,
     handlers::assemble::{self, Frame},
     models::{self, ProgressEvent, ProgressJobType, ProgressStatus},
-    services::redis::{RedisService, derive_worker_id},
-    settings::load_toml,
-    storage::ProviderCache,
+    services::{Services, redis::RedisService},
+    worker::{Shutdown, Worker},
 };
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
@@ -35,58 +36,24 @@ use proto::*;
 
 #[derive(Clone)]
 pub struct IngestServer {
-    mongo: MongoService,
-    redis: RedisService,
+    services: Arc<Services>,
     toml_config: crate::TomlRawConfig,
     redis_uri: String,
     mongo_uri: String,
-    provider_cache: Arc<ProviderCache>,
 }
 
 impl IngestServer {
-    pub async fn new(toml_path: &Path) -> Result<Self, ToolError> {
-        let redis_uri = std::env::var("REDIS_URI")?;
-        let mongo_uri = std::env::var("MONGODB_URI")?;
-        let toml_config = load_toml(&toml_path.to_path_buf())?;
-
-        let mongo = MongoService::new(
-            &mongo_uri,
-            toml_config.scheduler.mongo_pool_min,
-            toml_config.scheduler.mongo_pool_max,
-        )
-        .await?;
-        let redis = RedisService::new(&redis_uri, 3600, 3, vec![5, 30, 120])?;
-        let auth_registry = bootstrap::init_auth_registry();
-        let provider_cache = Arc::new(ProviderCache::new(auth_registry));
-
-        Ok(Self::new_from_parts(
-            mongo,
-            redis,
-            toml_config,
-            redis_uri,
-            mongo_uri,
-            provider_cache,
-        ))
-    }
-
-    /// Build an `IngestServer` from already-constructed services.
-    /// Used by integration tests to inject test-specific services and
-    /// a pre-built `ProviderCache`.
-    pub fn new_from_parts(
-        mongo: MongoService,
-        redis: RedisService,
-        toml_config: crate::TomlRawConfig,
-        redis_uri: String,
-        mongo_uri: String,
-        provider_cache: Arc<ProviderCache>,
-    ) -> Self {
+    /// Build an `IngestServer` from a [`Services`] handle and the parsed
+    /// `TomlRawConfig`. The TOML config is needed for the `Enqueue` RPC,
+    /// which merges YAML + TOML + CLI args to produce an `AppConfig`.
+    pub fn new(services: Arc<Services>, toml_config: crate::TomlRawConfig) -> Self {
+        let redis_uri = services.config.redis_uri.clone();
+        let mongo_uri = services.config.mongo_uri.clone();
         Self {
-            mongo,
-            redis,
+            services,
             toml_config,
             redis_uri,
             mongo_uri,
-            provider_cache,
         }
     }
 
@@ -164,7 +131,8 @@ impl IngestService for IngestServer {
     ) -> Result<Response<BatchStatus>, Status> {
         let batch_id = request.into_inner().batch_id;
         let batch = self
-            .mongo
+            .services
+            .db
             .get_batch(&batch_id)
             .await
             .map_err(internal_err)?
@@ -185,7 +153,8 @@ impl IngestService for IngestServer {
     ) -> Result<Response<JobDetail>, Status> {
         let job_id = request.into_inner().job_id;
         let job = self
-            .mongo
+            .services
+            .db
             .get_file_job(&job_id)
             .await
             .map_err(internal_err)?
@@ -195,7 +164,7 @@ impl IngestService for IngestServer {
             job_id: job._id,
             batch_id: job.batch_id,
             status: job.status.as_str().to_string(),
-            url: job.resource.url.to_string(),
+            url: job.spec.url.to_string(),
             error: job.error.unwrap_or_default(),
             retry_count: job.retry_count as i32,
             created_at: job.created_at.to_rfc3339(),
@@ -210,20 +179,7 @@ impl IngestService for IngestServer {
         let filter = if req.filter.is_empty() {
             None
         } else {
-            Some(match req.filter.to_lowercase().as_str() {
-                "pending" => JobStatusFilter::Pending,
-                "running" => JobStatusFilter::Running,
-                "completed" => JobStatusFilter::Completed,
-                "failed" => JobStatusFilter::Failed,
-                "retrying" => JobStatusFilter::Retrying,
-                "cancelled" => JobStatusFilter::Cancelled,
-                _ => {
-                    return Err(Status::invalid_argument(format!(
-                        "unknown filter: {}",
-                        req.filter
-                    )));
-                }
-            })
+            Some(JobStatusFilter::from_str(&req.filter).map_err(|e| Status::invalid_argument(e))?)
         };
         let limit = if req.limit > 0 {
             req.limit as usize
@@ -232,7 +188,8 @@ impl IngestService for IngestServer {
         };
 
         let jobs = self
-            .mongo
+            .services
+            .db
             .list_jobs(filter, limit)
             .await
             .map_err(internal_err)?;
@@ -243,7 +200,7 @@ impl IngestService for IngestServer {
                 job_id: job._id,
                 batch_id: job.batch_id,
                 status: job.status.as_str().to_string(),
-                url: job.resource.url.to_string(),
+                url: job.spec.url.to_string(),
                 error: job.error.unwrap_or_default(),
                 retry_count: job.retry_count as i32,
                 created_at: job.created_at.to_rfc3339(),
@@ -258,14 +215,20 @@ impl IngestService for IngestServer {
         request: Request<CancelJobRequest>,
     ) -> Result<Response<ActionResponse>, Status> {
         let job_id = request.into_inner().job_id;
-        let cancelled = self.mongo.cancel_job(&job_id).await.map_err(internal_err)?;
+        let cancelled = self
+            .services
+            .db
+            .cancel_job(&job_id)
+            .await
+            .map_err(internal_err)?;
 
         if cancelled {
-            self.redis
+            self.services
+                .redis
                 .cancel_job(&job_id, self.toml_config.scheduler.shard_count)
                 .await
                 .map_err(internal_err)?;
-            publish_cancelled(&self.redis, &job_id, ProgressJobType::FileJob).await;
+            publish_cancelled(&self.services.redis, &job_id, ProgressJobType::FileJob).await;
         }
 
         Ok(Response::new(ActionResponse {
@@ -285,23 +248,26 @@ impl IngestService for IngestServer {
         let batch_id = request.into_inner().batch_id;
 
         let count = self
-            .mongo
+            .services
+            .db
             .cancel_batch_jobs(&batch_id)
             .await
             .map_err(internal_err)?;
 
         if let Some(batch) = self
-            .mongo
+            .services
+            .db
             .get_batch(&batch_id)
             .await
             .map_err(internal_err)?
         {
-            self.redis
+            self.services
+                .redis
                 .cancel_batch_jobs(&batch.job_ids, self.toml_config.scheduler.shard_count)
                 .await
                 .map_err(internal_err)?;
             for job_id in &batch.job_ids {
-                publish_cancelled(&self.redis, job_id, ProgressJobType::FileJob).await;
+                publish_cancelled(&self.services.redis, job_id, ProgressJobType::FileJob).await;
             }
         }
 
@@ -317,13 +283,15 @@ impl IngestService for IngestServer {
     ) -> Result<Response<ActionResponse>, Status> {
         let job_id = request.into_inner().job_id;
         let retried = self
-            .mongo
+            .services
+            .db
             .retry_failed_job(&job_id)
             .await
             .map_err(internal_err)?;
 
         if retried {
             let _ = self
+                .services
                 .redis
                 .retry_job(
                     &job_id,
@@ -341,7 +309,7 @@ impl IngestService for IngestServer {
                 status: ProgressStatus::Retrying,
                 message: Some("Manually retried via API".to_string()),
             };
-            let _ = self.redis.publish_progress(&job_id, &event).await;
+            let _ = self.services.redis.publish_progress(&job_id, &event).await;
         }
 
         Ok(Response::new(ActionResponse {
@@ -376,7 +344,8 @@ impl IngestService for IngestServer {
         };
 
         let files = self
-            .mongo
+            .services
+            .db
             .list_files(mime, provider, limit)
             .await
             .map_err(internal_err)?;
@@ -392,7 +361,14 @@ impl IngestService for IngestServer {
                 compressed_file_size: f.compressed_file_size.unwrap_or(0),
                 compression_ratio: f.compression_ratio.unwrap_or(0.0) as f64,
                 mime_type: f.mime_type,
-                upload_date: chrono::Utc::now().to_rfc3339(),
+                upload_date: {
+                    let ts = f.upload_date.timestamp_millis();
+                    let secs = ts / 1000;
+                    let nsecs = ((ts % 1000) * 1_000_000) as u32;
+                    chrono::DateTime::from_timestamp(secs, nsecs)
+                        .map(|dt| dt.to_rfc3339())
+                        .unwrap_or_default()
+                },
             })
             .collect();
 
@@ -407,7 +383,8 @@ impl IngestService for IngestServer {
     ) -> Result<Response<FileMetadata>, Status> {
         let hash = request.into_inner().hash;
         let metadata = self
-            .mongo
+            .services
+            .db
             .get_file_metadata(&hash)
             .await
             .map_err(internal_err)?
@@ -449,13 +426,14 @@ impl IngestService for IngestServer {
         }
 
         let metadata = self
-            .mongo
+            .services
+            .db
             .get_file_metadata(&hash)
             .await
             .map_err(internal_err)?
             .ok_or_else(|| Status::not_found(format!("file with hash {hash} not found")))?;
 
-        let cache = self.provider_cache.clone();
+        let cache = self.services.storage.clone();
         let inner = assemble::assemble_file(metadata, cache, req.range_start, req.range_end);
 
         // Map Frame -> tonic::Response<DownloadFileChunk>.
@@ -525,21 +503,12 @@ impl From<ToolError> for Status {
 /// Start the gRPC server with an auto-started worker in background.
 pub async fn serve(addr: SocketAddr, toml_path: &Path) -> Result<(), ToolError> {
     ffmpeg_next::init().ok();
-    let shutdown = Arc::new(AtomicBool::new(false));
 
     let toml_config = load_toml(&toml_path.to_path_buf())?;
     let redis_uri = std::env::var("REDIS_URI")?;
     let mongo_uri = std::env::var("MONGODB_URI")?;
-    let mongo = MongoService::new(
-        &mongo_uri,
-        toml_config.scheduler.mongo_pool_min,
-        toml_config.scheduler.mongo_pool_max,
-    )
-    .await?;
-    let redis = RedisService::new(&redis_uri, 3600, 3, vec![5, 30, 120])?;
 
-    tracing::info!("Ingest gRPC server listening on {addr}");
-
+    // Build worker config (uses TOML defaults, no YAML)
     let worker_config = AppConfig::from_worker_args(
         toml_config.clone(),
         redis_uri.clone(),
@@ -547,49 +516,28 @@ pub async fn serve(addr: SocketAddr, toml_path: &Path) -> Result<(), ToolError> 
         None,
     );
 
-    let worker_id = derive_worker_id();
-    let worker_shutdown = shutdown.clone();
-    let worker_mongo = mongo.clone();
-    let worker_redis = redis.clone();
+    // Build all services once — shared between gRPC server and worker
+    let services = Services::build(worker_config).await?;
 
-    tokio::spawn(async move {
-        tracing::info!("Worker auto-started with gRPC server");
-        if let Err(e) = bootstrap::worker_with_services(
-            worker_mongo,
-            worker_redis,
-            worker_config,
-            worker_shutdown,
-            worker_id,
-        )
-        .await
-        {
-            tracing::error!(error = %e, "Worker exited with error");
-        } else {
-            tracing::info!("Worker stopped cleanly");
-        }
-    });
+    // Install single SIGINT handler
+    let shutdown = Shutdown::install(services.redis.clone());
 
-    let ingest_server = IngestServer {
-        mongo,
-        redis: redis.clone(),
-        toml_config,
-        redis_uri,
-        mongo_uri,
-        provider_cache: Arc::new(ProviderCache::new(bootstrap::init_auth_registry())),
-    };
+    tracing::info!("Ingest gRPC server listening on {addr}");
 
-    let server_shutdown = shutdown.clone();
+    let worker_id = crate::services::redis::derive_worker_id();
+    let worker = Worker::new(services.clone(), shutdown.clone(), worker_id);
+    let _worker_handle = worker.spawn();
+
+    let ingest_server = IngestServer::new(services.clone(), toml_config);
+
     let (signal_tx, signal_rx) = tokio::sync::oneshot::channel::<()>();
-    let shutdown_redis = redis.clone();
 
+    // Spawn a task that resolves when shutdown is requested (for tonic's serve_with_shutdown)
+    let shutdown_flag = shutdown.flag();
     tokio::spawn(async move {
-        tokio::signal::ctrl_c().await.ok();
-        tracing::warn!("SIGINT received, shutting down server and worker...");
-        // Clear running keys so recovery on next start is immediate
-        if let Err(e) = shutdown_redis.delete_all_running().await {
-            tracing::warn!(error = %e, "Failed to clear running keys on shutdown");
+        while !shutdown_flag.load(std::sync::atomic::Ordering::Relaxed) {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
-        server_shutdown.store(true, Ordering::Relaxed);
         let _ = signal_tx.send(());
     });
 

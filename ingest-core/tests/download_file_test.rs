@@ -8,19 +8,18 @@
 //! and cleans it up at the end.
 
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use bytes::Bytes;
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use futures_util::StreamExt;
-use ingest_core::auth::AuthProviderRegistry;
+use ingest_core::AppConfig;
+use ingest_core::config::toml::load_toml;
+use ingest_core::grpc::proto::ingest_service_client::IngestServiceClient;
+use ingest_core::grpc::proto::ingest_service_server::IngestServiceServer;
+use ingest_core::grpc::{self, proto};
 use ingest_core::models::{ChunkRef, Manifest, Metadata};
-use ingest_core::server::proto::ingest_service_client::IngestServiceClient;
-use ingest_core::server::proto::ingest_service_server::IngestServiceServer;
-use ingest_core::server::{self, proto};
-use ingest_core::settings::load_toml;
-use ingest_core::storage::ProviderCache;
+use ingest_core::services::Services;
 use mongodb::bson::DateTime as MongoDateTime;
 use sha2::{Digest, Sha256};
 use std::io::Write;
@@ -75,30 +74,17 @@ async fn start_test_server() -> (
     std::fs::write(&toml_path, TOML_TEST).unwrap();
 
     let toml_config = load_toml(&toml_path).expect("toml");
-    let mongo = ingest_core::MongoService::new(
-        &mongo_uri(),
-        toml_config.scheduler.mongo_pool_min,
-        toml_config.scheduler.mongo_pool_max,
-    )
-    .await
-    .expect("mongo connect");
-    let redis = ingest_core::services::redis::RedisService::new(
-        &std::env::var("REDIS_URI").unwrap_or_else(|_| "redis://localhost:6379".into()),
-        3600,
-        3,
-        vec![5, 30, 120],
-    )
-    .expect("redis");
-    let provider_cache = Arc::new(ProviderCache::new(AuthProviderRegistry::new()));
 
-    let ingest_server = server::IngestServer::new_from_parts(
-        mongo,
-        redis,
-        toml_config,
+    // Build a minimal AppConfig for Services::build
+    let config = AppConfig::from_worker_args(
+        toml_config.clone(),
         "redis://localhost:6379".into(),
         mongo_uri(),
-        provider_cache,
+        None,
     );
+
+    let services = Services::build(config).await.expect("services build");
+    let ingest_server = grpc::IngestServer::new(services, toml_config);
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().unwrap();
@@ -221,6 +207,7 @@ async fn download_file_chunked_gzip_roundtrip() {
                 size_original: 2048,
                 size_compressed: None,
                 storage_path: chunk_a_path.to_string_lossy().to_string(),
+                compression: "gzip".to_string(),
                 offset_start: 0,
                 offset_end: 2047,
             },
@@ -229,6 +216,7 @@ async fn download_file_chunked_gzip_roundtrip() {
                 size_original: 2048,
                 size_compressed: None,
                 storage_path: chunk_b_path.to_string_lossy().to_string(),
+                compression: "gzip".to_string(),
                 offset_start: 2048,
                 offset_end: 4095,
             },

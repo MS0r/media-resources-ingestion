@@ -3,9 +3,9 @@ use std::path::Path;
 use colored::*;
 use futures_util::StreamExt;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use ingest_core::grpc::proto::ingest_service_client::IngestServiceClient;
+use ingest_core::grpc::proto::*;
 use ingest_core::models::{ProgressEvent, ProgressStatus};
-use ingest_core::server::proto::ingest_service_client::IngestServiceClient;
-use ingest_core::server::proto::*;
 use tonic::transport::Endpoint;
 
 use crate::cli;
@@ -210,7 +210,7 @@ pub async fn handle_server(args: cli::ServerArgs) -> Result<()> {
         .unwrap_or_else(|| Path::new(".ingest/config.toml").to_path_buf());
 
     ffmpeg_next::init().ok();
-    ingest_core::server::serve(addr, &toml_path).await?;
+    ingest_core::grpc::serve(addr, &toml_path).await?;
     Ok(())
 }
 

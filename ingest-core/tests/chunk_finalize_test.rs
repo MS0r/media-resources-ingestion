@@ -17,8 +17,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use ingest_core::config::RunConfig;
 use ingest_core::models::{AppConfig, OutputFormat, load_config};
+use ingest_core::services::Services;
 use ingest_core::services::redis::RedisService;
-use ingest_core::{MongoService, TomlRawConfig, enqueue, worker_with_services};
+use ingest_core::worker::{Shutdown, Worker};
+use ingest_core::{MongoService, TomlRawConfig, enqueue};
 
 fn mongo_uri() -> String {
     std::env::var("MONGODB_URI").unwrap_or_else(|_| {
@@ -59,6 +61,14 @@ const TOTAL_SIZE: u64 = 4 * 1024 * 1024; // 4 MB = 4 chunks of 1 MB
 
 impl RangeServer {
     fn start() -> Self {
+        Self::start_inner(false)
+    }
+
+    fn start_incompressible() -> Self {
+        Self::start_inner(true)
+    }
+
+    fn start_inner(incompressible: bool) -> Self {
         let listener = StdTcpListener::bind("127.0.0.1:0").expect("bind range server");
         let addr = listener.local_addr().unwrap();
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -74,7 +84,7 @@ impl RangeServer {
                     Ok((stream, _)) => {
                         let total = TOTAL_SIZE;
                         std::thread::spawn(move || {
-                            Self::handle_connection(stream, total);
+                            Self::handle_connection(stream, total, incompressible);
                         });
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -100,7 +110,7 @@ impl RangeServer {
         format!("http://127.0.0.1:{}/testfile.bin", self.addr.port())
     }
 
-    fn handle_connection(mut stream: std::net::TcpStream, total: u64) {
+    fn handle_connection(mut stream: std::net::TcpStream, total: u64, incompressible: bool) {
         use std::io::{BufRead, BufReader, Write};
 
         let mut reader = BufReader::new(stream.try_clone().unwrap());
@@ -160,13 +170,22 @@ impl RangeServer {
             return;
         }
 
-        // Write payload bytes: deterministic pattern.
+        // Write payload bytes.
         let mut written: u64 = 0;
         let mut buf = [0u8; 8192];
         while written < len {
             let chunk = std::cmp::min((len - written) as usize, buf.len());
             for (i, b) in buf[..chunk].iter_mut().enumerate() {
-                *b = ((start + written + i as u64) % 251) as u8;
+                if incompressible {
+                    // SHA-256 counter mode: high-entropy incompressible bytes.
+                    use sha2::{Digest, Sha256};
+                    let mut hasher = Sha256::new();
+                    hasher.update(((start + written + i as u64) / 32).to_le_bytes());
+                    let hash = hasher.finalize();
+                    *b = hash[((start + written + i as u64) % 32) as usize];
+                } else {
+                    *b = ((start + written + i as u64) % 251) as u8;
+                }
             }
             stream.write_all(&buf[..chunk]).ok();
             written += chunk as u64;
@@ -256,22 +275,13 @@ async fn chunk_enqueue_all_chunks_finalize() {
     assert!(!batch_id.is_empty(), "batch_id should not be empty");
 
     // 6. Run the worker until the shutdown flag flips.
-    let shutdown = Arc::new(AtomicBool::new(false));
-    let worker_shutdown = shutdown.clone();
-    let worker_mongo = mongo.clone();
-    let worker_redis = redis.clone();
-    let worker_config = config.clone();
-
-    let worker_handle = tokio::spawn(async move {
-        worker_with_services(
-            worker_mongo,
-            worker_redis,
-            worker_config,
-            worker_shutdown,
-            42, // arbitrary worker_id
-        )
+    let services = Services::build(config.clone())
         .await
-    });
+        .expect("services build");
+    let shutdown = Shutdown::install(services.redis.clone());
+
+    let worker = Worker::new(services, shutdown.clone(), 42);
+    let worker_handle = worker.spawn();
 
     // 7. Get the file_job_id from the batch to find the expected hash.
     let batch = mongo
@@ -351,10 +361,134 @@ async fn chunk_enqueue_all_chunks_finalize() {
     );
 
     // 14. Shutdown the worker.
-    shutdown.store(true, Ordering::Relaxed);
+    shutdown.flag().store(true, Ordering::Relaxed);
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), worker_handle).await;
 
     // 15. Clean up.
+    let _ = mongo.delete_test_metadata(&file_hash).await;
+    std::fs::remove_dir_all(&tmp).ok();
+}
+
+/// Verify that incompressible chunks fall back to OriginalFormat and
+/// record the correct per-chunk compression in ChunkRef. The manifest
+/// summary compression should be None (all chunks are OriginalFormat).
+///
+/// The RangeServer produces a deterministic SHA-256 counter pattern
+/// which is incompressible for gzip. After compress_generic_local's
+/// size-compare fallback, each chunk's compression should be "" and the
+/// storage_path should not have a .gz extension.
+#[tokio::test]
+async fn chunk_incompressible_falls_back_to_original() {
+    // 1. Start local HTTP Range server with incompressible data.
+    let server = RangeServer::start_incompressible();
+    let url = server.url();
+
+    // 2. Set up Mongo + Redis.
+    let mongo = MongoService::new(&mongo_uri(), 1, 16)
+        .await
+        .expect("mongo connect");
+    let redis = RedisService::new(&redis_uri(), 3600, 3, vec![5, 30, 120]).expect("redis connect");
+    redis.flush_db().await.expect("flush redis");
+
+    // 3. Write a test YAML.
+    let tmp = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+    std::fs::create_dir_all(&tmp).unwrap();
+    let yaml_path = tmp.join("chunk-incompress-test.yaml");
+    let dest_path = tmp.join("output");
+    std::fs::create_dir_all(&dest_path).unwrap();
+
+    let yaml_content = format!(
+        "path: {}\n\
+         resources:\n\
+           - url: {}\n\
+             name: incompress_chunk_test\n",
+        dest_path.display(),
+        url
+    );
+    std::fs::write(&yaml_path, &yaml_content).unwrap();
+
+    // 4. Build AppConfig with small chunk_size (1 MB) for 4 MB payload.
+    let toml: TomlRawConfig = toml::from_str(TOML_SMALL_CHUNK).expect("parse toml");
+    let yaml_config = load_config(&yaml_path).expect("load yaml");
+    let args = RunConfig {
+        yaml_path: yaml_path.clone(),
+        dry_run: false,
+        priority: Some(10),
+        workers: None,
+        follow: false,
+        no_follow: true,
+        output: OutputFormat::Json,
+    };
+    let config = AppConfig::from_sources(&yaml_config, toml, args, redis_uri(), mongo_uri());
+
+    // 5. Enqueue.
+    let batch_id = enqueue(&config, &yaml_config.resources)
+        .await
+        .expect("enqueue");
+    assert!(!batch_id.is_empty());
+
+    // 6. Run worker.
+    let services = Services::build(config.clone())
+        .await
+        .expect("services build");
+    let shutdown = Shutdown::install(services.redis.clone());
+
+    let worker = Worker::new(services, shutdown.clone(), 42);
+    let worker_handle = worker.spawn();
+
+    // 7. Get file_job_id from batch.
+    let batch = mongo
+        .get_batch(&batch_id)
+        .await
+        .expect("get batch")
+        .expect("batch not found");
+    assert_eq!(batch.job_ids.len(), 1);
+    let file_job_id = &batch.job_ids[0];
+
+    // 8. Wait for file_job to finalize.
+    let file_hash = loop {
+        if let Ok(Some(job)) = mongo.get_file_job(file_job_id).await {
+            if let Some(ref hash) = job.file_hash {
+                break hash.clone();
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    };
+
+    let metadata = wait_for_metadata(&mongo, &file_hash, 30).await;
+
+    // 9. Verify the manifest has 4 chunks.
+    let manifest = metadata.chunk_manifest.as_ref().expect("chunk_manifest");
+    assert_eq!(manifest.chunks.len(), 4);
+
+    // 10. Verify per-chunk compression: each chunk must record "" (OriginalFormat)
+    //     because the RangeServer payload is incompressible.
+    for (i, chunk) in manifest.chunks.iter().enumerate() {
+        assert_eq!(
+            chunk.compression, "",
+            "chunk {i}: expected empty compression (OriginalFormat) but got {:?}",
+            chunk.compression
+        );
+        // The storage_path must NOT end in .gz — the original bytes are stored.
+        assert!(
+            !chunk.storage_path.ends_with(".gz"),
+            "chunk {i}: storage_path has .gz extension but compression is OriginalFormat: {}",
+            chunk.storage_path
+        );
+    }
+
+    // 11. Verify the manifest summary compression is None (all chunks OriginalFormat).
+    assert!(
+        manifest.compression.is_none(),
+        "manifest.compression should be None for incompressible chunks, got {:?}",
+        manifest.compression
+    );
+
+    // 12. Shutdown.
+    shutdown.flag().store(true, Ordering::Relaxed);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), worker_handle).await;
+
+    // 13. Clean up.
     let _ = mongo.delete_test_metadata(&file_hash).await;
     std::fs::remove_dir_all(&tmp).ok();
 }

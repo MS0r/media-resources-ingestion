@@ -1,19 +1,15 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::sync::atomic::AtomicBool;
 
 use crate::{
+    compression,
     error::JobErrorOutcome,
     handlers::jobs::{
-        compression::{
-            compress_generic_local, compress_image_local, compress_video_local,
-            generic_compression_mime, mime_to_extension,
-        },
-        {FileJob, JobContext, JobOutcome, types::DownloadInfo},
+        FileJob, JobContext, JobOutcome, compression::mime_to_extension, download::DownloadInfo,
     },
-    models::{CompressionOverride, Metadata},
+    job::JobEffect,
+    models::Metadata,
 };
-use tokio::time::timeout;
 
 use super::expand_path;
 
@@ -24,7 +20,7 @@ pub(crate) async fn handle_new_file(
     temp_path: String,
     hash_hex: String,
 ) -> Result<JobOutcome, JobErrorOutcome> {
-    let resource = &file_job.resource;
+    let resource = &file_job.spec;
     let pr = ctx.progress.as_ref();
 
     let (dest_path, provider) = match &resource.dest {
@@ -60,157 +56,32 @@ pub(crate) async fn handle_new_file(
         .as_ref()
         .and_then(|c| c.compression_override.as_ref());
 
-    let compression_timeout = Duration::from_secs(ctx.config.compression_timeout_secs);
     let quality = resource
         .config
         .as_ref()
         .and_then(|c| c.quality)
         .unwrap_or(ctx.config.compression_quality);
 
-    let (local_file, compressed_size, final_mime) = match override_strategy {
-        Some(strategy) => match strategy {
-            CompressionOverride::Image(image_s) => {
-                if !original_mime.starts_with("image/") {
-                    tracing::warn!(
-                        "Image compression requested but bytes indicate MIME is {} — skipping",
-                        download.mime_type
-                    );
-                    (temp_path.clone(), Some(0), download.mime_type)
-                } else {
-                    match timeout(
-                        compression_timeout,
-                        compress_image_local(
-                            &download.filename,
-                            &download.mime_type,
-                            download.content_length,
-                            quality,
-                            &temp_path,
-                            image_s,
-                        ),
-                    )
-                    .await
-                    {
-                        Ok(Ok((path, size, mime))) => {
-                            tracing::info!(
-                                "Image compressed: {} -> {} bytes",
-                                download.content_length,
-                                size
-                            );
-                            (path, Some(size), mime)
-                        }
-                        Ok(Err(e)) => {
-                            tracing::warn!("Image compression failed: {}, keeping original", e);
-                            (temp_path.clone(), Some(0), download.mime_type)
-                        }
-                        Err(_elapsed) => {
-                            tracing::warn!(
-                                "Image compression timed out after {}s, keeping original",
-                                ctx.config.compression_timeout_secs
-                            );
-                            (temp_path.clone(), Some(0), download.mime_type)
-                        }
-                    }
-                }
-            }
-            CompressionOverride::Video(video_s) => {
-                if !original_mime.starts_with("video/") {
-                    tracing::warn!(
-                        "Video compression requested but bytes indicate MIME is {} — skipping",
-                        download.mime_type
-                    );
-                    (temp_path.clone(), Some(0), download.mime_type)
-                } else {
-                    let cancel_video = Arc::new(AtomicBool::new(false));
-                    let cancel_video_clone = cancel_video.clone();
-                    match timeout(
-                        compression_timeout,
-                        compress_video_local(
-                            &download.filename,
-                            &download.mime_type,
-                            download.content_length,
-                            quality,
-                            &temp_path,
-                            video_s,
-                            cancel_video_clone,
-                        ),
-                    )
-                    .await
-                    {
-                        Ok(Ok((path, size, mime))) => {
-                            tracing::info!(
-                                "Video compressed: {} -> {} bytes",
-                                download.content_length,
-                                size
-                            );
-                            (path, Some(size), mime)
-                        }
-                        Ok(Err(e)) => {
-                            tracing::warn!("Video compression failed: {}, keeping original", e);
-                            (temp_path.clone(), Some(0), download.mime_type)
-                        }
-                        Err(_elapsed) => {
-                            tracing::warn!(
-                                "Video compression timed out after {}s, keeping original",
-                                ctx.config.compression_timeout_secs
-                            );
-                            cancel_video.store(true, Ordering::Relaxed);
-                            (temp_path.clone(), Some(0), download.mime_type)
-                        }
-                    }
-                }
-            }
-            CompressionOverride::Generic(strategy) => {
-                // Mirror the image/video branches: a tokio timeout enforces
-                // the configured compression budget, and an Arc<AtomicBool>
-                // signals the in-flight blocking encoder to bail on the
-                // next cancel-check boundary. The blocking thread is
-                // otherwise uninterruptible mid-`io::copy`, so the cancel
-                // check is best-effort.
-                let cancel_generic = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-                let cancel_generic_clone = cancel_generic.clone();
-                match timeout(
-                    compression_timeout,
-                    compress_generic_local(
-                        &temp_path,
-                        &download.filename,
-                        strategy,
-                        quality,
-                        cancel_generic_clone,
-                    ),
-                )
-                .await
-                {
-                    Ok(Ok((path, size))) => {
-                        let mime = if path == temp_path {
-                            download.mime_type.clone()
-                        } else {
-                            generic_compression_mime(strategy).to_string()
-                        };
-                        tracing::info!(
-                            "Generic compressed: {} -> {} bytes",
-                            download.content_length,
-                            size
-                        );
-                        (path, Some(size), mime)
-                    }
-                    Ok(Err(e)) => {
-                        tracing::warn!("Generic compression failed: {e}, keeping original");
-                        (temp_path.clone(), Some(0), download.mime_type)
-                    }
-                    Err(_elapsed) => {
-                        tracing::warn!(
-                            "Generic compression timed out after {}s, keeping original",
-                            ctx.config.compression_timeout_secs
-                        );
-                        cancel_generic.store(true, std::sync::atomic::Ordering::Relaxed);
-                        (temp_path.clone(), Some(0), download.mime_type)
-                    }
-                }
-            }
-            CompressionOverride::Universal(_) => (temp_path.clone(), Some(0), download.mime_type),
-        },
-        None => (temp_path.clone(), Some(0), download.mime_type),
-    };
+    // Decide compression plan — single decision point
+    let plan = compression::plan::decide(override_strategy, &download.mime_type);
+
+    // Apply the plan
+    let cancel = Arc::new(AtomicBool::new(false));
+    let applied = compression::plan::apply(
+        &plan,
+        std::path::Path::new(&temp_path),
+        &download.filename,
+        &download.mime_type,
+        download.content_length,
+        quality,
+        ctx.config.compression_timeout_secs,
+        cancel,
+    )
+    .await?;
+
+    let local_file = applied.output_path.to_string_lossy().to_string();
+    let compressed_size = Some(applied.size);
+    let final_mime = applied.mime;
 
     if final_mime != original_mime
         && let Some(new_ext) = mime_to_extension(&final_mime)
@@ -243,17 +114,17 @@ pub(crate) async fn handle_new_file(
         final_mime,
     );
 
-    Ok(JobOutcome::Completed(metadata))
+    Ok(JobOutcome::Done(JobEffect::FileStored { metadata }))
 }
 
 pub(crate) async fn handle_duplicate(
     temp_path: &str,
     existing_hash: &str,
-) -> Result<JobOutcome, JobErrorOutcome> {
+) -> Result<(), JobErrorOutcome> {
     tracing::info!(
         "Duplicate detected (existing hash: {}), cleaning up",
         existing_hash
     );
     tokio::fs::remove_file(temp_path).await?;
-    Ok(JobOutcome::Duplicated)
+    Ok(())
 }

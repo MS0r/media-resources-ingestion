@@ -1,3 +1,10 @@
+//! TOML configuration: the on-disk shape of `.ingest/config.toml`.
+//!
+//! These structs mirror the TOML schema 1:1 and are not meant to be
+//! touched at runtime. `config::app::AppConfig::from_sources` consumes
+//! a `TomlRawConfig` and merges its fields with YAML values to produce
+//! the merged runtime config.
+
 use crate::error::ToolError;
 use serde::Deserialize;
 use std::path::PathBuf;
@@ -92,6 +99,9 @@ impl Default for RetryConfig {
     }
 }
 
+/// The full on-disk TOML configuration. Root contains four tables
+/// (`[scheduler]`, `[compression]`, `[storage]`, `[retry]`); retry is
+/// optional.
 #[derive(Debug, Clone, Deserialize)]
 pub struct TomlRawConfig {
     pub scheduler: SchedulerConfig,
@@ -101,6 +111,7 @@ pub struct TomlRawConfig {
     pub retry: RetryConfig,
 }
 
+/// Load and parse the TOML config from the given path.
 pub fn load_toml(path: &PathBuf) -> Result<TomlRawConfig, ToolError> {
     let toml_fs = std::fs::read_to_string(path)?;
     let config: TomlRawConfig = toml::from_str(&toml_fs)?;

@@ -1,60 +1,13 @@
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::sync::Semaphore;
 use url::Url;
 use uuid::Uuid;
 
 use crate::{
-    auth::{AuthProviderRegistry, OAuthTokenProvider},
-    context::ContextFactory,
     error::ToolError,
-    handlers::{
-        jobs::{Batch, ChunkJobHandler, FileJob, FileJobHandler, JobStatus},
-        scheduler::scheduler_loop,
-    },
+    job::{Batch, FileJob, JobStatus},
     models::{AppConfig, Destination, Resource, ResourceLevelConfig},
     services::{mongo::MongoService, redis::RedisService},
     storage::Provider,
 };
-
-/// Initialize the auth provider registry from environment variables.
-/// Called once at worker startup; also reused by the gRPC server to
-/// build its `ProviderCache`.
-pub(crate) fn init_auth_registry() -> AuthProviderRegistry {
-    let mut registry = AuthProviderRegistry::new();
-
-    // Google Drive — OAuth refresh-token (from stored config file or env vars)
-    match OAuthTokenProvider::from_env_or_file(
-        "GDRIVE",
-        "https://oauth2.googleapis.com/token",
-        "gdrive",
-    ) {
-        Ok(p) => {
-            tracing::info!("GDrive OAuth token provider registered");
-            registry.register("gdrive", Arc::new(p));
-        }
-        Err(e) => {
-            tracing::debug!("GDrive OAuth not configured: {e}");
-        }
-    }
-
-    // Dropbox OAuth — try config file first, then env vars
-    match OAuthTokenProvider::from_env_or_file(
-        "DROPBOX",
-        "https://api.dropbox.com/oauth2/token",
-        "dropbox",
-    ) {
-        Ok(p) => {
-            tracing::info!("Dropbox OAuth token provider registered");
-            registry.register("dropbox", Arc::new(p));
-        }
-        Err(e) => {
-            tracing::debug!("Dropbox OAuth not configured: {e}");
-        }
-    }
-
-    registry
-}
 
 fn parent_values(mut res: Resource, config: &AppConfig) -> (Resource, i32) {
     let resource_priority = res.priority.unwrap_or(config.priority);
@@ -149,10 +102,18 @@ pub async fn enqueue(config: &AppConfig, resources: &[Resource]) -> Result<Strin
     for resource in resources {
         let (res, resource_priority) = parent_values(resource.clone(), config);
 
+        let spec = crate::job::FileJobSpec {
+            id: res.id.clone(),
+            url: res.url.clone(),
+            name: res.name.clone(),
+            dest: res.dest.clone(),
+            config: res.config.clone(),
+        };
+
         let file_job = FileJob {
             _id: resource.id.clone(),
             batch_id: batch_id.clone(),
-            resource: res,
+            spec,
             priority: resource_priority,
             status: JobStatus::Pending,
             retry_count: 0,
@@ -175,118 +136,6 @@ pub async fn enqueue(config: &AppConfig, resources: &[Resource]) -> Result<Strin
     redis_service.enqueue_batch(&batch).await?;
 
     Ok(batch_id)
-}
-
-/// Worker body that uses pre-created services and a shared shutdown flag.
-/// Used by both the server (auto-started worker) and standalone worker.
-pub async fn worker_with_services(
-    mongo_service: MongoService,
-    redis_service: RedisService,
-    config: AppConfig,
-    shutdown: Arc<AtomicBool>,
-    worker_id: u32,
-) -> Result<(), ToolError> {
-    match redis_service
-        .recover_orphaned_jobs(config.shard_count)
-        .await
-    {
-        Ok(n) => {
-            if n > 0 {
-                tracing::warn!(count = n, "Recovered orphaned jobs at worker startup");
-            }
-        }
-        Err(e) => tracing::warn!(error = %e, "Failed to recover orphaned jobs"),
-    }
-
-    match redis_service.cleanup_orphaned_chunks(&mongo_service).await {
-        Ok(n) => {
-            if n > 0 {
-                tracing::warn!(count = n, "Cleaned up orphaned chunk tracking keys");
-            }
-        }
-        Err(e) => tracing::warn!(error = %e, "Failed to clean up orphaned chunk keys"),
-    }
-
-    let temp_dir = &config.temp_dir;
-    tokio::fs::create_dir_all(temp_dir).await?;
-
-    let file_handler = Arc::new(FileJobHandler);
-    let chunk_handler = Arc::new(ChunkJobHandler);
-
-    // Initialize auth providers
-    let auth_registry = init_auth_registry();
-
-    tracing::info!("Starting worker mode");
-    tracing::info!(
-        file_workers = config.file_workers,
-        chunk_workers = config.chunk_workers,
-        "Worker pool sizes"
-    );
-
-    let file_semaphore = Arc::new(Semaphore::new(config.file_workers));
-    let chunk_semaphore = Arc::new(Semaphore::new(config.chunk_workers));
-
-    let ctx_factory = Arc::new(ContextFactory::new(
-        mongo_service,
-        redis_service,
-        config,
-        auth_registry,
-    )?);
-
-    scheduler_loop(
-        file_handler,
-        chunk_handler,
-        ctx_factory,
-        file_semaphore,
-        chunk_semaphore,
-        shutdown,
-        worker_id,
-    )
-    .await?;
-
-    Ok(())
-}
-
-pub async fn worker(config: AppConfig, worker_id: u32) -> Result<(), ToolError> {
-    let redis_service = match RedisService::new(
-        &config.redis_uri,
-        config.running_job_ttl_secs,
-        config.max_retries,
-        config.backoff_secs.clone(),
-    ) {
-        Ok(svc) => {
-            tracing::info!(url = %config.redis_uri, "Redis connected");
-            svc
-        }
-        Err(e) => {
-            tracing::error!("Failed to connect to Redis: {}", e);
-            return Err(e.into());
-        }
-    };
-
-    let mongo_service = MongoService::new(
-        &config.mongo_uri,
-        config.mongo_pool_min,
-        config.mongo_pool_max,
-    )
-    .await?;
-
-    let shutdown = Arc::new(AtomicBool::new(false));
-    let shutdown_clone = shutdown.clone();
-    let shutdown_redis = redis_service.clone();
-    tokio::spawn(async move {
-        tokio::signal::ctrl_c().await.ok();
-        tracing::warn!(
-            "SIGINT received, initiating graceful shutdown (press Ctrl+C again to force)"
-        );
-        // Clear running keys so recovery on next start is immediate
-        if let Err(e) = shutdown_redis.delete_all_running().await {
-            tracing::warn!(error = %e, "Failed to clear running keys on shutdown");
-        }
-        shutdown_clone.store(true, Ordering::Relaxed);
-    });
-
-    worker_with_services(mongo_service, redis_service, config, shutdown, worker_id).await
 }
 
 /// Perform a preflight check on a URL (HEAD request for HTTP/HTTPS)

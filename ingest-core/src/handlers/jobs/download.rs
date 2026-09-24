@@ -1,18 +1,23 @@
-use crate::{
-    error::JobError,
-    handlers::jobs::{JobEnvelope, types::DownloadInfo},
-    models::Resource,
-};
+use crate::{error::JobError, handlers::jobs::JobEnvelope, job::FileJobSpec, models::Headers};
 use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 use url::Url;
 use wreq::{
     Client, RequestBuilder, Response,
-    header::{ACCEPT_RANGES, AUTHORIZATION, CONTENT_TYPE, COOKIE, HeaderValue, RANGE, REFERER},
+    header::{ACCEPT_RANGES, CONTENT_TYPE, HeaderValue, RANGE, REFERER},
 };
 
 use super::{FileJob, expand_path};
+
+/// Metadata extracted from a HEAD or initial GET response. Used by
+/// `execute.rs` to decide chunking and to drive `handle_new_file`.
+pub struct DownloadInfo {
+    pub filename: String,
+    pub extension: String,
+    pub content_length: u64,
+    pub mime_type: String,
+}
 
 #[cfg(test)]
 mod tests {
@@ -136,30 +141,29 @@ pub(crate) fn extract_file_job(job: &JobEnvelope) -> Result<&FileJob, JobError> 
 /// used as `Authorization: Bearer <token>`. Otherwise, falls back to the
 /// static `authorization` / `cookie` headers from the resource config.
 fn apply_auth_headers(
-    mut request: RequestBuilder,
-    resource: &Resource,
+    request: RequestBuilder,
+    resource: &FileJobSpec,
     auth_token: Option<&str>,
 ) -> RequestBuilder {
     let origin = resource.url.origin();
-    if let Ok(val) = HeaderValue::from_str(&origin.ascii_serialization()) {
-        request = request.header(REFERER, val);
-    }
+    let request = if let Ok(val) = HeaderValue::from_str(&origin.ascii_serialization()) {
+        request.header(REFERER, val)
+    } else {
+        request
+    };
+
     if let Some(token) = auth_token {
-        request = request.header(AUTHORIZATION, format!("Bearer {}", token));
+        Headers::bearer(token).apply(request)
     } else if let Some(headers) = &resource.config.as_ref().and_then(|c| c.headers.as_ref()) {
-        if let Some(auth) = &headers.authorization {
-            request = request.header(AUTHORIZATION, auth);
-        }
-        if let Some(cookie) = &headers.cookie {
-            request = request.header(COOKIE, cookie);
-        }
+        headers.apply(request)
+    } else {
+        request
     }
-    request
 }
 
 /// HEAD preflight — get Content-Length and Accept-Ranges without downloading.
 pub(crate) async fn initiate_head(
-    resource: &Resource,
+    resource: &FileJobSpec,
     client: &Client,
     auth_token: Option<&str>,
 ) -> Result<HeadInfo, JobError> {
@@ -201,24 +205,20 @@ pub(crate) async fn initiate_range_download(
     url: &Url,
     offset_start: u64,
     offset_end: u64,
-    authorization: Option<&str>,
-    cookie: Option<&str>,
+    headers: &Headers,
     client: &Client,
 ) -> Result<(Response, String), JobError> {
     let range_val = format!("bytes={}-{}", offset_start, offset_end);
-    let mut request = client.get(url.as_str()).header(RANGE, &range_val);
+    let request = client.get(url.as_str()).header(RANGE, &range_val);
 
     let origin = url.origin();
-    if let Ok(val) = HeaderValue::from_str(&origin.ascii_serialization()) {
-        request = request.header(REFERER, val);
-    }
-    if let Some(auth) = authorization {
-        request = request.header(AUTHORIZATION, auth);
-    }
-    if let Some(cookie) = cookie {
-        request = request.header(COOKIE, cookie);
-    }
+    let request = if let Ok(val) = HeaderValue::from_str(&origin.ascii_serialization()) {
+        request.header(REFERER, val)
+    } else {
+        request
+    };
 
+    let request = headers.apply(request);
     let response = request.send().await?;
 
     if !response.status().is_success() && response.status() != 206 {
@@ -332,7 +332,7 @@ pub(crate) async fn download_range_chunk(
 }
 
 pub(crate) async fn initiate_download(
-    resource: &Resource,
+    resource: &FileJobSpec,
     client: &Client,
     auth_token: Option<&str>,
 ) -> Result<(Response, DownloadInfo), JobError> {

@@ -1,8 +1,8 @@
 use std::env;
 
 use chrono::Utc;
-use ingest_core::handlers::jobs::{FileJob, JobKind, JobStatus};
-use ingest_core::models::Resource;
+use ingest_core::handlers::jobs::JobKind;
+use ingest_core::job::{FileJob, FileJobSpec, JobStatus};
 use ingest_core::services::redis::{RedisService, compute_shard, shard_key};
 use url::Url;
 
@@ -11,11 +11,10 @@ fn redis_uri() -> String {
 }
 
 fn make_file_job(id: &str, priority: i32) -> FileJob {
-    let resource = Resource {
+    let spec = FileJobSpec {
         id: id.to_string(),
         url: Url::parse("https://example.com/test.bin").unwrap(),
         name: None,
-        priority: Some(priority),
         dest: None,
         config: None,
     };
@@ -23,7 +22,7 @@ fn make_file_job(id: &str, priority: i32) -> FileJob {
     FileJob {
         _id: id.to_string(),
         batch_id: "batch-test".to_string(),
-        resource,
+        spec,
         priority,
         status: JobStatus::Pending,
         retry_count: 0,

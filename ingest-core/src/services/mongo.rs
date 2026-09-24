@@ -1,7 +1,8 @@
 use crate::{
+    domain::JobStatusFilter,
     error::ToolError,
-    handlers::jobs::{Batch, ChunkJob, FileJob, JobStatus},
-    models::{JobStatusFilter, Metadata},
+    job::{Batch, ChunkJob, FileJob, JobStatus},
+    models::Metadata,
 };
 use bb8::Pool;
 use bb8_mongodb::MongodbConnectionManager;
@@ -169,26 +170,6 @@ impl MongoService {
         let client = self.client().await?;
         let collection: Collection<Metadata> = client.collection("files_metadata");
 
-        // Patch any orphaned placeholder documents left behind by a previously
-        // failed job. Two variants exist: old code wrote `original_url: ""` (not
-        // a valid Url) and `storage_provider: "Local"` (capital L, which fails
-        // `Provider`'s lowercase serde). Without this, find_one_and_update
-        // returns the stale document and BSON deserialization fails.
-        let patch_filter = doc! {
-            "file_hash": file_hash,
-            "$or": [
-                { "original_url": "" },
-                { "storage_provider": "Local" },
-            ],
-        };
-        let patch_update = doc! {
-            "$set": {
-                "original_url": "placeholder://pending",
-                "storage_provider": "local",
-            }
-        };
-        let _ = collection.update_one(patch_filter, patch_update).await;
-
         let filter = doc! { "file_hash": file_hash };
         let update = doc! {
             "$inc": { "duplicate_reference_count": 1i32 },
@@ -303,15 +284,8 @@ impl MongoService {
 
         let mut filter = doc! {};
         if let Some(status) = filter_status {
-            let status_str = match status {
-                JobStatusFilter::Pending => "status.pending",
-                JobStatusFilter::Running => "status.running",
-                JobStatusFilter::Completed => "status.completed",
-                JobStatusFilter::Failed => "status.failed",
-                JobStatusFilter::Retrying => "status.retrying",
-                JobStatusFilter::Cancelled => "status.cancelled",
-            };
-            filter.insert(status_str, doc! {"$exists" : true});
+            let status_field = status.mongo_field();
+            filter.insert(status_field, doc! {"$exists" : true});
         }
 
         let mut cursor = collection.find(filter).limit(limit as i64).await?;

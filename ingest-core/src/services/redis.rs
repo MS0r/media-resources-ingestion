@@ -1,13 +1,15 @@
 use crate::{
+    domain::JobStatus,
     error::ToolError,
-    handlers::jobs::{Batch, ChunkJob, FileJob, JobKind},
-    models::{ChunkRef, JobStatusFilter, ProgressEvent, ProgressJobType, ProgressStatus},
+    handlers::jobs::JobKind,
+    job::{Batch, ChunkJob, FileJob},
+    models::{ChunkRef, ProgressEvent, ProgressJobType, ProgressStatus},
     services::mongo::MongoService,
 };
 use crc32fast::Hasher;
 use futures_util::StreamExt;
 use redis::{AsyncCommands, Client, aio::MultiplexedConnection};
-use std::time::Duration;
+use std::{str::FromStr, time::Duration};
 
 const MAX_REDIS_RETRIES: usize = 3;
 const REDIS_BACKOFF_BASE_MS: u64 = 100;
@@ -182,7 +184,7 @@ impl RedisService {
 
     /// Fetch the full job state from Redis by ID.
     /// Returns the deserialized kind + payload so ContextFactory can build the context.
-    pub async fn get_job(&self, job_id: &str) -> Result<(JobKind, JobStatusFilter, u8), ToolError> {
+    pub async fn get_job(&self, job_id: &str) -> Result<(JobKind, JobStatus, u8), ToolError> {
         let mut conn = self.get_connection().await?;
         let state_key = format!("jobs:state:{job_id}");
 
@@ -200,14 +202,8 @@ impl RedisService {
             other => return Err(format!("Unknown job kind '{other}' for job {job_id}").into()),
         };
 
-        let job_status = match status.as_str() {
-            "pending" => JobStatusFilter::Pending,
-            "running" => JobStatusFilter::Running,
-            "completed" => JobStatusFilter::Completed,
-            "retrying" => JobStatusFilter::Retrying,
-            "failed" => JobStatusFilter::Failed,
-            other => return Err(format!("Unknown job status '{other}' for job {job_id}").into()),
-        };
+        let job_status =
+            JobStatus::from_str(&status).map_err(|e| format!("{e} for job {job_id}"))?;
 
         Ok((job_kind, job_status, retry_count))
     }

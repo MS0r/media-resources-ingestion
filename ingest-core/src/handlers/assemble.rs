@@ -90,40 +90,30 @@ pub fn assemble_file(
     let provider = metadata.storage_provider.clone();
     let data_stream: Pin<Box<dyn Stream<Item = Result<Frame, JobError>> + Send>> = if is_chunked {
         let manifest = metadata.chunk_manifest.clone().expect("checked is_chunked");
-        // Reject manifests where the compression field is *truly missing*
-        // (`None`) instead of silently falling through to the passthrough
-        // branch. An empty string is a valid value: it means
-        // `GenericCompressionStrategy::OriginalFormat` (no chunk-level
-        // compression), and `decompress_streaming` handles `""` as a
-        // passthrough. The old buggy pipeline produced `None`; the new
-        // pipeline always sets the field to `Some("")` for OriginalFormat
-        // or `Some("gzip")` etc. for compressed formats.
-        let compression = manifest.compression.clone();
-        match compression.as_deref() {
-            Some(c) => Box::pin(stream_chunks(
-                provider,
-                provider_cache,
-                manifest,
-                c.to_string(),
-                range_start,
-                range_end,
-            )),
-            None => {
-                tracing::error!(
-                    file_hash = %metadata.file_hash,
-                    "Chunked Metadata has missing `compression` field — \
-                     refusing to reassemble. Delete the Metadata and re-enqueue \
-                     the file to recover."
-                );
-                let err = JobError::OtherFatal(format!(
-                    "Chunked file {} has no chunk compression recorded; \
-                     refusing to reassemble (would emit corrupt bytes). \
-                     Delete the Metadata document and re-enqueue the file.",
-                    metadata.file_hash
-                ));
-                Box::pin(stream::once(async move { Err(err) }))
+        // Log a warning if any chunk's per-chunk compression differs
+        // from the manifest summary. The per-chunk ChunkRef.compression
+        // is what actually drives decompression in stream_chunks.
+        if let Some(ref mc) = manifest.compression {
+            for chunk in &manifest.chunks {
+                if !chunk.compression.is_empty() && chunk.compression != mc.as_str() {
+                    tracing::warn!(
+                        file_hash = %metadata.file_hash,
+                        offset_start = chunk.offset_start,
+                        chunk_compression = %chunk.compression,
+                        manifest_compression = %mc,
+                        "Chunk compression differs from manifest summary — \
+                         using per-chunk ChunkRef.compression for this chunk"
+                    );
+                }
             }
         }
+        Box::pin(stream_chunks(
+            provider,
+            provider_cache,
+            manifest,
+            range_start,
+            range_end,
+        ))
     } else {
         Box::pin(stream_single(
             provider,
@@ -189,7 +179,6 @@ fn stream_chunks(
     provider: crate::storage::Provider,
     provider_cache: Arc<ProviderCache>,
     manifest: Manifest,
-    compression: String,
     range_start: Option<u64>,
     range_end: Option<u64>,
 ) -> impl Stream<Item = Result<Frame, JobError>> + Send {
@@ -232,6 +221,10 @@ fn stream_chunks(
                 .await
                 .map_err(|e| JobError::OtherFatal(format!("chunk read failed: {e}")))?;
 
+            // Per-chunk compression: use chunk.compression (the
+            // actually-applied strategy) rather than the manifest summary.
+            let chunk_compression = &chunk.compression;
+
             let input: Box<dyn tokio::io::AsyncRead + Unpin + Send> =
                 Box::new(std::io::Cursor::new(buf));
             // The decoder needs to produce `skip + take` bytes total so
@@ -240,7 +233,7 @@ fn stream_chunks(
             let decode_total = skip + take;
             let mut decoder = decompress_generic_reader(
                 input,
-                &compression,
+                chunk_compression,
                 if decode_total == 0 { 0 } else { decode_total },
             );
 
@@ -465,6 +458,7 @@ mod tests {
             size_original: 1024,
             size_compressed: None,
             storage_path: chunk_a_path.to_string_lossy().to_string(),
+            compression: "gzip".to_string(),
             offset_start: 0,
             offset_end: 1023,
         };
@@ -473,6 +467,7 @@ mod tests {
             size_original: 1024,
             size_compressed: None,
             storage_path: chunk_b_path.to_string_lossy().to_string(),
+            compression: "gzip".to_string(),
             offset_start: 1024,
             offset_end: 2047,
         };
@@ -539,6 +534,7 @@ mod tests {
                     size_original: 1024,
                     size_compressed: None,
                     storage_path: chunk_a_path.to_string_lossy().to_string(),
+                    compression: "gzip".to_string(),
                     offset_start: 0,
                     offset_end: 1023,
                 },
@@ -547,6 +543,7 @@ mod tests {
                     size_original: 1024,
                     size_compressed: None,
                     storage_path: chunk_b_path.to_string_lossy().to_string(),
+                    compression: "gzip".to_string(),
                     offset_start: 1024,
                     offset_end: 2047,
                 },

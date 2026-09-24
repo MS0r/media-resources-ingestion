@@ -803,11 +803,11 @@ pub(crate) async fn compress_generic_local(
     strategy: &GenericCompressionStrategy,
     quality: u8,
     cancelled: Arc<AtomicBool>,
-) -> Result<(String, u64), JobError> {
+) -> Result<(String, u64, GenericCompressionStrategy), JobError> {
     match strategy {
         GenericCompressionStrategy::OriginalFormat | GenericCompressionStrategy::None => {
             let meta = std::fs::metadata(temp_path)?;
-            return Ok((temp_path.to_string(), meta.len()));
+            return Ok((temp_path.to_string(), meta.len(), strategy.clone()));
         }
         GenericCompressionStrategy::Gzip
         | GenericCompressionStrategy::Zstd
@@ -822,7 +822,8 @@ pub(crate) async fn compress_generic_local(
 
     let input_path = temp_path.to_string();
     let out_path = output_path_str.clone();
-    let strategy = strategy.clone();
+    let applied = strategy.clone();
+    let applied_for_return = applied.clone();
     let cancelled = cancelled.clone();
 
     let result = tokio::task::spawn_blocking(move || -> Result<(String, u64), JobError> {
@@ -847,7 +848,7 @@ pub(crate) async fn compress_generic_local(
             }
         };
 
-        match strategy {
+        match &applied {
             GenericCompressionStrategy::Gzip => {
                 check_cancel()?;
                 let mut input = std::fs::File::open(&input_path)?;
@@ -912,10 +913,14 @@ pub(crate) async fn compress_generic_local(
     let original_size = std::fs::metadata(temp_path)?.len();
     if original_size > 0 && result.1 >= original_size {
         std::fs::remove_file(&result.0).ok();
-        return Ok((temp_path.to_string(), original_size));
+        return Ok((
+            temp_path.to_string(),
+            original_size,
+            GenericCompressionStrategy::OriginalFormat,
+        ));
     }
 
-    Ok(result)
+    Ok((result.0, result.1, applied_for_return))
 }
 
 /// `AsyncRead` adapter that pumps a synchronous `Read` (driven on a
@@ -1176,7 +1181,8 @@ fn decompress_buffered(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::GenericCompressionStrategy;
+    use crate::compression::GenericCompressionStrategy;
+    use sha2::Digest;
 
     // ── Helper function tests ──────────────────────────────────────────────────
 
@@ -1290,7 +1296,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let input = create_compressible_data(&dir);
 
-        let (path, size) = compress_generic_local(
+        let (path, size, applied) = compress_generic_local(
             input.to_str().unwrap(),
             "test",
             &GenericCompressionStrategy::Gzip,
@@ -1307,6 +1313,7 @@ mod tests {
                 .map(|e| e.to_string_lossy()),
             Some("gz".into())
         );
+        assert_eq!(applied, GenericCompressionStrategy::Gzip);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1316,7 +1323,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let input = create_compressible_data(&dir);
 
-        let (path, size) = compress_generic_local(
+        let (path, size, applied) = compress_generic_local(
             input.to_str().unwrap(),
             "test",
             &GenericCompressionStrategy::Zstd,
@@ -1333,6 +1340,7 @@ mod tests {
                 .map(|e| e.to_string_lossy()),
             Some("zst".into())
         );
+        assert_eq!(applied, GenericCompressionStrategy::Zstd);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1342,7 +1350,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let input = create_compressible_data(&dir);
 
-        let (path, size) = compress_generic_local(
+        let (path, size, applied) = compress_generic_local(
             input.to_str().unwrap(),
             "test",
             &GenericCompressionStrategy::Zip,
@@ -1359,6 +1367,7 @@ mod tests {
                 .map(|e| e.to_string_lossy()),
             Some("zip".into())
         );
+        assert_eq!(applied, GenericCompressionStrategy::Zip);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1368,7 +1377,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let input = create_compressible_data(&dir);
 
-        let (path, size) = compress_generic_local(
+        let (path, size, applied) = compress_generic_local(
             input.to_str().unwrap(),
             "test",
             &GenericCompressionStrategy::SevenZ,
@@ -1385,6 +1394,7 @@ mod tests {
                 .map(|e| e.to_string_lossy()),
             Some("7z".into())
         );
+        assert_eq!(applied, GenericCompressionStrategy::SevenZ);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1411,7 +1421,7 @@ mod tests {
         // `compress_generic_local` deletes the input on success.
         let src = dir.join(format!("q{}_{}.txt", quality, uuid::Uuid::new_v4()));
         std::fs::copy(dir.join("stress.txt"), &src).unwrap();
-        let (out, size) = compress_generic_local(
+        let (out, size, _applied) = compress_generic_local(
             src.to_str().unwrap(),
             "stress",
             &strategy,
@@ -1475,7 +1485,7 @@ mod tests {
         std::fs::write(&input, "Hello, world!").unwrap();
         let input_str = input.to_str().unwrap().to_string();
 
-        let (path, size) = compress_generic_local(
+        let (path, size, applied) = compress_generic_local(
             input_str.as_str(),
             "test",
             &GenericCompressionStrategy::OriginalFormat,
@@ -1487,6 +1497,7 @@ mod tests {
 
         assert!(size > 0);
         assert_eq!(path, input_str);
+        assert_eq!(applied, GenericCompressionStrategy::OriginalFormat);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1498,7 +1509,7 @@ mod tests {
         std::fs::write(&input, "Hello, world!").unwrap();
         let input_str = input.to_str().unwrap().to_string();
 
-        let (path, size) = compress_generic_local(
+        let (path, size, applied) = compress_generic_local(
             input_str.as_str(),
             "test",
             &GenericCompressionStrategy::None,
@@ -1510,6 +1521,45 @@ mod tests {
 
         assert!(size > 0);
         assert_eq!(path, input_str);
+        assert_eq!(applied, GenericCompressionStrategy::None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_compress_generic_incompressible_falls_back_to_original() {
+        // 1 MiB of SHA-256 counter output — incompressible. Gzip would
+        // grow the file, so compress_generic_local should fall back to
+        // OriginalFormat and return the input path (not the .gz path).
+        let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        let input = dir.join("random.bin");
+        let mut data = Vec::with_capacity(1024 * 1024);
+        for i in 0u32..32768 {
+            let mut hasher = sha2::Sha256::new();
+            hasher.update(i.to_le_bytes());
+            data.extend_from_slice(&hasher.finalize());
+        }
+        std::fs::write(&input, &data).unwrap();
+        let input_str = input.to_str().unwrap().to_string();
+
+        let (path, size, applied) = compress_generic_local(
+            input_str.as_str(),
+            "random",
+            &GenericCompressionStrategy::Gzip,
+            5,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+        .await
+        .unwrap();
+
+        // Size must equal the original — no compression was applied.
+        assert_eq!(size, data.len() as u64);
+        // Path must be the original input (not .gz) — the .gz was deleted.
+        assert_eq!(path, input_str);
+        // The applied strategy must reflect the actual outcome.
+        assert_eq!(applied, GenericCompressionStrategy::OriginalFormat);
+        // The .gz output file should not exist.
+        assert!(!std::path::Path::new(&format!("{input_str}.gz")).exists());
         std::fs::remove_dir_all(&dir).ok();
     }
 
