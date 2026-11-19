@@ -99,8 +99,15 @@ impl RedisService {
     }
 
     async fn get_connection(&self) -> Result<MultiplexedConnection, redis::RedisError> {
+        // redis-rs defaults `response_timeout` to 500 ms, but `dequeue_job`
+        // issues a BZPOPMAX that blocks up to 2 s server-side — without a
+        // longer client timeout, every idle dequeue fails with
+        // `RedisError(timed out)` instead of returning `Ok(None)`.
+        let config =
+            redis::AsyncConnectionConfig::new().set_response_timeout(Some(Duration::from_secs(3)));
         with_retry("get_connection", || {
-            self.client.get_multiplexed_async_connection()
+            self.client
+                .get_multiplexed_async_connection_with_config(&config)
         })
         .await
     }

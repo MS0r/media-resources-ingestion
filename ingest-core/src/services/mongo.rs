@@ -178,13 +178,18 @@ impl MongoService {
                 // Minimal placeholder fields so Metadata deserialization succeeds
                 // when find_one_and_update returns the upserted document.
                 // These are overwritten by complete_job's full metadata update.
+                //
+                // `duplicate_reference_count` must NOT appear here: it is
+                // already covered by the `$inc` above (which initializes the
+                // field to 1 on insert), and listing it in both operators
+                // makes MongoDB reject the update with error code 40
+                // (ConflictingUpdateOperators).
                 "original_url": "placeholder://pending",
                 "storage_provider": "local",
                 "storage_path": "",
                 "original_file_size": 0i64,
                 "mime_type": "",
                 "upload_date": DateTime::now(),
-                "duplicate_reference_count": 0i32,
             },
         };
 

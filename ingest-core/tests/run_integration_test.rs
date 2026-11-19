@@ -1,7 +1,9 @@
-use std::env;
+mod common;
+
 use std::io::Write;
 use std::path::PathBuf;
 
+use common::Infra;
 use ingest_core::OutputFormat;
 use ingest_core::config::RunConfig;
 use ingest_core::enqueue;
@@ -24,16 +26,6 @@ chunk_size = "128MB"
 temp_dir = "/tmp/ingest-inttest"
 "#;
 
-fn mongo_uri() -> String {
-    env::var("MONGODB_URI").unwrap_or_else(|_| {
-        "mongodb://root:example@localhost:27017/ingestion?authSource=admin".into()
-    })
-}
-
-fn redis_uri() -> String {
-    env::var("REDIS_URI").unwrap_or_else(|_| "redis://localhost:6379".into())
-}
-
 fn setup_toml() -> TomlRawConfig {
     toml::from_str(TOML_TEST).expect("invalid test TOML")
 }
@@ -53,7 +45,12 @@ fn write_test_yaml(resources: &str) -> (PathBuf, PathBuf) {
     (dir, path)
 }
 
-fn build_app_config(yaml_path: PathBuf, no_follow: bool, dry_run: bool) -> (AppConfig, PathBuf) {
+fn build_app_config(
+    yaml_path: PathBuf,
+    no_follow: bool,
+    dry_run: bool,
+    infra: &Infra,
+) -> (AppConfig, PathBuf) {
     let toml = setup_toml();
     let yaml_config = load_config(&yaml_path).expect("load test YAML");
     let args = RunConfig {
@@ -65,14 +62,30 @@ fn build_app_config(yaml_path: PathBuf, no_follow: bool, dry_run: bool) -> (AppC
         no_follow,
         output: OutputFormat::Json,
     };
-    let cfg = AppConfig::from_sources(&yaml_config, toml, args, redis_uri(), mongo_uri());
+    let cfg = AppConfig::from_sources(
+        &yaml_config,
+        toml,
+        args,
+        infra.redis_uri.clone(),
+        infra.mongo_uri.clone(),
+    );
     (cfg, yaml_path)
 }
 
-fn build_app_config_full(yaml_path: PathBuf, args: RunConfig) -> (AppConfig, PathBuf) {
+fn build_app_config_full(
+    yaml_path: PathBuf,
+    args: RunConfig,
+    infra: &Infra,
+) -> (AppConfig, PathBuf) {
     let toml = setup_toml();
     let yaml_config = load_config(&yaml_path).expect("load test YAML");
-    let cfg = AppConfig::from_sources(&yaml_config, toml, args, redis_uri(), mongo_uri());
+    let cfg = AppConfig::from_sources(
+        &yaml_config,
+        toml,
+        args,
+        infra.redis_uri.clone(),
+        infra.mongo_uri.clone(),
+    );
     (cfg, yaml_path)
 }
 
@@ -82,6 +95,7 @@ async fn count_jobs(mongo: &MongoService) -> usize {
 
 #[tokio::test]
 async fn run_no_follow_creates_batch_and_jobs() {
+    let infra = common::infra().await;
     let (_dir, yaml_path) = write_test_yaml(
         r#"  - url: https://example.com/img1.png
     name: img1
@@ -94,12 +108,12 @@ async fn run_no_follow_creates_batch_and_jobs() {
 "#,
     );
 
-    let mongo = MongoService::new(&mongo_uri(), 1, 16)
+    let mongo = MongoService::new(&infra.mongo_uri, 1, 16)
         .await
         .expect("connect to MongoDB");
     let before = count_jobs(&mongo).await;
 
-    let (config, yaml_path) = build_app_config(yaml_path, true, false);
+    let (config, yaml_path) = build_app_config(yaml_path, true, false, &infra);
     let yaml_config = load_config(&yaml_path).expect("load test YAML");
     let resources = yaml_config.resources;
     enqueue(&config, &resources)
@@ -112,9 +126,10 @@ async fn run_no_follow_creates_batch_and_jobs() {
 
 #[tokio::test]
 async fn run_empty_yaml_is_accepted() {
+    let infra = common::infra().await;
     let (_dir, yaml_path) = write_test_yaml("");
 
-    let (config, yaml_path) = build_app_config(yaml_path, true, false);
+    let (config, yaml_path) = build_app_config(yaml_path, true, false, &infra);
     let yaml_config = load_config(&yaml_path).expect("load test YAML");
     enqueue(&config, &yaml_config.resources)
         .await
@@ -123,6 +138,7 @@ async fn run_empty_yaml_is_accepted() {
 
 #[tokio::test]
 async fn run_duplicate_urls_rejected() {
+    let infra = common::infra().await;
     let (_dir, yaml_path) = write_test_yaml(
         r#"  - url: https://example.com/dup.png
     name: dup1
@@ -135,7 +151,7 @@ async fn run_duplicate_urls_rejected() {
 "#,
     );
 
-    let (config, yaml_path) = build_app_config(yaml_path, true, false);
+    let (config, yaml_path) = build_app_config(yaml_path, true, false, &infra);
     let yaml_config = load_config(&yaml_path).expect("load test YAML");
     let err = enqueue(&config, &yaml_config.resources).await.unwrap_err();
 
@@ -144,6 +160,7 @@ async fn run_duplicate_urls_rejected() {
 
 #[tokio::test]
 async fn run_dry_run_local_file() {
+    let infra = common::infra().await;
     let (_dir, yaml_path) = write_test_yaml(
         r#"  - url: file:///etc/hosts
     name: hosts
@@ -159,7 +176,7 @@ async fn run_dry_run_local_file() {
         no_follow: false,
         output: OutputFormat::Json,
     };
-    let (config, yaml_path) = build_app_config_full(yaml_path, args);
+    let (config, yaml_path) = build_app_config_full(yaml_path, args, &infra);
     let yaml_config = load_config(&yaml_path).expect("load test YAML");
     enqueue(&config, &yaml_config.resources)
         .await
@@ -168,6 +185,7 @@ async fn run_dry_run_local_file() {
 
 #[tokio::test]
 async fn run_dry_run_missing_file_fails() {
+    let infra = common::infra().await;
     let (_dir, yaml_path) = write_test_yaml(
         r#"  - url: file:///tmp/nonexistent-test-file-ingest-12345
     name: missing
@@ -183,7 +201,7 @@ async fn run_dry_run_missing_file_fails() {
         no_follow: false,
         output: OutputFormat::Json,
     };
-    let (config, yaml_path) = build_app_config_full(yaml_path, args);
+    let (config, yaml_path) = build_app_config_full(yaml_path, args, &infra);
     let yaml_config = load_config(&yaml_path).expect("load test YAML");
     let err = enqueue(&config, &yaml_config.resources).await.unwrap_err();
     assert!(matches!(err, ToolError::ValidationError(_)));
@@ -191,6 +209,7 @@ async fn run_dry_run_missing_file_fails() {
 
 #[tokio::test]
 async fn run_dry_run_invalid_scheme_fails() {
+    let infra = common::infra().await;
     let (_dir, yaml_path) = write_test_yaml(
         r#"  - url: "gopher://example.com/resource"
     name: badscheme
@@ -206,7 +225,7 @@ async fn run_dry_run_invalid_scheme_fails() {
         no_follow: false,
         output: OutputFormat::Json,
     };
-    let (config, yaml_path) = build_app_config_full(yaml_path, args);
+    let (config, yaml_path) = build_app_config_full(yaml_path, args, &infra);
     let yaml_config = load_config(&yaml_path).expect("load test YAML");
     let err = enqueue(&config, &yaml_config.resources).await.unwrap_err();
     assert!(matches!(err, ToolError::ValidationError(_)));

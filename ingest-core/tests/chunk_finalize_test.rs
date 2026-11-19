@@ -11,6 +11,8 @@
 //!
 //! Requires MongoDB + Redis (defaults match `docker compose -f compose.dev.yml`).
 
+mod common;
+
 use std::net::TcpListener as StdTcpListener;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -22,16 +24,6 @@ use ingest_core::services::redis::RedisService;
 use ingest_core::worker::{Shutdown, Worker};
 use ingest_core::{MongoService, TomlRawConfig, enqueue};
 
-fn mongo_uri() -> String {
-    std::env::var("MONGODB_URI").unwrap_or_else(|_| {
-        "mongodb://root:example@localhost:27017/ingestion?authSource=admin".into()
-    })
-}
-
-fn redis_uri() -> String {
-    std::env::var("REDIS_URI").unwrap_or_else(|_| "redis://localhost:6379".into())
-}
-
 const TOML_SMALL_CHUNK: &str = r#"
 [scheduler]
 file_workers = 2
@@ -40,7 +32,7 @@ max_pending_jobs = 100
 max_per_host = 2
 job_timeout_secs = 120
 [compression]
-threshold_mb = 512
+threshold_mb = 0
 quality = 95
 [storage]
 default_provider = "local"
@@ -227,10 +219,12 @@ async fn chunk_enqueue_all_chunks_finalize() {
     let url = server.url();
 
     // 2. Set up Mongo + Redis.
-    let mongo = MongoService::new(&mongo_uri(), 1, 16)
+    let infra = common::infra().await;
+    let mongo = MongoService::new(&infra.mongo_uri, 1, 16)
         .await
         .expect("mongo connect");
-    let redis = RedisService::new(&redis_uri(), 3600, 3, vec![5, 30, 120]).expect("redis connect");
+    let redis =
+        RedisService::new(&infra.redis_uri, 3600, 3, vec![5, 30, 120]).expect("redis connect");
 
     // Flush Redis to start clean.
     redis.flush_db().await.expect("flush redis");
@@ -265,7 +259,13 @@ async fn chunk_enqueue_all_chunks_finalize() {
         no_follow: true,
         output: OutputFormat::Json,
     };
-    let config = AppConfig::from_sources(&yaml_config, toml, args, redis_uri(), mongo_uri());
+    let config = AppConfig::from_sources(
+        &yaml_config,
+        toml,
+        args,
+        infra.redis_uri.clone(),
+        infra.mongo_uri.clone(),
+    );
 
     // 5. Enqueue the file job.
     let batch_id = enqueue(&config, &yaml_config.resources)
@@ -294,12 +294,17 @@ async fn chunk_enqueue_all_chunks_finalize() {
 
     // 8. Wait for the file job to be finalized (Metadata with chunk_manifest).
     //    Poll the Mongo file_job for file_hash, then wait for metadata.
+    let hash_deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
     let file_hash = loop {
         if let Ok(Some(job)) = mongo.get_file_job(file_job_id).await {
             if let Some(ref hash) = job.file_hash {
                 break hash.clone();
             }
         }
+        assert!(
+            std::time::Instant::now() < hash_deadline,
+            "timed out waiting for file_hash on job {file_job_id}"
+        );
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     };
 
@@ -384,10 +389,12 @@ async fn chunk_incompressible_falls_back_to_original() {
     let url = server.url();
 
     // 2. Set up Mongo + Redis.
-    let mongo = MongoService::new(&mongo_uri(), 1, 16)
+    let infra = common::infra().await;
+    let mongo = MongoService::new(&infra.mongo_uri, 1, 16)
         .await
         .expect("mongo connect");
-    let redis = RedisService::new(&redis_uri(), 3600, 3, vec![5, 30, 120]).expect("redis connect");
+    let redis =
+        RedisService::new(&infra.redis_uri, 3600, 3, vec![5, 30, 120]).expect("redis connect");
     redis.flush_db().await.expect("flush redis");
 
     // 3. Write a test YAML.
@@ -419,7 +426,13 @@ async fn chunk_incompressible_falls_back_to_original() {
         no_follow: true,
         output: OutputFormat::Json,
     };
-    let config = AppConfig::from_sources(&yaml_config, toml, args, redis_uri(), mongo_uri());
+    let config = AppConfig::from_sources(
+        &yaml_config,
+        toml,
+        args,
+        infra.redis_uri.clone(),
+        infra.mongo_uri.clone(),
+    );
 
     // 5. Enqueue.
     let batch_id = enqueue(&config, &yaml_config.resources)
@@ -446,12 +459,17 @@ async fn chunk_incompressible_falls_back_to_original() {
     let file_job_id = &batch.job_ids[0];
 
     // 8. Wait for file_job to finalize.
+    let hash_deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
     let file_hash = loop {
         if let Ok(Some(job)) = mongo.get_file_job(file_job_id).await {
             if let Some(ref hash) = job.file_hash {
                 break hash.clone();
             }
         }
+        assert!(
+            std::time::Instant::now() < hash_deadline,
+            "timed out waiting for file_hash on job {file_job_id}"
+        );
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     };
 

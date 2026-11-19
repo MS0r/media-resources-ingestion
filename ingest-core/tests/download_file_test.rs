@@ -3,13 +3,17 @@
 //! `IngestServer`, opens a gRPC client, and verifies the reassembled
 //! bytes match the original.
 //!
-//! Requires MongoDB on `MONGODB_URI` (default `root:example@localhost:27017`).
-//! The test creates a temp directory under `/tmp/ingest-inttest-download-*`
-//! and cleans it up at the end.
+//! MongoDB + Redis come from `common::infra()` (testcontainers, or
+//! `MONGODB_URI`/`REDIS_URI` env override). The test creates a temp
+//! directory under `/tmp/ingest-inttest-download-*` and cleans it up at
+//! the end.
+
+mod common;
 
 use std::path::PathBuf;
 
 use bytes::Bytes;
+use common::Infra;
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use futures_util::StreamExt;
@@ -44,12 +48,6 @@ chunk_size = "128MB"
 temp_dir = "/tmp/ingest-inttest"
 "#;
 
-fn mongo_uri() -> String {
-    std::env::var("MONGODB_URI").unwrap_or_else(|_| {
-        "mongodb://root:example@localhost:27017/ingestion?authSource=admin".into()
-    })
-}
-
 fn sha256_hex(data: &[u8]) -> String {
     let mut h = Sha256::new();
     h.update(data);
@@ -63,7 +61,9 @@ async fn gzip_to_path(path: &PathBuf, bytes: &[u8]) {
     enc.finish().unwrap();
 }
 
-async fn start_test_server() -> (
+async fn start_test_server(
+    infra: &Infra,
+) -> (
     IngestServiceClient<Channel>,
     oneshot::Sender<()>,
     TempDir,
@@ -78,8 +78,8 @@ async fn start_test_server() -> (
     // Build a minimal AppConfig for Services::build
     let config = AppConfig::from_worker_args(
         toml_config.clone(),
-        "redis://localhost:6379".into(),
-        mongo_uri(),
+        infra.redis_uri.clone(),
+        infra.mongo_uri.clone(),
         None,
     );
 
@@ -114,7 +114,8 @@ async fn start_test_server() -> (
 
 #[tokio::test]
 async fn download_file_non_chunked_roundtrip() {
-    let (mut client, _shutdown, _tmp, _toml) = start_test_server().await;
+    let infra = common::infra().await;
+    let (mut client, _shutdown, _tmp, _toml) = start_test_server(&infra).await;
 
     // Distinct payload from the chunked test to avoid races on the
     // shared `files_metadata` document when tests run concurrently.
@@ -142,7 +143,7 @@ async fn download_file_non_chunked_roundtrip() {
     };
 
     // Insert directly into Mongo so the server can find it.
-    let mongo = ingest_core::MongoService::new(&mongo_uri(), 1, 4)
+    let mongo = ingest_core::MongoService::new(&infra.mongo_uri, 1, 4)
         .await
         .expect("mongo");
     mongo.insert_test_metadata(&metadata).await.expect("insert");
@@ -186,7 +187,8 @@ async fn download_file_non_chunked_roundtrip() {
 
 #[tokio::test]
 async fn download_file_chunked_gzip_roundtrip() {
-    let (mut client, _shutdown, _tmp, _toml) = start_test_server().await;
+    let infra = common::infra().await;
+    let (mut client, _shutdown, _tmp, _toml) = start_test_server(&infra).await;
 
     let payload: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
     let file_hash = sha256_hex(&payload);
@@ -241,7 +243,7 @@ async fn download_file_chunked_gzip_roundtrip() {
         update_date: None,
     };
 
-    let mongo = ingest_core::MongoService::new(&mongo_uri(), 1, 4)
+    let mongo = ingest_core::MongoService::new(&infra.mongo_uri, 1, 4)
         .await
         .expect("mongo");
     mongo.insert_test_metadata(&metadata).await.expect("insert");

@@ -1,14 +1,10 @@
-use std::env;
+mod common;
 
 use chrono::Utc;
 use ingest_core::handlers::jobs::JobKind;
 use ingest_core::job::{FileJob, FileJobSpec, JobStatus};
 use ingest_core::services::redis::{RedisService, compute_shard, shard_key};
 use url::Url;
-
-fn redis_uri() -> String {
-    env::var("REDIS_URI").unwrap_or_else(|_| "redis://localhost:6379".into())
-}
 
 fn make_file_job(id: &str, priority: i32) -> FileJob {
     let spec = FileJobSpec {
@@ -50,10 +46,11 @@ fn enqueue_and_verify_shard(job: &FileJob, shard_count: u32) {
 /// regardless of which worker_id (and therefore which shard) we pass in.
 #[tokio::test]
 async fn dequeue_crosses_all_shards() {
-    let redis = match RedisService::new(&redis_uri(), 3600, 3, vec![5, 30, 120]) {
+    let infra = common::infra().await;
+    let redis = match RedisService::new(&infra.redis_uri, 3600, 3, vec![5, 30, 120]) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("SKIP: cannot connect to Redis at {}: {e}", redis_uri());
+            eprintln!("SKIP: cannot connect to Redis at {}: {e}", infra.redis_uri);
             return;
         }
     };
@@ -111,10 +108,11 @@ async fn dequeue_crosses_all_shards() {
 /// A worker with a different worker_id also pops from all shards.
 #[tokio::test]
 async fn dequeue_worker_id_does_not_constrain_shards() {
-    let redis = match RedisService::new(&redis_uri(), 3600, 3, vec![5, 30, 120]) {
+    let infra = common::infra().await;
+    let redis = match RedisService::new(&infra.redis_uri, 3600, 3, vec![5, 30, 120]) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("SKIP: cannot connect to Redis at {}: {e}", redis_uri());
+            eprintln!("SKIP: cannot connect to Redis at {}: {e}", infra.redis_uri);
             return;
         }
     };
@@ -159,10 +157,11 @@ async fn dequeue_worker_id_does_not_constrain_shards() {
 /// Dequeue returns None (empty) when the pending queue is exhausted.
 #[tokio::test]
 async fn dequeue_returns_none_when_empty() {
-    let redis = match RedisService::new(&redis_uri(), 3600, 3, vec![5, 30, 120]) {
+    let infra = common::infra().await;
+    let redis = match RedisService::new(&infra.redis_uri, 3600, 3, vec![5, 30, 120]) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("SKIP: cannot connect to Redis at {}: {e}", redis_uri());
+            eprintln!("SKIP: cannot connect to Redis at {}: {e}", infra.redis_uri);
             return;
         }
     };
