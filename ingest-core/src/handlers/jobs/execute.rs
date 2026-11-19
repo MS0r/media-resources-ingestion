@@ -4,14 +4,17 @@ use chrono::Utc;
 use crate::{
     AppConfig,
     error::{AuthResolutionError, JobErrorOutcome},
-    models::{ChunkRef, CompressionOverride, GenericCompressionStrategy, Resource},
+    job::{ChunkJob, FileJob, FileJobSpec, JobEffect, JobOutcome, JobStatus},
+    models::{ChunkRef, CompressionOverride, GenericCompressionStrategy},
     services::mongo::UpsertResult,
     storage::{Provider, ProviderCache},
 };
 
 use super::{
-    ChunkJob, FileJob, JobContext, JobOutcome, JobStatus,
-    compression::{compress_generic_local, generic_compression_extension},
+    JobContext,
+    compression::{
+        compress_generic_local, generic_compression_extension, generic_compression_name,
+    },
     download::{
         StreamResult, download_range_chunk, download_to_temp, extract_file_job, initiate_download,
         initiate_head, initiate_range_download,
@@ -37,6 +40,8 @@ fn parse_chunk_size(s: &str) -> u64 {
     }
 }
 
+/// Pick a sensible default chunk compression strategy based on the source MIME type.
+///
 /// Resolve the source auth token for a resource.
 ///
 /// Returns `Some(token)` if a dynamic OAuth token should be used,
@@ -45,24 +50,24 @@ fn parse_chunk_size(s: &str) -> u64 {
 /// For S3 sources, this generates a pre-signed URL and stores it in the
 /// returned data so the caller can replace the resource URL.
 pub(crate) async fn resolve_source_auth(
-    resource: &Resource,
+    resource: &FileJobSpec,
     provider_cache: &ProviderCache,
 ) -> Result<Option<String>, AuthResolutionError> {
     let config = resource.config.as_ref();
     let source_auth = config
-        .and_then(|c| c.source_auth.as_deref())
-        .unwrap_or("auto");
+        .and_then(|c| c.source_auth)
+        .unwrap_or(crate::domain::SourceAuth::Auto);
 
-    let provider = if source_auth == "auto" {
-        ProviderCache::detect_from_url(resource.url.as_str())
-    } else if source_auth == "headers" || source_auth == "none" || source_auth == "auto" {
-        None
-    } else {
-        Some(source_auth)
-    };
+    let resolved = source_auth.resolve_for_url(&resource.url);
 
-    match provider {
-        Some(name @ ("gdrive" | "dropbox")) => {
+    match resolved {
+        crate::domain::SourceAuth::None | crate::domain::SourceAuth::Headers => Ok(None),
+        crate::domain::SourceAuth::Gdrive | crate::domain::SourceAuth::Dropbox => {
+            let name = match resolved {
+                crate::domain::SourceAuth::Gdrive => "gdrive",
+                crate::domain::SourceAuth::Dropbox => "dropbox",
+                _ => unreachable!(),
+            };
             let tp = provider_cache
                 .get_token_provider(name)
                 .ok_or_else(|| AuthResolutionError::Unregistered(name.to_string()))?;
@@ -75,7 +80,7 @@ pub(crate) async fn resolve_source_auth(
                 })?;
             Ok(Some(token))
         }
-        Some("s3") => {
+        crate::domain::SourceAuth::S3Presigned => {
             // S3 source: generate a pre-signed URL for the full object.
             // Detection from URL would require parsing bucket/key which is complex.
             // For now, require explicit source_auth: s3 and use env vars.
@@ -88,7 +93,7 @@ pub(crate) async fn resolve_source_auth(
                 Err(e) => Err(AuthResolutionError::S3Presign(e)),
             }
         }
-        None | Some(_) => Ok(None),
+        crate::domain::SourceAuth::Auto => unreachable!("resolve_for_url replaces Auto"),
     }
 }
 
@@ -138,7 +143,7 @@ fn extract_s3_url(auth: &str) -> &str {
 
 /// Extract auth headers from resource config, falling back to resolved token.
 fn resolve_auth_for_chunks(
-    resource: &Resource,
+    resource: &FileJobSpec,
     resolved_token: Option<&str>,
 ) -> (Option<String>, Option<String>) {
     // If we have a dynamically resolved token, use it
@@ -165,16 +170,22 @@ async fn spawn_chunk_jobs(
     total_size: u64,
     config: &AppConfig,
     resolved_auth: Option<&str>,
+    mime: &str,
 ) -> Result<Vec<ChunkJob>, JobErrorOutcome> {
     let chunk_size = match &file_job.chunk_size {
         Some(s) => parse_chunk_size(s),
         None => parse_chunk_size(&config.chunk_size),
     };
     let total_chunks = ((total_size + chunk_size - 1) / chunk_size) as u32;
-    let resource = &file_job.resource;
+    let resource = &file_job.spec;
 
     let (auth, cookie) = resolve_auth_for_chunks(resource, resolved_auth);
 
+    // Always set a compression_strategy. If the user didn't pick one
+    // explicitly, fall back to a MIME-aware default (see
+    // `default_chunk_compression`). This guarantees the stored manifest
+    // has a non-null `compression` field, so reassembly never silently
+    // falls through to the passthrough branch.
     let compression_strategy = resource
         .config
         .as_ref()
@@ -182,7 +193,8 @@ async fn spawn_chunk_jobs(
         .and_then(|co| match co {
             CompressionOverride::Generic(s) => Some(s.clone()),
             _ => None,
-        });
+        })
+        .unwrap_or_else(|| crate::compression::plan::default_chunk_compression(mime));
 
     let resource_name = resource.name.clone().unwrap_or_else(|| {
         filename_from_url(&resource.url)
@@ -190,7 +202,7 @@ async fn spawn_chunk_jobs(
             .unwrap_or_else(|| "file".to_string())
     });
 
-    let base_path = resource
+    let base_path: &str = resource
         .dest
         .as_ref()
         .and_then(|d| d.path.as_ref())
@@ -204,6 +216,7 @@ async fn spawn_chunk_jobs(
         .and_then(|d| d.provider.clone())
         .unwrap_or(Provider::Local);
 
+    let now = Utc::now();
     let build_chunk = |i: u32| {
         let offset_start = (i as u64) * chunk_size;
         let offset_end = ((i as u64 + 1) * chunk_size - 1).min(total_size.saturating_sub(1));
@@ -228,8 +241,8 @@ async fn spawn_chunk_jobs(
             priority: file_job.priority as i64,
             status: JobStatus::Pending,
             retry_count: 0,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            created_at: now,
+            updated_at: now,
             chunk_hash: None,
             error: None,
             url: chunk_url,
@@ -239,11 +252,12 @@ async fn spawn_chunk_jobs(
             storage: dest_provider.clone(),
             total_chunks,
             total_file_size: total_size,
-            compression_strategy: compression_strategy.clone(),
+            compression_strategy: Some(compression_strategy.clone()),
         }
     };
 
-    let chunks: Vec<ChunkJob> = (0..total_chunks).map(build_chunk).collect();
+    let mut chunks: Vec<ChunkJob> = Vec::with_capacity(total_chunks as usize);
+    chunks.extend((0..total_chunks).map(build_chunk));
 
     tracing::info!(
         file_job_id = %file_job._id,
@@ -261,23 +275,20 @@ async fn spawn_chunk_jobs(
 impl super::JobHandler for FileJobHandler {
     async fn execute(&self, ctx: &JobContext) -> Result<JobOutcome, JobErrorOutcome> {
         let file_job = extract_file_job(&ctx.job)?;
-        let resource = &file_job.resource;
+        let resource = &file_job.spec;
         let threshold_bytes = ctx.config.compression_threshold_mb * 1024 * 1024;
         let pr = ctx.progress.as_ref();
-
-        // ── Phase 0: Use pre-resolved source auth ─────────────────────────
-        let auth_token = ctx.auth_token.clone();
 
         // ── Phase 1: HEAD preflight ──────────────────────────────────────
         if let Some(pr) = pr {
             pr.report("preflight", 1, Some(7), None).await;
         }
-        let (head_size, head_ranges) =
-            match initiate_head(resource, &ctx.http_client, auth_token.as_deref()).await {
-                Ok(info) => (info.content_length, info.accept_ranges),
+        let (head_size, head_ranges, head_mime) =
+            match initiate_head(resource, &ctx.http_client, ctx.auth_token.as_deref()).await {
+                Ok(info) => (info.content_length, info.accept_ranges, info.mime_type),
                 Err(e) => {
                     tracing::warn!(error = %e, "HEAD preflight failed, falling back to GET");
-                    (None, false)
+                    (None, false, "application/octet-stream".to_string())
                 }
             };
 
@@ -288,10 +299,15 @@ impl super::JobHandler for FileJobHandler {
                         pr.report("splitting", 2, Some(7), Some("Spawning chunk jobs"))
                             .await;
                     }
-                    let chunks =
-                        spawn_chunk_jobs(file_job, size, &ctx.config, auth_token.as_deref())
-                            .await?;
-                    return Ok(JobOutcome::SpawnedChunks(chunks));
+                    let chunks = spawn_chunk_jobs(
+                        file_job,
+                        size,
+                        &ctx.config,
+                        ctx.auth_token.as_deref(),
+                        &head_mime,
+                    )
+                    .await?;
+                    return Ok(JobOutcome::Done(JobEffect::ChunksSpawned { chunks }));
                 }
                 tracing::warn!(
                     "File {} bytes exceeds threshold but server doesn't support Range — downloading full",
@@ -305,7 +321,7 @@ impl super::JobHandler for FileJobHandler {
             pr.report("download", 2, Some(7), None).await;
         }
         let (response, mut download) =
-            initiate_download(resource, &ctx.http_client, auth_token.as_deref()).await?;
+            initiate_download(resource, &ctx.http_client, ctx.auth_token.as_deref()).await?;
 
         let resp_content_length = response.content_length();
         let resp_accept_ranges = response
@@ -322,10 +338,15 @@ impl super::JobHandler for FileJobHandler {
                     pr.report("splitting", 2, Some(7), Some("Spawning chunk jobs"))
                         .await;
                 }
-                let chunks =
-                    spawn_chunk_jobs(file_job, resp_size, &ctx.config, auth_token.as_deref())
-                        .await?;
-                return Ok(JobOutcome::SpawnedChunks(chunks));
+                let chunks = spawn_chunk_jobs(
+                    file_job,
+                    resp_size,
+                    &ctx.config,
+                    ctx.auth_token.as_deref(),
+                    &download.mime_type,
+                )
+                .await?;
+                return Ok(JobOutcome::Done(JobEffect::ChunksSpawned { chunks }));
             }
         }
 
@@ -360,10 +381,15 @@ impl super::JobHandler for FileJobHandler {
                 );
 
                 if resp_accept_ranges {
-                    let chunks =
-                        spawn_chunk_jobs(file_job, byte_count, &ctx.config, auth_token.as_deref())
-                            .await?;
-                    return Ok(JobOutcome::SpawnedChunks(chunks));
+                    let chunks = spawn_chunk_jobs(
+                        file_job,
+                        byte_count,
+                        &ctx.config,
+                        ctx.auth_token.as_deref(),
+                        &download.mime_type,
+                    )
+                    .await?;
+                    return Ok(JobOutcome::Done(JobEffect::ChunksSpawned { chunks }));
                 } else {
                     return Err(JobErrorOutcome::Fatal(format!(
                         "File exceeds {} MB threshold (streamed {} bytes) but server does not \
@@ -382,8 +408,8 @@ impl super::JobHandler for FileJobHandler {
         }
         match ctx.db.upsert_file_metadata(&hash_hex).await? {
             UpsertResult::Duplicate(existing) => {
-                let outcome = handle_duplicate(&temp_path, &existing.file_hash).await?;
-                return Ok(outcome);
+                handle_duplicate(&temp_path, &existing.file_hash).await?;
+                return Ok(JobOutcome::Done(JobEffect::DuplicateSkipped));
             }
             UpsertResult::Inserted => {}
         }
@@ -411,13 +437,16 @@ impl super::JobHandler for ChunkJobHandler {
 
         let auth = chunk_job.authorization.as_deref();
         let cookie = chunk_job.cookie.as_deref();
+        let headers = crate::models::Headers {
+            authorization: auth.map(|s| s.to_string()),
+            cookie: cookie.map(|s| s.to_string()),
+        };
 
         let (response, mime) = initiate_range_download(
             &chunk_job.url,
             chunk_job.offset_start,
             chunk_job.offset_end,
-            auth,
-            cookie,
+            &headers,
             &ctx.http_client,
         )
         .await?;
@@ -427,21 +456,44 @@ impl super::JobHandler for ChunkJobHandler {
             download_range_chunk(response, &ctx.config.temp_dir, &chunk_label, &chunk_job._id)
                 .await?;
 
-        // Compress chunk (default gzip if no strategy specified)
+        // Determine the compression strategy for the chunk
         let strategy = chunk_job
             .compression_strategy
             .clone()
-            .unwrap_or(GenericCompressionStrategy::Gzip);
+            .unwrap_or_else(|| crate::compression::plan::default_chunk_compression(&mime));
 
-        let (compressed_path, compressed_size) = compress_generic_local(
+        let (compressed_path, compressed_size, applied_strategy) = match compress_generic_local(
             &temp_path,
             &chunk_label,
             &strategy,
             ctx.config.compression_quality,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         )
-        .await?;
+        .await
+        {
+            Ok(result) => result,
+            Err(e) => {
+                tracing::warn!(
+                    job_id = %chunk_job._id,
+                    error = %e,
+                    "Chunk compression failed: keeping original bytes"
+                );
+                let original_size = std::fs::metadata(&temp_path)
+                    .map(|m| m.len())
+                    .unwrap_or(byte_count);
+                (
+                    temp_path.clone(),
+                    original_size,
+                    GenericCompressionStrategy::OriginalFormat,
+                )
+            }
+        };
 
-        let ext = generic_compression_extension(&strategy);
+        // Record the actually-applied strategy so finalize and reassembly
+        // see the real choice (not the requested one).
+        // B4a: this is also written to ChunkRef.compression at finalize.
+
+        let ext = generic_compression_extension(&applied_strategy);
         let storage_path = if ext.is_empty() {
             chunk_job.dest_path.clone()
         } else {
@@ -467,11 +519,12 @@ impl super::JobHandler for ChunkJobHandler {
             size_original: byte_count,
             size_compressed: Some(compressed_size),
             storage_path,
+            compression: generic_compression_name(&applied_strategy).to_string(),
             offset_start: chunk_job.offset_start,
             offset_end: chunk_job.offset_end,
         };
 
-        Ok(JobOutcome::ChunkCompleted(chunk_ref, mime))
+        Ok(JobOutcome::Done(JobEffect::ChunkStored { chunk_ref, mime }))
     }
 }
 
@@ -519,6 +572,54 @@ mod tests {
         ));
         assert!(!is_s3_presigned("Bearer token123"));
         assert!(!is_s3_presigned(""));
+    }
+
+    #[test]
+    fn test_default_chunk_compression_passthrough_for_compressed_formats() {
+        // Already-compressed formats must use OriginalFormat to avoid
+        // the gzip-on-incompressible-data growth bug.
+        for mime in [
+            "application/x-rar",
+            "application/zip",
+            "application/x-7z-compressed",
+            "application/x-bzip2",
+            "application/x-xz",
+            "application/x-lz4",
+            "application/pdf",
+            "video/mp4",
+            "video/x-matroska",
+            "video/webm",
+            "audio/mpeg",
+            "audio/flac",
+            "image/jpeg",
+            "image/png",
+            "image/webp",
+        ] {
+            assert_eq!(
+                crate::compression::plan::default_chunk_compression(mime),
+                GenericCompressionStrategy::OriginalFormat,
+                "expected OriginalFormat for {mime}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_default_chunk_compression_gzip_for_text() {
+        // Text-like and unknown formats should default to gzip.
+        for mime in [
+            "text/plain",
+            "text/html",
+            "application/json",
+            "application/xml",
+            "application/octet-stream",
+            "",
+        ] {
+            assert_eq!(
+                crate::compression::plan::default_chunk_compression(mime),
+                GenericCompressionStrategy::Gzip,
+                "expected Gzip for {mime}"
+            );
+        }
     }
 
     #[test]

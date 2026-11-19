@@ -1,7 +1,8 @@
 use crate::{
+    domain::JobStatusFilter,
     error::ToolError,
-    handlers::jobs::{Batch, ChunkJob, FileJob, JobStatus},
-    models::{JobStatusFilter, Metadata},
+    job::{Batch, ChunkJob, FileJob, JobStatus},
+    models::Metadata,
 };
 use bb8::Pool;
 use bb8_mongodb::MongodbConnectionManager;
@@ -12,6 +13,7 @@ use mongodb::{
     bson::{DateTime, doc, serialize_to_bson},
     options::{ClientOptions, IndexOptions},
 };
+use std::future::Future;
 use std::time::Duration;
 
 type MongoPool = Pool<MongodbConnectionManager>;
@@ -27,7 +29,7 @@ pub struct MongoService {
 }
 
 impl MongoService {
-    pub async fn new(uri: &str) -> Result<Self, bb8_mongodb::Error> {
+    pub async fn new(uri: &str, pool_min: u32, pool_max: u32) -> Result<Self, bb8_mongodb::Error> {
         let client_options = ClientOptions::parse(uri).await?;
 
         let client = Client::with_options(client_options.clone())?;
@@ -72,8 +74,22 @@ impl MongoService {
 
         chunks_jobs_coll.create_index(parent_job_id_index).await?;
 
+        // TTL: auto-delete chunk job rows after 7 days
+        let chunk_ttl_index = IndexModel::builder()
+            .keys(doc! { "updated_at": 1 })
+            .options(
+                IndexOptions::builder()
+                    .expire_after(Duration::from_secs(7 * 24 * 3600))
+                    .build(),
+            )
+            .build();
+
+        chunks_jobs_coll.create_index(chunk_ttl_index).await?;
+
         let connection_manager = MongodbConnectionManager::new(client_options, "ingestion");
         let pool = Pool::builder()
+            .min_idle(Some(pool_min))
+            .max_size(pool_max)
             .connection_timeout(Duration::from_secs(10))
             .idle_timeout(Some(Duration::from_secs(60)))
             .max_lifetime(Some(Duration::from_secs(300)))
@@ -92,15 +108,48 @@ impl MongoService {
         self.pool.get().await
     }
 
+    pub async fn with_collection<T, F, R>(&self, name: &str, f: F) -> Result<R, ToolError>
+    where
+        T: Send + Sync + 'static,
+        F: for<'a> FnOnce(
+            &'a Collection<T>,
+        ) -> std::pin::Pin<
+            Box<dyn Future<Output = Result<R, mongodb::error::Error>> + Send + 'a>,
+        >,
+    {
+        let conn = self.client().await?;
+        let coll: Collection<T> = conn.collection(name);
+        f(&coll).await.map_err(ToolError::MongoError)
+    }
+
     pub async fn complete_job(
         self: &MongoService,
         metadata: Metadata,
         job_id: &str,
     ) -> Result<(), ToolError> {
         let client = self.client().await?;
-        let collection: Collection<Metadata> = client.collection("files_metadata");
-        collection.insert_one(&metadata).await?;
 
+        // Upsert the full metadata. $set (not insert_one) avoids conflicts with
+        // the placeholder created by upsert_file_metadata, and does NOT touch
+        // duplicate_reference_count (which is owned by upsert_file_metadata).
+        let collection: Collection<Metadata> = client.collection("files_metadata");
+        let update = doc! { "$set": {
+            "original_url": metadata.original_url.to_string(),
+            "storage_provider": metadata.storage_provider.to_string(),
+            "storage_path": &metadata.storage_path,
+            "original_file_size": metadata.original_file_size as i64,
+            "compressed_file_size": metadata.compressed_file_size.map(|c| c as i64),
+            "compression_ratio": metadata.compression_ratio,
+            "mime_type": &metadata.mime_type,
+            "chunk_manifest": serialize_to_bson(&metadata.chunk_manifest)?,
+            "upload_date": serialize_to_bson(&metadata.upload_date)?,
+        }};
+        collection
+            .update_one(doc! { "file_hash": &metadata.file_hash }, update)
+            .upsert(true)
+            .await?;
+
+        // FileJob status update -- always runs (idempotent).
         let complete_job = serialize_to_bson(&JobStatus::Completed {
             finished_at: Utc::now(),
         })?;
@@ -116,20 +165,48 @@ impl MongoService {
     }
 
     pub async fn upsert_file_metadata(&self, file_hash: &str) -> Result<UpsertResult, ToolError> {
+        use mongodb::options::{FindOneAndUpdateOptions, ReturnDocument};
+
         let client = self.client().await?;
         let collection: Collection<Metadata> = client.collection("files_metadata");
 
         let filter = doc! { "file_hash": file_hash };
         let update = doc! {
-            "$set" : {
-                "duplicate_reference_count" : 1u32,
-                "update_date" : DateTime::now(),
-            }
+            "$inc": { "duplicate_reference_count": 1i32 },
+            "$set": { "update_date": DateTime::now() },
+            "$setOnInsert": {
+                // Minimal placeholder fields so Metadata deserialization succeeds
+                // when find_one_and_update returns the upserted document.
+                // These are overwritten by complete_job's full metadata update.
+                "original_url": "placeholder://pending",
+                "storage_provider": "local",
+                "storage_path": "",
+                "original_file_size": 0i64,
+                "mime_type": "",
+                "upload_date": DateTime::now(),
+                "duplicate_reference_count": 0i32,
+            },
         };
 
-        match collection.find_one_and_update(filter, update).await? {
-            None => Ok(UpsertResult::Inserted),
-            Some(existing) => Ok(UpsertResult::Duplicate(Box::new(existing))),
+        let opts = FindOneAndUpdateOptions::builder()
+            .upsert(true)
+            .return_document(ReturnDocument::After)
+            .build();
+
+        let doc = collection
+            .find_one_and_update(filter, update)
+            .with_options(opts)
+            .await?
+            .ok_or_else(|| {
+                ToolError::Message(
+                    "find_one_and_update with upsert returned no document".to_string(),
+                )
+            })?;
+
+        if doc.duplicate_reference_count == 1 {
+            Ok(UpsertResult::Inserted)
+        } else {
+            Ok(UpsertResult::Duplicate(Box::new(doc)))
         }
     }
 
@@ -207,15 +284,8 @@ impl MongoService {
 
         let mut filter = doc! {};
         if let Some(status) = filter_status {
-            let status_str = match status {
-                JobStatusFilter::Pending => "status.pending",
-                JobStatusFilter::Running => "status.running",
-                JobStatusFilter::Completed => "status.completed",
-                JobStatusFilter::Failed => "status.failed",
-                JobStatusFilter::Retrying => "status.retrying",
-                JobStatusFilter::Cancelled => "status.cancelled",
-            };
-            filter.insert(status_str, doc! {"$exists" : true});
+            let status_field = status.mongo_field();
+            filter.insert(status_field, doc! {"$exists" : true});
         }
 
         let mut cursor = collection.find(filter).limit(limit as i64).await?;
@@ -332,6 +402,32 @@ impl MongoService {
                 doc! { "_id": job_id },
                 doc! { "$set": { "status": failed_job } },
             )
+            .await?;
+        Ok(())
+    }
+
+    /// Test helper: insert a `Metadata` document directly. Used by
+    /// integration tests that want to seed MongoDB without going
+    /// through the full enqueue/worker pipeline.
+    pub async fn insert_test_metadata(&self, metadata: &Metadata) -> Result<(), ToolError> {
+        let client = self.client().await?;
+        let collection: Collection<Metadata> = client.collection("files_metadata");
+        // Drop any existing entry with the same hash to make the test
+        // idempotent across runs.
+        let _ = collection
+            .delete_one(doc! { "file_hash": &metadata.file_hash })
+            .await;
+        collection.insert_one(metadata).await?;
+        Ok(())
+    }
+
+    /// Test helper: remove a `Metadata` document by hash. Companion
+    /// to `insert_test_metadata`.
+    pub async fn delete_test_metadata(&self, file_hash: &str) -> Result<(), ToolError> {
+        let client = self.client().await?;
+        let collection: Collection<Metadata> = client.collection("files_metadata");
+        collection
+            .delete_one(doc! { "file_hash": file_hash })
             .await?;
         Ok(())
     }

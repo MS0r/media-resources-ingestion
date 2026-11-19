@@ -28,5 +28,5 @@ async fn main() -> Result<(), ToolError> {
 
     let toml_path = env_var("INGEST_CONFIG").unwrap_or_else(|_| ".ingest/config.toml".into());
 
-    ingest_core::server::serve(addr, std::path::Path::new(&toml_path)).await
+    ingest_core::grpc::serve(addr, std::path::Path::new(&toml_path)).await
 }

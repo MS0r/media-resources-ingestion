@@ -1,18 +1,26 @@
-mod compression;
-mod download;
-mod execute;
+//! Job execution layer — handler trait, context, envelope, plus the
+//! download / compression / handle / execute implementations.
+//!
+//! Pure data types live in `crate::job`; this module is the glue between
+//! those types, the storage layer, and the scheduler.
+
+pub mod compression;
+pub mod download;
+pub mod execute;
 mod handle;
-mod types;
+
+pub(crate) use compression::decompress_generic_reader;
 
 pub use execute::*;
-pub use types::*;
 
 use async_trait::async_trait;
 use std::{path::PathBuf, sync::Arc};
 
 use crate::{
     error::JobErrorOutcome,
-    models::{AppConfig, ChunkRef, Metadata},
+    job::{ChunkJob, FileJob, JobOutcome, JobStatus},
+    models::AppConfig,
+    services::heartbeat::HeartbeatSupervisor,
     services::redis::ProgressReporter,
     services::{mongo::MongoService, redis::RedisService},
     storage::{Provider, ProviderCache, StorageProvider},
@@ -37,6 +45,7 @@ pub struct JobContext {
     pub progress: Option<ProgressReporter>,
     pub http_client: Arc<wreq::Client>,
     pub auth_token: Option<String>,
+    pub heartbeat: Arc<HeartbeatSupervisor>,
 }
 
 impl JobContext {
@@ -48,9 +57,10 @@ impl JobContext {
         http_client: Arc<wreq::Client>,
         auth_token: Option<String>,
         provider_cache: &ProviderCache,
+        heartbeat: Arc<HeartbeatSupervisor>,
     ) -> Self {
         let progress = Some(ProgressReporter::new(job._id.clone(), (*redis).clone()));
-        let storage = if let Some(dest) = &job.resource.dest
+        let storage = if let Some(dest) = &job.spec.dest
             && let Some(provider) = &dest.provider
         {
             provider_cache.get(provider)
@@ -67,6 +77,7 @@ impl JobContext {
             progress,
             http_client,
             auth_token,
+            heartbeat,
         }
     }
 
@@ -77,6 +88,7 @@ impl JobContext {
         config: Arc<AppConfig>,
         http_client: Arc<wreq::Client>,
         provider_cache: &ProviderCache,
+        heartbeat: Arc<HeartbeatSupervisor>,
     ) -> Self {
         Self {
             storage: provider_cache.get(&job.storage),
@@ -87,6 +99,7 @@ impl JobContext {
             progress: None,
             http_client,
             auth_token: None,
+            heartbeat,
         }
     }
 
@@ -105,13 +118,9 @@ impl JobContext {
     }
 }
 
-pub enum JobOutcome {
-    Completed(Metadata),
-    Duplicated,
-    SpawnedChunks(Vec<ChunkJob>),
-    ChunkCompleted(ChunkRef, String),
-}
-
+/// Discriminator stored in Redis to know whether a `jobs:state:<id>` row
+/// points at a file job or a chunk job (the scheduler needs this to
+/// decide which handler to dispatch).
 #[derive(Clone, Debug, PartialEq)]
 pub enum JobKind {
     File,
@@ -121,6 +130,14 @@ pub enum JobKind {
 pub(crate) fn expand_path(path: &str, filename: &str) -> PathBuf {
     let expanded_path = shellexpand::tilde(path).to_string();
     PathBuf::from(expanded_path).join(filename)
+}
+
+/// Returns `true` if the given `JobStatus` represents a terminal outcome.
+pub fn is_terminal_status(status: &JobStatus) -> bool {
+    matches!(
+        status,
+        JobStatus::Completed { .. } | JobStatus::Failed { .. } | JobStatus::Cancelled
+    )
 }
 
 #[cfg(test)]

@@ -1,11 +1,78 @@
 use crate::{
+    domain::JobStatus,
     error::ToolError,
-    handlers::jobs::{Batch, ChunkJob, FileJob, JobKind},
-    models::{ChunkRef, JobStatusFilter, ProgressEvent, ProgressJobType, ProgressStatus},
+    handlers::jobs::JobKind,
+    job::{Batch, ChunkJob, FileJob},
+    models::{ChunkRef, ProgressEvent, ProgressJobType, ProgressStatus},
     services::mongo::MongoService,
 };
+use crc32fast::Hasher;
 use futures_util::StreamExt;
 use redis::{AsyncCommands, Client, aio::MultiplexedConnection};
+use std::{str::FromStr, time::Duration};
+
+const MAX_REDIS_RETRIES: usize = 3;
+const REDIS_BACKOFF_BASE_MS: u64 = 100;
+
+/// Retry a Redis operation with exponential backoff.
+/// Used to absorb transient connection drops / network blips.
+async fn with_retry<F, Fut, T>(op_name: &'static str, mut f: F) -> Result<T, redis::RedisError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, redis::RedisError>>,
+{
+    let mut attempt = 0;
+    loop {
+        match f().await {
+            Ok(v) => {
+                if attempt > 0 {
+                    tracing::debug!(op = op_name, attempt, "Redis op succeeded after retry");
+                }
+                return Ok(v);
+            }
+            Err(e) if attempt < MAX_REDIS_RETRIES => {
+                let backoff_ms = REDIS_BACKOFF_BASE_MS * (1 << attempt);
+                tracing::warn!(
+                    op = op_name,
+                    attempt,
+                    backoff_ms,
+                    error = %e,
+                    "Redis op failed, retrying"
+                );
+                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                attempt += 1;
+            }
+            Err(e) => {
+                tracing::error!(op = op_name, error = %e, "Redis op failed after retries");
+                return Err(e);
+            }
+        }
+    }
+}
+
+pub fn compute_shard(key: &str, shard_count: u32) -> u32 {
+    let mut h = Hasher::new();
+    h.update(key.as_bytes());
+    h.finalize() % shard_count
+}
+
+pub fn shard_key(shard: u32) -> String {
+    format!("jobs:pending:{{{shard}}}")
+}
+
+pub fn derive_worker_id() -> u32 {
+    if let Ok(s) = std::env::var("INGEST_WORKER_ID") {
+        if let Ok(n) = s.parse::<u32>() {
+            return n;
+        }
+    }
+    let hostname = std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown-host".to_string());
+    let pid = std::process::id();
+    let mut h = Hasher::new();
+    h.update(hostname.as_bytes());
+    h.update(&pid.to_le_bytes());
+    h.finalize()
+}
 
 #[derive(Clone)]
 pub struct RedisService {
@@ -32,7 +99,18 @@ impl RedisService {
     }
 
     async fn get_connection(&self) -> Result<MultiplexedConnection, redis::RedisError> {
-        self.client.get_multiplexed_async_connection().await
+        with_retry("get_connection", || {
+            self.client.get_multiplexed_async_connection()
+        })
+        .await
+    }
+
+    /// Flush the entire Redis database. **Test-only helper** — do not call in
+    /// production code.
+    pub async fn flush_db(&self) -> Result<(), ToolError> {
+        let mut conn = self.get_connection().await?;
+        let _: String = redis::cmd("FLUSHDB").query_async(&mut conn).await?;
+        Ok(())
     }
 
     /// Enqueues a batch record into `batches:state:<id>` as a serialised JSON
@@ -51,7 +129,8 @@ impl RedisService {
     /// Pushes a file-level job onto `jobs:pending` (sorted set, score =
     /// priority). The member is encoded as `"file:<job_id>"` so that
     /// `dequeue_job` can recover the kind without an extra lookup.
-    pub async fn enqueue_file_job(&self, job: &FileJob) -> Result<(), ToolError> {
+    /// Shard is computed from `job._id`.
+    pub async fn enqueue_file_job(&self, job: &FileJob, shard_count: u32) -> Result<(), ToolError> {
         let mut conn = self.get_connection().await?;
 
         // Persist full struct — worker needs everything to execute without Mongo
@@ -62,18 +141,24 @@ impl RedisService {
             .hset(&state_key, "retry_count", job.retry_count)
             .await?;
 
-        // Add to priority queue
+        // Add to priority queue — sharded by job_id
+        let shard = compute_shard(&job._id, shard_count);
         let member = format!("file:{}", job._id);
         let _: () = conn
-            .zadd("jobs:pending", &member, job.priority as f64)
+            .zadd(shard_key(shard), &member, job.priority as f64)
             .await?;
 
-        tracing::debug!(job_id = %job._id, priority = job.priority, "File job enqueued");
+        tracing::debug!(job_id = %job._id, priority = job.priority, shard, "File job enqueued");
         Ok(())
     }
 
     /// Enqueue a chunk job: same pattern, different kind prefix.
-    pub async fn enqueue_chunk_job(&self, job: &ChunkJob) -> Result<(), ToolError> {
+    /// Shard is computed from `job.parent_job_id` for intra-file locality.
+    pub async fn enqueue_chunk_job(
+        &self,
+        job: &ChunkJob,
+        shard_count: u32,
+    ) -> Result<(), ToolError> {
         let mut conn = self.get_connection().await?;
 
         let state_key = format!("jobs:state:{}", job._id);
@@ -82,10 +167,15 @@ impl RedisService {
         let _: () = conn
             .hset(&state_key, "retry_count", job.retry_count)
             .await?;
+        let _: () = conn
+            .hset(&state_key, "parent_job_id", &job.parent_job_id)
+            .await?;
 
+        // Shard by parent_job_id so all chunks from the same file land on one shard
+        let shard = compute_shard(&job.parent_job_id, shard_count);
         let member = format!("chunk:{}", job._id);
         let _: () = conn
-            .zadd("jobs:pending", &member, job.priority as f64)
+            .zadd(shard_key(shard), &member, job.priority as f64)
             .await?;
 
         tracing::debug!(job_id = %job._id, priority = job.priority, "Chunk job enqueued");
@@ -94,7 +184,7 @@ impl RedisService {
 
     /// Fetch the full job state from Redis by ID.
     /// Returns the deserialized kind + payload so ContextFactory can build the context.
-    pub async fn get_job(&self, job_id: &str) -> Result<(JobKind, JobStatusFilter, u8), ToolError> {
+    pub async fn get_job(&self, job_id: &str) -> Result<(JobKind, JobStatus, u8), ToolError> {
         let mut conn = self.get_connection().await?;
         let state_key = format!("jobs:state:{job_id}");
 
@@ -112,19 +202,14 @@ impl RedisService {
             other => return Err(format!("Unknown job kind '{other}' for job {job_id}").into()),
         };
 
-        let job_status = match status.as_str() {
-            "pending" => JobStatusFilter::Pending,
-            "running" => JobStatusFilter::Running,
-            "completed" => JobStatusFilter::Completed,
-            "retrying" => JobStatusFilter::Retrying,
-            "failed" => JobStatusFilter::Failed,
-            other => return Err(format!("Unknown job status '{other}' for job {job_id}").into()),
-        };
+        let job_status =
+            JobStatus::from_str(&status).map_err(|e| format!("{e} for job {job_id}"))?;
 
         Ok((job_kind, job_status, retry_count))
     }
 
-    /// Dequeues the highest-priority job from `jobs:pending` (ZPOPMAX).
+    /// Dequeues the highest-priority job from across all sharded
+    /// `jobs:pending:{N}` sets (variadic BZPOPMAX over every shard).
     ///
     /// The job ID is stored in the sorted set with a prefix that encodes its
     /// kind: `"file:<uuid>"` or `"chunk:<uuid>"`. This avoids a second Redis
@@ -134,14 +219,23 @@ impl RedisService {
     /// loop will simply spin and try again.
     pub async fn dequeue_job(
         &self,
-        n_worker: usize,
+        worker_id: u32,
+        shard_count: u32,
     ) -> Result<Option<(JobKind, String)>, ToolError> {
         let mut conn = self.get_connection().await?;
 
-        // BZPOPMAX blocks up to 2 s; returns (key, member, score) or nothing.
-        let result: (String, String, f64) = conn.bzpopmax("jobs:pending", 2.0).await?;
+        let keys: Vec<String> = (0..shard_count).map(shard_key).collect();
 
-        let (_, raw_id, _score) = result;
+        // BZPOPMAX blocks up to 2 s; returns (key, member, score) or nil.
+        let result: Option<(String, String, f64)> = redis::cmd("BZPOPMAX")
+            .arg(&keys)
+            .arg(2.0)
+            .query_async(&mut conn)
+            .await?;
+
+        let Some((_key, raw_id, _score)) = result else {
+            return Ok(None);
+        };
 
         // Decode the "kind:uuid" member into its parts.
         let (kind, job_id) = parse_job_member(&raw_id)
@@ -154,7 +248,7 @@ impl RedisService {
         // Record it in a TTL-bearing key so the scheduler can track live workers
         // and stale entries auto-cleanup on worker crash.
         let running_key = format!("jobs:running:{job_id}");
-        let _: () = conn.set(&running_key, format!("worker{n_worker}")).await?;
+        let _: () = conn.set(&running_key, format!("worker{worker_id}")).await?;
         let _: () = conn
             .expire(&running_key, self.running_job_ttl_secs as i64)
             .await?;
@@ -173,8 +267,61 @@ impl RedisService {
         Ok(())
     }
 
+    /// Read the `parent_job_id` from a chunk's state hash. Used by the
+    /// scheduler to re-enqueue a chunk after a context-build miss without
+    /// needing the caller to retain the parent_job_id.
+    pub async fn get_parent_for_chunk(&self, job_id: &str) -> Result<String, ToolError> {
+        let mut conn = self.get_connection().await?;
+        let state_key = format!("jobs:state:{job_id}");
+        let parent_id: String = redis::cmd("HGET")
+            .arg(&state_key)
+            .arg("parent_job_id")
+            .query_async(&mut conn)
+            .await?;
+        Ok(parent_id)
+    }
+
+    /// Re-enqueue a chunk job back to `jobs:pending:{shard}` after a
+    /// transient context-build failure (e.g. Mongo write lag).
+    ///
+    /// Clears the `jobs:running` lease, resets the state hash to
+    /// `pending`, and pushes the member back to the shard's sorted set.
+    /// Does NOT increment `retry_count` — this is a visibility recovery,
+    /// not a retry of the job itself.
+    pub async fn requeue_chunk_for_retry(
+        &self,
+        job_id: &str,
+        parent_id: &str,
+        shard_count: u32,
+    ) -> Result<(), ToolError> {
+        let mut conn = self.get_connection().await?;
+        let state_key = format!("jobs:state:{job_id}");
+        let running_key = format!("jobs:running:{job_id}");
+        // Clear the running lease so recover_orphaned_jobs won't pick it up
+        // and so dequeue_job won't see a stale lease.
+        let _: () = conn.del(&running_key).await?;
+        // Reset status to pending (the job is back in the queue).
+        let _: () = conn.hset(&state_key, "status", "pending").await?;
+        // Re-enqueue to the correct shard.
+        let shard = compute_shard(parent_id, shard_count);
+        let member = format!("chunk:{job_id}");
+        let _: () = conn.zadd(shard_key(shard), &member, 0_f64).await?;
+        tracing::info!(
+            job_id = %job_id, shard,
+            "Chunk re-enqueued for context-build recovery"
+        );
+        Ok(())
+    }
+
     /// Re-enqueues a job for retry with configurable backoff.
-    pub async fn retry_job(&self, job_id: &str, kind: JobKind) -> Result<(), ToolError> {
+    /// For chunks, `parent_job_id` is needed to compute the correct shard.
+    pub async fn retry_job(
+        &self,
+        job_id: &str,
+        kind: JobKind,
+        shard_count: u32,
+        parent_job_id: Option<&str>,
+    ) -> Result<(), ToolError> {
         let mut conn = self.get_connection().await?;
         let running_key = format!("jobs:running:{job_id}");
         let _: () = conn.del(&running_key).await?;
@@ -222,7 +369,11 @@ impl RedisService {
             .await?;
 
         // Use priority score 0 so it's picked up after backoff
-        let _: () = conn.zadd("jobs:pending", &member, 0).await?;
+        let shard = match kind {
+            JobKind::File => compute_shard(job_id, shard_count),
+            JobKind::Chunk => compute_shard(parent_job_id.unwrap_or(job_id), shard_count),
+        };
+        let _: () = conn.zadd(shard_key(shard), &member, 0).await?;
 
         tracing::debug!(job_id = %job_id, retry_count, backoff_secs, "Job re-enqueued for retry");
         Ok(())
@@ -254,7 +405,7 @@ impl RedisService {
     /// Scans for orphaned `jobs:running:*` keys (stale from a crashed worker)
     /// and re-enqueues them as pending so a healthy worker can pick them up.
     /// Called once at worker startup.
-    pub async fn recover_orphaned_jobs(&self) -> Result<usize, ToolError> {
+    pub async fn recover_orphaned_jobs(&self, shard_count: u32) -> Result<usize, ToolError> {
         let mut conn = self.get_connection().await?;
 
         let keys: Vec<String> = {
@@ -287,11 +438,12 @@ impl RedisService {
                 }
             };
 
+            let shard = compute_shard(&job_id, shard_count);
             let _: () = conn.hset(&state_key, "status", "pending").await?;
             let _: () = conn.del(&key).await?;
-            let _: () = conn.zadd("jobs:pending", &member, 0.0).await?;
+            let _: () = conn.zadd(shard_key(shard), &member, 0.0).await?;
             rec += 1;
-            tracing::info!(job_id = %job_id, kind = ?kind, "Recovered orphaned job");
+            tracing::info!(job_id = %job_id, kind = ?kind, shard, "Recovered orphaned job");
         }
 
         if rec > 0 {
@@ -301,36 +453,116 @@ impl RedisService {
         Ok(rec)
     }
 
+    /// Delete all `jobs:running:*` keys. Called at worker shutdown
+    /// so the next worker's `recover_orphaned_jobs` picks them up
+    /// immediately instead of waiting for the 3600s TTL.
+    pub async fn delete_all_running(&self) -> Result<usize, ToolError> {
+        let mut conn = self.get_connection().await?;
+        let keys: Vec<String> = {
+            let iter = conn.scan_match("jobs:running:*").await.map_err(|e| {
+                tracing::error!(error = %e, "Failed to scan for running keys");
+                ToolError::from(e)
+            })?;
+            let res: Vec<Result<String, _>> = iter.collect().await;
+            res.into_iter().filter_map(|r| r.ok()).collect()
+        };
+        let n = keys.len();
+        if n > 0 {
+            let _: () = conn.del(&keys).await?;
+            tracing::info!(count = n, "Cleared running keys on shutdown");
+        }
+        Ok(n)
+    }
+
     /// Cancels all pending jobs in a batch by removing their IDs from the
     /// Redis sorted set. Accepts the list of job IDs (from the Batch document
-    /// in Mongo).
-    pub async fn cancel_batch_jobs(&self, job_ids: &[String]) -> Result<usize, ToolError> {
+    /// in Mongo). Tries all shards since we don't know which shard holds each job.
+    /// Cancels all pending jobs in a batch by removing their IDs from the
+    /// Redis sorted set. Accepts the list of job IDs (from the Batch document
+    /// in Mongo). Tries all shards since we don't know which shard holds each job.
+    /// Batches into a single pipeline round-trip.
+    pub async fn cancel_batch_jobs(
+        &self,
+        job_ids: &[String],
+        shard_count: u32,
+    ) -> Result<usize, ToolError> {
         let mut conn = self.get_connection().await?;
-        let mut removed = 0usize;
+        let mut pipe = redis::pipe();
         for job_id in job_ids {
             for prefix in &["file", "chunk"] {
                 let member = format!("{}:{}", prefix, job_id);
-                let n: usize = conn.zrem("jobs:pending", &member).await?;
-                removed += n;
+                for s in 0..shard_count {
+                    pipe.zrem(shard_key(s), &member).ignore();
+                }
             }
         }
+        let results: Vec<i64> = pipe.query_async(&mut conn).await?;
+        let removed = results.iter().filter(|&&n| n > 0).count();
         tracing::info!(count = removed, "Cancelled jobs from Redis pending queue");
         Ok(removed)
     }
 
     /// Cancels a single pending job (handles both file and chunk prefixes).
-    pub async fn cancel_job(&self, job_id: &str) -> Result<(), ToolError> {
+    /// Tries all shards since we don't know which shard holds the job.
+    /// Uses a pipeline for a single round-trip.
+    pub async fn cancel_job(&self, job_id: &str, shard_count: u32) -> Result<(), ToolError> {
         let mut conn = self.get_connection().await?;
-        let mut removed: usize = 0;
+        let mut pipe = redis::pipe();
         for prefix in &["file", "chunk"] {
             let member = format!("{}:{}", prefix, job_id);
-            let n: usize = conn.zrem("jobs:pending", &member).await?;
-            removed += n;
+            for s in 0..shard_count {
+                pipe.zrem(shard_key(s), &member).ignore();
+            }
         }
+        let results: Vec<i64> = pipe.query_async(&mut conn).await?;
+        let removed: usize = results.iter().filter(|&&n| n > 0).count();
         if removed > 0 {
-            tracing::info!("Cancelled job {} from pending queue", job_id);
+            tracing::info!(job_id = %job_id, "Cancelled job from pending queue");
         }
         Ok(())
+    }
+
+    /// Move all members of `jobs:delayed` whose retry time has elapsed
+    /// into the appropriate `jobs:pending:{shard}` sorted set.
+    /// Called once per scheduler iteration before dequeue.
+    pub async fn promote_due_delayed(&self, shard_count: u32) -> Result<usize, ToolError> {
+        let mut conn = self.get_connection().await?;
+        let now_ts = chrono::Utc::now().timestamp();
+
+        // Upper bound: (now_ts + 1) * 1000 + shard_count covers all possible
+        // encoded scores for jobs that are due now or earlier.
+        let max_score = ((now_ts + 1) as f64) * 1000.0 + (shard_count as f64);
+        let due: Vec<(String, f64)> = redis::cmd("ZRANGEBYSCORE")
+            .arg("jobs:delayed")
+            .arg("-inf")
+            .arg(max_score)
+            .arg("WITHSCORES")
+            .query_async(&mut conn)
+            .await?;
+
+        if due.is_empty() {
+            return Ok(0);
+        }
+
+        let mut promoted = 0;
+        for (member, score) in &due {
+            let retry_at_ts = (score / 1000.0).floor() as i64;
+            if retry_at_ts > now_ts {
+                continue;
+            }
+
+            let shard = score.fract().round() as u32;
+            let shard = shard.min(shard_count.saturating_sub(1));
+
+            let _: () = conn.zadd(shard_key(shard), member, 0_f64).await?;
+            let _: () = conn.zrem("jobs:delayed", member).await?;
+            promoted += 1;
+        }
+
+        if promoted > 0 {
+            tracing::debug!(count = promoted, "Promoted delayed jobs to pending");
+        }
+        Ok(promoted)
     }
 
     /// Create a counter for the counter pattern following the given parent_id
@@ -338,6 +570,7 @@ impl RedisService {
         let mut conn = self.get_connection().await?;
         let key = format!("jobs:counter:{parent_id}");
         let _: () = conn.set(&key, "0").await?;
+        let _: () = conn.expire(&key, (7 * 24 * 3600) as i64).await?;
         Ok(())
     }
 
@@ -346,6 +579,7 @@ impl RedisService {
         let mut conn = self.get_connection().await?;
         let key = format!("jobs:chunks:{parent_id}");
         let _: () = conn.sadd(&key, chunk_id).await?;
+        let _: () = conn.expire(&key, (7 * 24 * 3600) as i64).await?;
         Ok(())
     }
 
@@ -356,6 +590,43 @@ impl RedisService {
         let key = format!("jobs:chunks:{parent_id}");
         let members: Vec<String> = conn.smembers(&key).await?;
         Ok(members)
+    }
+
+    /// Returns the number of chunk jobs for a parent that are NOT yet
+    /// in a terminal state (completed/failed/cancelled).
+    /// Uses SCAN over jobs:state:* keys to find chunk entries with the given parent.
+    pub async fn live_chunk_count(&self, parent_id: &str) -> Result<u32, ToolError> {
+        let mut conn = self.get_connection().await?;
+        let keys: Vec<String> = {
+            let iter = conn.scan_match("jobs:state:*").await.map_err(|e| {
+                tracing::error!(error = %e, "Failed to scan for chunk state keys");
+                ToolError::from(e)
+            })?;
+            let res: Vec<Result<String, _>> = iter.collect().await;
+            res.into_iter().filter_map(|r| r.ok()).collect()
+        };
+
+        let mut count = 0u32;
+        for state_key in keys {
+            let (kind, status, p_id): (Option<String>, Option<String>, Option<String>) =
+                redis::cmd("HMGET")
+                    .arg(&state_key)
+                    .arg("kind")
+                    .arg("status")
+                    .arg("parent_job_id")
+                    .query_async(&mut conn)
+                    .await?;
+            if kind.as_deref() == Some("chunk")
+                && p_id.as_deref() == Some(parent_id)
+                && !matches!(
+                    status.as_deref(),
+                    Some("completed") | Some("failed") | Some("cancelled")
+                )
+            {
+                count += 1;
+            }
+        }
+        Ok(count)
     }
 
     /// Store a chunk's metadata in a Redis hash for later manifest assembly.
@@ -379,6 +650,11 @@ impl RedisService {
             .incr(&count_key, 1)
             .query_async(&mut conn)
             .await?;
+
+        // Auto-expire chunk tracking keys after 7 days
+        let ttl_secs = 7 * 24 * 3600;
+        let _: () = conn.expire(&result_key, ttl_secs).await?;
+        let _: () = conn.expire(&count_key, ttl_secs).await?;
 
         Ok(count)
     }

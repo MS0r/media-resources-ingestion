@@ -1,3 +1,10 @@
+//! TOML configuration: the on-disk shape of `.ingest/config.toml`.
+//!
+//! These structs mirror the TOML schema 1:1 and are not meant to be
+//! touched at runtime. `config::app::AppConfig::from_sources` consumes
+//! a `TomlRawConfig` and merges its fields with YAML values to produce
+//! the merged runtime config.
+
 use crate::error::ToolError;
 use serde::Deserialize;
 use std::path::PathBuf;
@@ -10,10 +17,34 @@ pub struct SchedulerConfig {
     pub max_per_host: usize,
     #[serde(default = "default_job_timeout")]
     pub job_timeout_secs: u64,
+    #[serde(default = "default_mongo_pool_min")]
+    pub mongo_pool_min: u32,
+    #[serde(default = "default_mongo_pool_max")]
+    pub mongo_pool_max: u32,
+    #[serde(default = "default_shard_count")]
+    pub shard_count: u32,
+    #[serde(default = "default_shutdown_grace")]
+    pub shutdown_grace_secs: u64,
 }
 
 const fn default_job_timeout() -> u64 {
     7200
+}
+
+const fn default_mongo_pool_min() -> u32 {
+    1
+}
+
+const fn default_mongo_pool_max() -> u32 {
+    16
+}
+
+const fn default_shard_count() -> u32 {
+    16
+}
+
+const fn default_shutdown_grace() -> u64 {
+    30
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -68,6 +99,9 @@ impl Default for RetryConfig {
     }
 }
 
+/// The full on-disk TOML configuration. Root contains four tables
+/// (`[scheduler]`, `[compression]`, `[storage]`, `[retry]`); retry is
+/// optional.
 #[derive(Debug, Clone, Deserialize)]
 pub struct TomlRawConfig {
     pub scheduler: SchedulerConfig,
@@ -77,6 +111,7 @@ pub struct TomlRawConfig {
     pub retry: RetryConfig,
 }
 
+/// Load and parse the TOML config from the given path.
 pub fn load_toml(path: &PathBuf) -> Result<TomlRawConfig, ToolError> {
     let toml_fs = std::fs::read_to_string(path)?;
     let config: TomlRawConfig = toml::from_str(&toml_fs)?;

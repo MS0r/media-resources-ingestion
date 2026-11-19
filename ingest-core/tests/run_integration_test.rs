@@ -94,7 +94,7 @@ async fn run_no_follow_creates_batch_and_jobs() {
 "#,
     );
 
-    let mongo = MongoService::new(&mongo_uri())
+    let mongo = MongoService::new(&mongo_uri(), 1, 16)
         .await
         .expect("connect to MongoDB");
     let before = count_jobs(&mongo).await;

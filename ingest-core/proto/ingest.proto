@@ -12,6 +12,11 @@ service IngestService {
   rpc RetryJob(RetryJobRequest) returns (ActionResponse);
   rpc ListFiles(ListFilesRequest) returns (ListFilesResponse);
   rpc GetFile(GetFileRequest) returns (FileMetadata);
+  // Stream the original (decompressed) bytes of a stored file. The first
+  // message in the stream is a `DownloadFileHeader`; subsequent messages
+  // are `DownloadFileChunk` carrying the reassembled payload in order.
+  // Both chunked and non-chunked files are supported transparently.
+  rpc DownloadFile(DownloadFileRequest) returns (stream DownloadFileChunk);
 }
 
 message EnqueueRequest {
@@ -102,4 +107,37 @@ message FileMetadata {
   double compression_ratio = 7;
   string mime_type = 8;
   string upload_date = 9;
+}
+
+message DownloadFileRequest {
+  // The Metadata.file_hash of the file to download.
+  string hash = 1;
+
+  // Optional inclusive byte range. Both unset = full file. `range_end`
+  // must be `>= range_start` when set.
+  optional uint64 range_start = 2;
+  optional uint64 range_end = 3;
+}
+
+// One frame of a `DownloadFile` stream. The first emitted frame carries
+// the header; all subsequent frames carry raw bytes in order.
+message DownloadFileChunk {
+  oneof payload {
+    DownloadFileHeader header = 1;
+    bytes data = 2;
+  }
+}
+
+message DownloadFileHeader {
+  // Hex SHA-256 of the chunked file's Merkle root (== Metadata.file_hash).
+  string file_hash = 1;
+  string mime_type = 2;
+  // Last path segment of Metadata.storage_path — suitable for
+  // `Content-Disposition: filename=`.
+  string filename = 3;
+  // Original (uncompressed) file size in bytes.
+  uint64 total_size = 4;
+  // True if the file was stored as a chunked manifest; the stream
+  // walks `chunk_manifest.chunks` in order to produce the bytes.
+  bool is_chunked = 5;
 }
